@@ -2,7 +2,10 @@ package controller
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
@@ -25,8 +28,12 @@ func GetGroups(c *gin.Context) {
 
 func GetUserGroups(c *gin.Context) {
 	usableGroups := make(map[string]map[string]interface{})
-	userGroup := ""
 	userId := c.GetInt("id")
+	requestedUserId, err := strconv.Atoi(strings.TrimSpace(c.Query("user_id")))
+	if err == nil && requestedUserId > 0 && requestedUserId != userId && c.GetInt("role") >= common.RoleAdminUser {
+		userId = requestedUserId
+	}
+	userGroup := ""
 	userGroup, _ = model.GetUserGroup(userId, false)
 	userUsableGroups := service.GetUserUsableGroups(userGroup)
 	for groupName, _ := range ratio_setting.GetGroupRatioCopy() {

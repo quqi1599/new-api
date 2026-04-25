@@ -382,6 +382,7 @@ function TokensPage() {
         editingToken={editingToken}
         visiable={showEdit}
         handleClose={closeEdit}
+        isAdminUser={tokensData.isAdminUser}
       />
 
       <CCSwitchModal
@@ -408,6 +409,8 @@ function TokensPage() {
               setShowEdit={setShowEdit}
               batchCopyTokens={batchCopyTokens}
               batchDeleteTokens={batchDeleteTokens}
+              isAdminUser={tokensData.isAdminUser}
+              isRootUser={tokensData.isRootUser}
               t={t}
             />
 
@@ -418,6 +421,7 @@ function TokensPage() {
                 searchTokens={searchTokens}
                 loading={loading}
                 searching={searching}
+                isAdminUser={tokensData.isAdminUser}
                 t={t}
               />
             </div>

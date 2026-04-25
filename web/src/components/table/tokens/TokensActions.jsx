@@ -29,6 +29,8 @@ const TokensActions = ({
   setShowEdit,
   batchCopyTokens,
   batchDeleteTokens,
+  isAdminUser,
+  isRootUser,
   t,
 }) => {
   // Modal states
@@ -85,14 +87,16 @@ const TokensActions = ({
           {t('复制所选令牌')}
         </Button>
 
-        <Button
-          type='danger'
-          className='w-full md:w-auto'
-          onClick={handleDeleteSelectedTokens}
-          size='small'
-        >
-          {t('删除所选令牌')}
-        </Button>
+        {(!isAdminUser || isRootUser) && (
+          <Button
+            type='danger'
+            className='w-full md:w-auto'
+            onClick={handleDeleteSelectedTokens}
+            size='small'
+          >
+            {t('删除所选令牌')}
+          </Button>
+        )}
       </div>
 
       <CopyTokensModal
@@ -102,13 +106,15 @@ const TokensActions = ({
         t={t}
       />
 
-      <DeleteTokensModal
-        visible={showDeleteModal}
-        onCancel={() => setShowDeleteModal(false)}
-        onConfirm={handleConfirmDelete}
-        selectedKeys={selectedKeys}
-        t={t}
-      />
+      {(!isAdminUser || isRootUser) && (
+        <DeleteTokensModal
+          visible={showDeleteModal}
+          onCancel={() => setShowDeleteModal(false)}
+          onConfirm={handleConfirmDelete}
+          selectedKeys={selectedKeys}
+          t={t}
+        />
+      )}
     </>
   );
 };

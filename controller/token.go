@@ -31,8 +31,68 @@ func buildMaskedTokenResponses(tokens []*model.Token) []*model.Token {
 	return maskedTokens
 }
 
+func buildCreatedTokenResponse(token *model.Token) gin.H {
+	if token == nil {
+		return gin.H{}
+	}
+
+	maskedToken := buildMaskedTokenResponse(token)
+
+	return gin.H{
+		"id":                   token.Id,
+		"user_id":              token.UserId,
+		"name":                 token.Name,
+		"key":                  maskedToken.Key,
+		"value":                "sk-" + token.GetFullKey(),
+		"masked_key":           maskedToken.Key,
+		"status":               token.Status,
+		"created_time":         token.CreatedTime,
+		"accessed_time":        token.AccessedTime,
+		"expired_time":         token.ExpiredTime,
+		"remain_quota":         token.RemainQuota,
+		"used_quota":           token.UsedQuota,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits_enabled": token.ModelLimitsEnabled,
+		"model_limits":         token.ModelLimits,
+		"allow_ips":            token.AllowIps,
+		"group":                token.Group,
+		"cross_group_retry":    token.CrossGroupRetry,
+	}
+}
+
+func resolveTokenOwnerUserID(c *gin.Context, requestedUserID int) (int, error) {
+	currentUserID := c.GetInt("id")
+	if requestedUserID <= 0 || requestedUserID == currentUserID {
+		return currentUserID, nil
+	}
+
+	if c.GetInt("role") < common.RoleAdminUser {
+		return 0, fmt.Errorf("无权为其他用户创建令牌")
+	}
+
+	if _, err := model.GetUserById(requestedUserID, false); err != nil {
+		return 0, err
+	}
+
+	return requestedUserID, nil
+}
+
+func resolveTokenQueryUserID(c *gin.Context) int {
+	currentUserID := c.GetInt("id")
+	requestedUserID, err := strconv.Atoi(strings.TrimSpace(c.Query("user_id")))
+	if err != nil || requestedUserID <= 0 {
+		return currentUserID
+	}
+
+	if requestedUserID != currentUserID && c.GetInt("role") < common.RoleAdminUser {
+		return currentUserID
+	}
+
+	return requestedUserID
+}
+
 func GetAllTokens(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId := resolveTokenQueryUserID(c)
 	pageInfo := common.GetPageQuery(c)
 	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
@@ -46,7 +106,7 @@ func GetAllTokens(c *gin.Context) {
 }
 
 func SearchTokens(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId := resolveTokenQueryUserID(c)
 	keyword := c.Query("keyword")
 	token := c.Query("token")
 
@@ -188,8 +248,14 @@ func AddToken(c *gin.Context) {
 		}
 	}
 	// 检查用户令牌数量是否已达上限
+	targetUserID, err := resolveTokenOwnerUserID(c, token.UserId)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
 	maxTokens := operation_setting.GetMaxUserTokens()
-	count, err := model.CountUserTokens(c.GetInt("id"))
+	count, err := model.CountUserTokens(targetUserID)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -208,7 +274,7 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:             c.GetInt("id"),
+		UserId:             targetUserID,
 		Name:               token.Name,
 		Key:                key,
 		CreatedTime:        common.GetTimestamp(),
@@ -227,10 +293,7 @@ func AddToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
+	common.ApiSuccess(c, buildCreatedTokenResponse(&cleanToken))
 }
 
 func DeleteToken(c *gin.Context) {

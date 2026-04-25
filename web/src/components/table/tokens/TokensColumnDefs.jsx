@@ -39,6 +39,7 @@ import {
   renderQuota,
   getModelCategories,
   showError,
+  stringToColor,
 } from '../../../helpers';
 import {
   IconTreeTriangleDown,
@@ -480,12 +481,34 @@ export const getTokensColumns = ({
   setShowEdit,
   refresh,
   groupRatios = {},
+  isAdminUser,
+  isRootUser,
 }) => {
-  return [
+  const columns = [
     {
       title: t('名称'),
       dataIndex: 'name',
     },
+    ...(isAdminUser
+      ? [
+          {
+            title: t('用户'),
+            dataIndex: 'username',
+            render: (text) => (
+              <div>
+                <Avatar
+                  size='extra-small'
+                  color={stringToColor(text)}
+                  style={{ marginRight: 4 }}
+                >
+                  {typeof text === 'string' && text.slice(0, 1)}
+                </Avatar>
+                {text}
+              </div>
+            ),
+          },
+        ]
+      : []),
     {
       title: t('状态'),
       dataIndex: 'status',
@@ -571,4 +594,10 @@ export const getTokensColumns = ({
         ),
     },
   ];
+
+  if (isAdminUser && !isRootUser) {
+    return columns.filter((column) => column.dataIndex !== 'operate');
+  }
+
+  return columns;
 };

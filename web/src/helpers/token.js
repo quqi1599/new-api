@@ -33,6 +33,15 @@ export async function fetchTokenKey(tokenId) {
   return data.key;
 }
 
+export async function fetchAdminTokenKey(tokenId) {
+  const response = await API.post(`/api/token/admin/${tokenId}/key`);
+  const { success, data, message } = response.data || {};
+  if (!success || !data?.key) {
+    throw new Error(message || 'Failed to fetch admin token key');
+  }
+  return data.key;
+}
+
 /**
  * 批量获取多个令牌的真实 key
  * @param {number[]} tokenIds
@@ -43,6 +52,17 @@ export async function fetchTokenKeysBatch(tokenIds) {
   const { success, data, message } = response.data || {};
   if (!success || !data?.keys) {
     throw new Error(message || 'Failed to fetch token keys');
+  }
+  return data.keys;
+}
+
+export async function fetchAdminTokenKeysBatch(tokenIds) {
+  const response = await API.post('/api/token/admin/batch/keys', {
+    ids: tokenIds,
+  });
+  const { success, data, message } = response.data || {};
+  if (!success || !data?.keys) {
+    throw new Error(message || 'Failed to fetch admin token keys');
   }
   return data.keys;
 }

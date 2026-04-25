@@ -250,6 +250,19 @@ func SetApiRouter(router *gin.Engine) {
 			channelRoute.POST("/upstream_updates/detect", controller.DetectChannelUpstreamModelUpdates)
 			channelRoute.POST("/upstream_updates/detect_all", controller.DetectAllChannelUpstreamModelUpdates)
 		}
+		tokenAdminRoute := apiRouter.Group("/token/admin")
+		tokenAdminRoute.Use(middleware.AdminAuth())
+		{
+			tokenAdminRoute.GET("/", controller.AdminGetAllTokens)
+			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
+			tokenAdminRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKeysBatch)
+			tokenAdminRoute.POST("/batch", middleware.RootAuth(), controller.AdminDeleteTokenBatch)
+			tokenAdminRoute.GET("/:id", controller.AdminGetToken)
+			tokenAdminRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKey)
+			tokenAdminRoute.PUT("/", middleware.RootAuth(), controller.AdminUpdateToken)
+			tokenAdminRoute.DELETE("/:id", middleware.RootAuth(), controller.AdminDeleteToken)
+			tokenAdminRoute.POST("/grant-quota", controller.AdminGrantTokenQuota)
+		}
 		tokenRoute := apiRouter.Group("/token")
 		tokenRoute.Use(middleware.UserAuth())
 		{

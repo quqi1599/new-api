@@ -23,6 +23,8 @@ import { Modal } from '@douyinfe/semi-ui';
 import {
   API,
   copy,
+  isAdmin,
+  isRoot,
   showError,
   showSuccess,
   encodeToBase64,
@@ -31,13 +33,17 @@ import { ITEMS_PER_PAGE } from '../../constants';
 import { useTableCompactMode } from '../common/useTableCompactMode';
 import {
   fetchTokenKey as fetchTokenKeyById,
+  fetchAdminTokenKey,
   fetchTokenKeysBatch,
+  fetchAdminTokenKeysBatch,
   getServerAddress,
   encodeChannelConnectionString,
 } from '../../helpers/token';
 
 export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
   const { t } = useTranslation();
+  const isAdminUser = isAdmin();
+  const isRootUser = isRoot();
 
   // Basic state
   const [tokens, setTokens] = useState([]);
@@ -70,6 +76,7 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
   const formInitValues = {
     searchKeyword: '',
     searchToken: '',
+    searchUsername: '',
   };
 
   // Get form values helper function
@@ -78,6 +85,7 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     return {
       searchKeyword: formValues.searchKeyword || '',
       searchToken: formValues.searchToken || '',
+      searchUsername: formValues.searchUsername || '',
     };
   };
 
@@ -104,7 +112,10 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
   const loadTokens = async (page = 1, size = pageSize) => {
     setLoading(true);
     setSearchMode(false);
-    const res = await API.get(`/api/token/?p=${page}&size=${size}`);
+    const endpoint = isAdminUser
+      ? `/api/token/admin?p=${page}&size=${size}`
+      : `/api/token/?p=${page}&size=${size}`;
+    const res = await API.get(endpoint);
     const { success, message, data } = res.data;
     if (success) {
       syncPageData(data);
@@ -157,7 +168,9 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     const request = (async () => {
       setLoadingTokenKeys((prev) => ({ ...prev, [tokenId]: true }));
       try {
-        const fullKey = await fetchTokenKeyById(tokenId);
+        const fullKey = isAdminUser
+          ? await fetchAdminTokenKey(tokenId)
+          : await fetchTokenKeyById(tokenId);
         setResolvedTokenKeys((prev) => ({ ...prev, [tokenId]: fullKey }));
         return fullKey;
       } catch (error) {
@@ -267,15 +280,27 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     let res;
     switch (action) {
       case 'delete':
-        res = await API.delete(`/api/token/${id}/`);
+        res = await API.delete(
+          isAdminUser ? `/api/token/admin/${id}` : `/api/token/${id}/`,
+        );
         break;
       case 'enable':
         data.status = 1;
-        res = await API.put('/api/token/?status_only=true', data);
+        res = await API.put(
+          isAdminUser
+            ? '/api/token/admin/?status_only=true'
+            : '/api/token/?status_only=true',
+          data,
+        );
         break;
       case 'disable':
         data.status = 2;
-        res = await API.put('/api/token/?status_only=true', data);
+        res = await API.put(
+          isAdminUser
+            ? '/api/token/admin/?status_only=true'
+            : '/api/token/?status_only=true',
+          data,
+        );
         break;
     }
     const { success, message } = res.data;
@@ -296,19 +321,32 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
   // Search tokens function
   const searchTokens = async (page = 1, size = pageSize) => {
     const normalizedPage = Number.isInteger(page) && page > 0 ? page : 1;
-    const normalizedSize =
-      Number.isInteger(size) && size > 0 ? size : pageSize;
+    const normalizedSize = Number.isInteger(size) && size > 0 ? size : pageSize;
 
-    const { searchKeyword, searchToken } = getFormValues();
-    if (searchKeyword === '' && searchToken === '') {
+    const { searchKeyword, searchToken, searchUsername } = getFormValues();
+    if (
+      searchKeyword === '' &&
+      searchToken === '' &&
+      (!isAdminUser || searchUsername === '')
+    ) {
       setSearchMode(false);
       await loadTokens(1);
       return;
     }
     setSearching(true);
-    const res = await API.get(
-      `/api/token/search?keyword=${encodeURIComponent(searchKeyword)}&token=${encodeURIComponent(searchToken)}&p=${normalizedPage}&size=${normalizedSize}`,
-    );
+    const endpoint = isAdminUser
+      ? '/api/token/admin/search'
+      : '/api/token/search';
+    const params = [
+      `keyword=${encodeURIComponent(searchKeyword)}`,
+      `token=${encodeURIComponent(searchToken)}`,
+      `p=${normalizedPage}`,
+      `size=${normalizedSize}`,
+    ];
+    if (isAdminUser) {
+      params.push(`username=${encodeURIComponent(searchUsername)}`);
+    }
+    const res = await API.get(`${endpoint}?${params.join('&')}`);
     const { success, message, data } = res.data;
     if (success) {
       setSearchMode(true);
@@ -383,7 +421,10 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     setLoading(true);
     try {
       const ids = selectedKeys.map((token) => token.id);
-      const res = await API.post('/api/token/batch', { ids });
+      const res = await API.post(
+        isAdminUser ? '/api/token/admin/batch' : '/api/token/batch',
+        { ids },
+      );
       if (res?.data?.success) {
         const count = res.data.data || 0;
         showSuccess(t('已删除 {{count}} 个令牌！', { count }));
@@ -411,7 +452,9 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     }
     try {
       const ids = selectedKeys.map((token) => token.id);
-      const keysMap = await fetchTokenKeysBatch(ids);
+      const keysMap = isAdminUser
+        ? await fetchAdminTokenKeysBatch(ids)
+        : await fetchTokenKeysBatch(ids);
 
       setResolvedTokenKeys((prev) => ({ ...prev, ...keysMap }));
 
@@ -460,6 +503,8 @@ export const useTokensData = (openFluentNotification, openCCSwitchModal) => {
     pageSize,
     searching,
     groupRatios,
+    isAdminUser,
+    isRootUser,
 
     // Selection state
     selectedKeys,

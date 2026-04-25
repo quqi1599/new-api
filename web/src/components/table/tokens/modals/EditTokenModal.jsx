@@ -59,6 +59,9 @@ import { StatusContext } from '../../../../context/Status';
 
 const { Text, Title } = Typography;
 
+const sortUserOptionsById = (options) =>
+  [...options].sort((a, b) => Number(a.value) - Number(b.value));
+
 const EditTokenModal = (props) => {
   const { t } = useTranslation();
   const [statusState, statusDispatch] = useContext(StatusContext);
@@ -68,10 +71,14 @@ const EditTokenModal = (props) => {
   const [models, setModels] = useState([]);
   const [groups, setGroups] = useState([]);
   const [showQuotaInput, setShowQuotaInput] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [usersLoading, setUsersLoading] = useState(false);
   const isEdit = props.editingToken.id !== undefined;
+  const isAdminUser = !!props.isAdminUser;
 
   const getInitValues = () => ({
     name: '',
+    user_id: undefined,
     remain_quota: 0,
     remain_amount: 0,
     expired_time: -1,
@@ -133,8 +140,9 @@ const EditTokenModal = (props) => {
     }
   };
 
-  const loadGroups = async () => {
-    let res = await API.get(`/api/user/self/groups`);
+  const loadGroups = async (targetUserId = null) => {
+    const query = isAdminUser && targetUserId ? `?user_id=${targetUserId}` : '';
+    let res = await API.get(`/api/user/self/groups${query}`);
     const { success, message, data } = res.data;
     if (success) {
       let localGroupOptions = Object.entries(data).map(([group, info]) => ({
@@ -148,17 +156,84 @@ const EditTokenModal = (props) => {
         }
       }
       setGroups(localGroupOptions);
-      // if (statusState?.status?.default_use_auto_group && formApiRef.current) {
-      //   formApiRef.current.setValue('group', 'auto');
-      // }
     } else {
       showError(t(message));
     }
   };
 
+  const loadUsers = async (keyword = '') => {
+    if (!isAdminUser) {
+      return [];
+    }
+    setUsersLoading(true);
+    try {
+      const endpoint = keyword.trim()
+        ? `/api/user/search?keyword=${encodeURIComponent(keyword.trim())}&group=&p=0&page_size=20&order=id_asc`
+        : '/api/user/?p=0&page_size=20&order=id_asc';
+      const res = await API.get(endpoint);
+      const { success, message, data } = res.data;
+      if (!success) {
+        showError(t(message));
+        return [];
+      }
+      const items = Array.isArray(data?.items) ? data.items : [];
+      const localUserOptions = items.map((user) => ({
+        label: user.username,
+        value: user.id,
+        username: user.username,
+      }));
+      const sortedUserOptions = sortUserOptionsById(localUserOptions);
+      setUsers(sortedUserOptions);
+      return sortedUserOptions;
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
+  const ensureUserOption = async (userId, username = '') => {
+    if (!isAdminUser || !userId) {
+      return;
+    }
+    setUsers((prev) => {
+      if (prev.some((user) => user.value === userId)) {
+        return prev;
+      }
+      return sortUserOptionsById([
+        ...prev,
+        {
+          label: username || String(userId),
+          value: userId,
+          username: username || String(userId),
+        },
+      ]);
+    });
+  };
+
+  const applySelectedUser = async (userId, options = {}) => {
+    if (!isAdminUser || !userId || !formApiRef.current) {
+      return;
+    }
+    const {
+      preserveGroup = false,
+      preferredGroup = undefined,
+      username = '',
+    } = options;
+    await ensureUserOption(userId, username);
+    formApiRef.current.setValue('user_id', userId);
+    await loadGroups(userId);
+    const currentGroup = preserveGroup
+      ? preferredGroup ?? formApiRef.current.getValue('group')
+      : '';
+    formApiRef.current.setValue('group', currentGroup || '');
+  };
+
   const loadToken = async () => {
     setLoading(true);
-    let res = await API.get(`/api/token/${props.editingToken.id}`);
+    let res = await API.get(
+      isAdminUser
+        ? `/api/token/admin/${props.editingToken.id}`
+        : `/api/token/${props.editingToken.id}`,
+    );
     const { success, message, data } = res.data;
     if (success) {
       if (data.expired_time !== -1) {
@@ -172,6 +247,23 @@ const EditTokenModal = (props) => {
       data.remain_amount = Number(
         quotaToDisplayAmount(data.remain_quota || 0).toFixed(6),
       );
+      if (isAdminUser) {
+        await applySelectedUser(data.user_id, {
+          preserveGroup: true,
+          preferredGroup: data.group || '',
+          username: data.username || props.editingToken.username || '',
+        });
+      }
+      data.remain_amount = Number(
+        quotaToDisplayAmount(data.remain_quota || 0).toFixed(6),
+      );
+      if (isAdminUser) {
+        await applySelectedUser(data.user_id, {
+          preserveGroup: true,
+          preferredGroup: data.group || '',
+          username: data.username || props.editingToken.username || '',
+        });
+      }
       if (formApiRef.current) {
         formApiRef.current.setValues({ ...getInitValues(), ...data });
       }
@@ -182,14 +274,24 @@ const EditTokenModal = (props) => {
   };
 
   useEffect(() => {
-    if (formApiRef.current) {
-      if (!isEdit) {
-        formApiRef.current.setValues(getInitValues());
-      }
+    if (formApiRef.current && !isEdit) {
+      formApiRef.current.setValues(getInitValues());
     }
     loadModels();
+    if (isAdminUser) {
+      loadUsers().then((userOptions) => {
+        if (!isEdit && userOptions.length > 0) {
+          applySelectedUser(userOptions[0].value, {
+            username: userOptions[0].username,
+          });
+        } else if (!isEdit) {
+          setGroups([]);
+        }
+      });
+      return;
+    }
     loadGroups();
-  }, [props.editingToken.id]);
+  }, [props.editingToken.id, isAdminUser]);
 
   useEffect(() => {
     if (props.visiable) {
@@ -197,6 +299,19 @@ const EditTokenModal = (props) => {
         loadToken();
       } else {
         formApiRef.current?.setValues(getInitValues());
+        if (isAdminUser) {
+          loadUsers().then((userOptions) => {
+            if (userOptions.length > 0) {
+              applySelectedUser(userOptions[0].value, {
+                username: userOptions[0].username,
+              });
+            } else {
+              setGroups([]);
+            }
+          });
+        } else {
+          loadGroups();
+        }
       }
     } else {
       formApiRef.current?.reset();
@@ -238,10 +353,13 @@ const EditTokenModal = (props) => {
       }
       localInputs.model_limits = localInputs.model_limits.join(',');
       localInputs.model_limits_enabled = localInputs.model_limits.length > 0;
-      let res = await API.put(`/api/token/`, {
-        ...localInputs,
-        id: parseInt(props.editingToken.id),
-      });
+      let res = await API.put(
+        isAdminUser ? `/api/token/admin/` : `/api/token/`,
+        {
+          ...localInputs,
+          id: parseInt(props.editingToken.id),
+        },
+      );
       const { success, message } = res.data;
       if (success) {
         showSuccess(t('令牌更新成功！'));
@@ -382,6 +500,39 @@ const EditTokenModal = (props) => {
                       showClear
                     />
                   </Col>
+                  {!isEdit && isAdminUser && (
+                    <Col span={24}>
+                      <Form.Select
+                        field='user_id'
+                        label={t('用户')}
+                        placeholder={t('请选择目标用户')}
+                        optionList={users}
+                        loading={usersLoading}
+                        filter
+                        remote
+                        searchable
+                        onSearch={loadUsers}
+                        onChange={(value) => {
+                          applySelectedUser(value);
+                        }}
+                        rules={[
+                          { required: true, message: t('请选择目标用户') },
+                        ]}
+                        style={{ width: '100%' }}
+                      />
+                    </Col>
+                  )}
+                  {isEdit && isAdminUser && (
+                    <Col span={24}>
+                      <Form.Select
+                        field='user_id'
+                        label={t('用户')}
+                        optionList={users}
+                        disabled
+                        style={{ width: '100%' }}
+                      />
+                    </Col>
+                  )}
                   <Col span={24}>
                     {groups.length > 0 ? (
                       <Form.Select
@@ -403,7 +554,11 @@ const EditTokenModal = (props) => {
                       />
                     ) : (
                       <Form.Select
-                        placeholder={t('管理员未设置用户可选分组')}
+                        placeholder={
+                          isAdminUser
+                            ? t('请先选择用户')
+                            : t('管理员未设置用户可选分组')
+                        }
                         disabled
                         label={t('令牌分组')}
                         style={{ width: '100%' }}

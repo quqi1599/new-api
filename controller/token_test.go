@@ -42,27 +42,38 @@ type tokenKeyResponse struct {
 	Key string `json:"key"`
 }
 
+type tokenCreateResponse struct {
+	ID        int     `json:"id"`
+	UserID    int     `json:"user_id"`
+	Name      string  `json:"name"`
+	Key       string  `json:"key"`
+	Value     string  `json:"value"`
+	MaskedKey string  `json:"masked_key"`
+	Group     string  `json:"group"`
+	AllowIPs  *string `json:"allow_ips"`
+}
+
 type sqliteColumnInfo struct {
 	Name string `gorm:"column:name"`
 	Type string `gorm:"column:type"`
 }
 
 type legacyToken struct {
-	Id                 int            `gorm:"primaryKey"`
-	UserId             int            `gorm:"index"`
-	Key                string         `gorm:"column:key;type:char(48);uniqueIndex"`
-	Status             int            `gorm:"default:1"`
-	Name               string         `gorm:"index"`
-	CreatedTime        int64          `gorm:"bigint"`
-	AccessedTime       int64          `gorm:"bigint"`
-	ExpiredTime        int64          `gorm:"bigint;default:-1"`
-	RemainQuota        int            `gorm:"default:0"`
+	Id                 int    `gorm:"primaryKey"`
+	UserId             int    `gorm:"index"`
+	Key                string `gorm:"column:key;type:char(48);uniqueIndex"`
+	Status             int    `gorm:"default:1"`
+	Name               string `gorm:"index"`
+	CreatedTime        int64  `gorm:"bigint"`
+	AccessedTime       int64  `gorm:"bigint"`
+	ExpiredTime        int64  `gorm:"bigint;default:-1"`
+	RemainQuota        int    `gorm:"default:0"`
 	UnlimitedQuota     bool
 	ModelLimitsEnabled bool
-	ModelLimits        string         `gorm:"type:text"`
-	AllowIps           *string        `gorm:"default:''"`
-	UsedQuota          int            `gorm:"default:0"`
-	Group              string         `gorm:"column:group;default:''"`
+	ModelLimits        string  `gorm:"type:text"`
+	AllowIps           *string `gorm:"default:''"`
+	UsedQuota          int     `gorm:"default:0"`
+	Group              string  `gorm:"column:group;default:''"`
 	CrossGroupRetry    bool
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
@@ -111,6 +122,9 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 
 	db := openTokenControllerTestDB(t)
 	migrateTokenControllerTestDB(t, db)
+	if err := db.AutoMigrate(&model.Log{}); err != nil {
+		t.Fatalf("failed to migrate log table: %v", err)
+	}
 	return db
 }
 
@@ -537,5 +551,83 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	}
 	if strings.Contains(unauthorizedRecorder.Body.String(), token.Key) {
 		t.Fatalf("unauthorized key response leaked raw token key: %s", unauthorizedRecorder.Body.String())
+	}
+}
+
+func TestGetAllTokensAdminCanQueryTargetUser(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	targetToken := seedToken(t, db, 4, "target-user-token", "target1234token5678")
+	seedToken(t, db, 1, "admin-token", "admin1234token5678")
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/?user_id=4&p=1&size=10", nil, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	GetAllTokens(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got message: %s", response.Message)
+	}
+
+	var page tokenPageResponse
+	if err := common.Unmarshal(response.Data, &page); err != nil {
+		t.Fatalf("failed to decode token page response: %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != targetToken.Id {
+		t.Fatalf("expected only target user token, got %+v", page.Items)
+	}
+}
+
+func TestAddTokenAllowsAdminProxyCreateForTargetUser(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user-access-token")
+
+	body := map[string]any{
+		"name":                 "首购-代理创建",
+		"user_id":              4,
+		"expired_time":         -1,
+		"remain_quota":         0,
+		"unlimited_quota":      false,
+		"model_limits_enabled": false,
+		"model_limits":         "",
+		"group":                "default",
+		"cross_group_retry":    false,
+	}
+
+	ctx, recorder := newAuthenticatedContext(t, http.MethodPost, "/api/token/", body, 1)
+	ctx.Set("role", common.RoleAdminUser)
+	AddToken(ctx)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected success response, got message: %s", response.Message)
+	}
+
+	var created tokenCreateResponse
+	if err := common.Unmarshal(response.Data, &created); err != nil {
+		t.Fatalf("failed to decode create token response: %v", err)
+	}
+	if created.UserID != 4 {
+		t.Fatalf("expected created token to belong to user 4, got %+v", created)
+	}
+	if !strings.HasPrefix(created.Value, "sk-") {
+		t.Fatalf("expected plaintext key with sk- prefix, got %+v", created)
+	}
+	if created.Key == "" || created.MaskedKey == "" || created.Key != created.MaskedKey {
+		t.Fatalf("expected masked key metadata, got %+v", created)
+	}
+	if created.Group != "default" {
+		t.Fatalf("expected default group, got %+v", created)
+	}
+
+	token, err := model.GetTokenById(created.ID)
+	if err != nil {
+		t.Fatalf("failed to reload created token: %v", err)
+	}
+	if token.UserId != 4 {
+		t.Fatalf("expected persisted token owner 4, got %d", token.UserId)
+	}
+	if created.Value != "sk-"+token.GetFullKey() {
+		t.Fatalf("expected create response to include full key, got %+v", created)
 	}
 }
