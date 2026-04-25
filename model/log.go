@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,7 +15,32 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+var logMigrationOnce sync.Once
+
+type logMigrationStage string
+
+const (
+	logMigrationStageIdle      logMigrationStage = "idle"
+	logMigrationStageStarted   logMigrationStage = "started"
+	logMigrationStageCopied    logMigrationStage = "copied"
+	logMigrationStageVerified  logMigrationStage = "verified"
+	logMigrationStageCleared   logMigrationStage = "cleared"
+	logMigrationStageCompleted logMigrationStage = "completed"
+	logMigrationStageFailed    logMigrationStage = "failed"
+)
+
+var logMigrationState = struct {
+	sync.Mutex
+	Stage       logMigrationStage
+	SourceCount int64
+	MaxID       int
+	Migrated    int64
+}{
+	Stage: logMigrationStageIdle,
+}
 
 type Log struct {
 	Id               int    `json:"id" gorm:"index:idx_created_at_id,priority:1;index:idx_user_id_id,priority:2"`
@@ -530,4 +556,166 @@ func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int) (int64,
 	}
 
 	return total, nil
+}
+
+func MigrateOldLogsToLogDBIfNeeded() {
+	if !shouldMigrateOldLogsToLogDB() {
+		return
+	}
+	logMigrationOnce.Do(func() {
+		gopool.Go(func() {
+			if err := migrateOldLogsToLogDB(); err != nil {
+				setLogMigrationState(logMigrationStageFailed, 0, 0, 0)
+				common.SysError("log migration failed: " + err.Error())
+			}
+		})
+	})
+}
+
+func migrateOldLogsToLogDB() error {
+	batchSize := getLogMigrationBatchSize()
+
+	var sourceCount int64
+	if err := DB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
+		return err
+	}
+	if sourceCount == 0 {
+		setLogMigrationState(logMigrationStageCompleted, 0, 0, 0)
+		return nil
+	}
+	var maxLog Log
+	if err := DB.Select("id").Order("id desc").First(&maxLog).Error; err != nil {
+		return err
+	}
+
+	var targetCount int64
+	if err := LOG_DB.Model(&Log{}).Count(&targetCount).Error; err != nil {
+		return err
+	}
+	if targetCount > 0 && !common.AllowLogMigrationToNonEmptyTarget {
+		return fmt.Errorf("log migration aborted: target log database is not empty")
+	}
+
+	setLogMigrationState(logMigrationStageStarted, sourceCount, maxLog.Id, 0)
+	common.SysLog(fmt.Sprintf("starting log migration: %d rows, max_id=%d, batch_size=%d", sourceCount, maxLog.Id, batchSize))
+
+	lastID := 0
+	var migrated int64
+	lastProgressAt := time.Now()
+	lastProgressRows := int64(0)
+	for {
+		var batch []Log
+		if err := DB.Where("id > ? AND id <= ?", lastID, maxLog.Id).Order("id asc").Limit(batchSize).Find(&batch).Error; err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if err := LOG_DB.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoNothing: true,
+		}).CreateInBatches(batch, batchSize).Error; err != nil {
+			return err
+		}
+		lastID = batch[len(batch)-1].Id
+		migrated += int64(len(batch))
+		setLogMigrationState(logMigrationStageStarted, sourceCount, maxLog.Id, migrated)
+		if migrated-lastProgressRows >= int64(batchSize) || time.Since(lastProgressAt) >= 10*time.Second {
+			common.SysLog(fmt.Sprintf("log migration progress: %d/%d rows", migrated, sourceCount))
+			lastProgressAt = time.Now()
+			lastProgressRows = migrated
+		}
+	}
+	setLogMigrationState(logMigrationStageCopied, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration copy completed: %d/%d rows", migrated, sourceCount))
+
+	if err := syncLogIDSequence(LOG_DB); err != nil {
+		return err
+	}
+
+	if err := verifyMigratedLogs(maxLog.Id, batchSize); err != nil {
+		return err
+	}
+	setLogMigrationState(logMigrationStageVerified, sourceCount, maxLog.Id, migrated)
+
+	if err := clearSourceLogs(); err != nil {
+		return err
+	}
+	setLogMigrationState(logMigrationStageCleared, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration source cleanup completed: cleared %d rows", sourceCount))
+
+	var sourceCountAfter int64
+	if err := DB.Model(&Log{}).Count(&sourceCountAfter).Error; err != nil {
+		return err
+	}
+	if sourceCountAfter != 0 {
+		return fmt.Errorf("log migration cleanup failed: source log table still has %d rows", sourceCountAfter)
+	}
+
+	setLogMigrationState(logMigrationStageCompleted, sourceCount, maxLog.Id, migrated)
+	common.SysLog(fmt.Sprintf("log migration completed: migrated %d rows", migrated))
+	return nil
+}
+
+func setLogMigrationState(stage logMigrationStage, sourceCount int64, maxID int, migrated int64) {
+	logMigrationState.Lock()
+	defer logMigrationState.Unlock()
+	logMigrationState.Stage = stage
+	logMigrationState.SourceCount = sourceCount
+	logMigrationState.MaxID = maxID
+	logMigrationState.Migrated = migrated
+}
+
+func verifyMigratedLogs(maxID int, batchSize int) error {
+	lastID := 0
+	for {
+		var ids []int
+		if err := DB.Model(&Log{}).
+			Where("id > ? AND id <= ?", lastID, maxID).
+			Order("id asc").
+			Limit(batchSize).
+			Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		var targetCount int64
+		if err := LOG_DB.Model(&Log{}).Where("id IN ?", ids).Count(&targetCount).Error; err != nil {
+			return err
+		}
+		if targetCount != int64(len(ids)) {
+			return fmt.Errorf("log migration verification failed: expected %d rows for id range %d-%d, got %d", len(ids), ids[0], ids[len(ids)-1], targetCount)
+		}
+		lastID = ids[len(ids)-1]
+	}
+}
+
+func shouldMigrateOldLogsToLogDB() bool {
+	return common.AutoMigrateOldLogsToLogDB && DB != nil && LOG_DB != nil && DB != LOG_DB
+}
+
+func getLogMigrationBatchSize() int {
+	if common.LogMigrationBatchSize > 0 {
+		return common.LogMigrationBatchSize
+	}
+	return 10000
+}
+
+func clearSourceLogs() error {
+	switch {
+	case common.UsingPostgreSQL, common.UsingMySQL:
+		return DB.Exec("TRUNCATE TABLE logs").Error
+	default:
+		return DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Log{}).Error
+	}
+}
+
+func syncLogIDSequence(db *gorm.DB) error {
+	switch common.LogSqlType {
+	case common.DatabaseTypePostgreSQL:
+		return db.Exec("SELECT setval(pg_get_serial_sequence('logs', 'id'), COALESCE((SELECT MAX(id) FROM logs), 1), (SELECT COUNT(*) > 0 FROM logs))").Error
+	default:
+		return nil
+	}
 }
