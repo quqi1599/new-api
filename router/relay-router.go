@@ -1,6 +1,8 @@
 package router
 
 import (
+	"net/http"
+
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
@@ -13,7 +15,7 @@ import (
 func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
-	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
+	router.Use(middleware.BodyStorageCleanup()) // Clean up request body storage.
 	router.Use(middleware.StatsMiddleware())
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
@@ -24,7 +26,7 @@ func SetRelayRouter(router *gin.Engine) {
 			switch {
 			case c.GetHeader("x-api-key") != "" && c.GetHeader("anthropic-version") != "":
 				controller.ListModels(c, constant.ChannelTypeAnthropic)
-			case c.GetHeader("x-goog-api-key") != "" || c.Query("key") != "": // 单独的适配
+			case c.GetHeader("x-goog-api-key") != "" || c.Query("key") != "": // Dedicated Gemini compatibility.
 				controller.RetrieveModel(c, constant.ChannelTypeGemini)
 			default:
 				controller.ListModels(c, constant.ChannelTypeOpenAI)
@@ -72,12 +74,17 @@ func SetRelayRouter(router *gin.Engine) {
 	relayV1Router.Use(middleware.TokenAuth())
 	relayV1Router.Use(middleware.ModelRequestRateLimit())
 	{
-		// WebSocket 路由（统一到 Relay）
+		// WebSocket routes are unified through Relay.
 		wsRouter := relayV1Router.Group("")
 		wsRouter.Use(middleware.Distribute())
 		wsRouter.GET("/realtime", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIRealtime)
 		})
+	}
+	{
+		embeddingUnsupported := relayV1Router.Group("")
+		embeddingUnsupported.POST("/embeddings", rejectEmbeddings)
+		embeddingUnsupported.POST("/engines/:model/embeddings", rejectEmbeddings)
 	}
 	{
 		//http router
@@ -116,11 +123,6 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.Relay(c, types.RelayFormatOpenAIImage)
 		})
 
-		// embedding related routes
-		httpRouter.POST("/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatEmbedding)
-		})
-
 		// audio related routes
 		httpRouter.POST("/audio/transcriptions", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatOpenAIAudio)
@@ -138,9 +140,6 @@ func SetRelayRouter(router *gin.Engine) {
 		})
 
 		// gemini relay routes
-		httpRouter.POST("/engines/:model/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
-		})
 		httpRouter.POST("/models/*path", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
@@ -193,11 +192,22 @@ func SetRelayRouter(router *gin.Engine) {
 	relayGeminiRouter.Use(middleware.ModelRequestRateLimit())
 	relayGeminiRouter.Use(middleware.Distribute())
 	{
-		// Gemini API 路径格式: /v1beta/models/{model_name}:{action}
+		// Gemini API path format: /v1beta/models/{model_name}:{action}
 		relayGeminiRouter.POST("/models/*path", func(c *gin.Context) {
 			controller.Relay(c, types.RelayFormatGemini)
 		})
 	}
+}
+
+func rejectEmbeddings(c *gin.Context) {
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error": types.OpenAIError{
+			Message: "当前平台暂不支持嵌入模型/向量接口，请改用聊天模型接口。",
+			Type:    "unsupported_endpoint",
+			Param:   "",
+			Code:    "embeddings_not_supported",
+		},
+	})
 }
 
 func registerMjRouterGroup(relayMjRouter *gin.RouterGroup) {

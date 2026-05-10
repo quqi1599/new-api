@@ -81,7 +81,7 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 			Function: dto.FunctionRequest{
 				Name:        claudeTool.Name,
 				Description: claudeTool.Description,
-				Parameters:  claudeTool.InputSchema,
+				Parameters:  sanitizeOpenAIFunctionParameters(claudeTool.InputSchema),
 			},
 		}
 		openAITools = append(openAITools, openAITool)
@@ -331,7 +331,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			}
 			resp.SetIndex(0)
 			claudeResponses = append(claudeResponses, resp)
-			// 首块包含工具 delta，则追加 input_json_delta
+			// If the first chunk contains a tool delta, append input_json_delta.
 			if toolCall.Function.Arguments != "" {
 				idx := 0
 				claudeResponses = append(claudeResponses, &dto.ClaudeResponse{
@@ -346,7 +346,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 		} else {
 
 		}
-		// 判断首个响应是否存在内容（非标准的 OpenAI 响应）
+		// Check whether the first response has content for non-standard OpenAI responses.
 		if len(openAIResponse.Choices) > 0 {
 			reasoning := openAIResponse.Choices[0].Delta.GetReasoningContent()
 			content := openAIResponse.Choices[0].Delta.GetContentString()
@@ -400,7 +400,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 			}
 		}
 
-		// 如果首块就带 finish_reason，需要立即发送停止块
+		// If the first chunk already has finish_reason, send the stop block immediately.
 		if len(openAIResponse.Choices) > 0 && openAIResponse.Choices[0].FinishReason != nil && *openAIResponse.Choices[0].FinishReason != "" {
 			info.FinishReason = *openAIResponse.Choices[0].FinishReason
 			stopOpenBlocks()
@@ -427,7 +427,7 @@ func StreamResponseOpenAI2Claude(openAIResponse *dto.ChatCompletionsStreamRespon
 
 	if len(openAIResponse.Choices) == 0 {
 		// no choices
-		// 可能为非标准的 OpenAI 响应，判断是否已经完成
+		// This may be a non-standard OpenAI response, so check whether it has completed.
 		if info.ClaudeConvertInfo.Done {
 			stopOpenBlocks()
 			oaiUsage := info.ClaudeConvertInfo.Usage
@@ -642,14 +642,14 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 		Stream: lo.ToPtr(info.IsStream),
 	}
 
-	// 转换 messages
+	// Convert messages.
 	var messages []dto.Message
 	for _, content := range geminiRequest.Contents {
 		message := dto.Message{
 			Role: convertGeminiRoleToOpenAI(content.Role),
 		}
 
-		// 处理 parts
+		// Process parts.
 		var mediaContents []dto.MediaContent
 		var toolCalls []dto.ToolCallRequest
 		for _, part := range content.Parts {
@@ -680,9 +680,9 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				}
 				mediaContents = append(mediaContents, mediaContent)
 			} else if part.FunctionCall != nil {
-				// 处理 Gemini 的工具调用
+				// Process Gemini tool calls.
 				toolCall := dto.ToolCallRequest{
-					ID:   fmt.Sprintf("call_%d", len(toolCalls)+1), // 生成唯一ID
+					ID:   fmt.Sprintf("call_%d", len(toolCalls)+1), // Generate a unique ID.
 					Type: "function",
 					Function: dto.FunctionRequest{
 						Name:      part.FunctionCall.FunctionName,
@@ -691,29 +691,29 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 				}
 				toolCalls = append(toolCalls, toolCall)
 			} else if part.FunctionResponse != nil {
-				// 处理 Gemini 的工具响应，创建单独的 tool 消息
+				// Process Gemini tool responses and create separate tool messages.
 				toolMessage := dto.Message{
 					Role:       "tool",
-					ToolCallId: fmt.Sprintf("call_%d", len(toolCalls)), // 使用对应的调用ID
+					ToolCallId: fmt.Sprintf("call_%d", len(toolCalls)), // Use the matching call ID.
 				}
 				toolMessage.SetStringContent(toJSONString(part.FunctionResponse.Response))
 				messages = append(messages, toolMessage)
 			}
 		}
 
-		// 设置消息内容
+		// Set message content.
 		if len(toolCalls) > 0 {
-			// 如果有工具调用，设置工具调用
+			// Set tool calls when present.
 			message.SetToolCalls(toolCalls)
 		} else if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
-			// 如果只有一个文本内容，直接设置字符串
+			// Use a string when there is only one text item.
 			message.Content = mediaContents[0].Text
 		} else if len(mediaContents) > 0 {
-			// 如果有多个内容或包含媒体，设置为数组
+			// Use an array when there are multiple items or media content.
 			message.SetMediaContent(mediaContents)
 		}
 
-		// 只有当消息有内容或工具调用时才添加
+		// Add the message only when it has content or tool calls.
 		if len(message.ParseContent()) > 0 || len(message.ToolCalls) > 0 {
 			messages = append(messages, message)
 		}
@@ -733,7 +733,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 	if geminiRequest.GenerationConfig.MaxOutputTokens != nil && *geminiRequest.GenerationConfig.MaxOutputTokens > 0 {
 		openaiRequest.MaxTokens = lo.ToPtr(*geminiRequest.GenerationConfig.MaxOutputTokens)
 	}
-	// gemini stop sequences 最多 5 个，openai stop 最多 4 个
+	// Gemini supports up to 5 stop sequences, while OpenAI supports up to 4.
 	if len(geminiRequest.GenerationConfig.StopSequences) > 0 {
 		openaiRequest.Stop = geminiRequest.GenerationConfig.StopSequences[:4]
 	}
@@ -741,7 +741,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 		openaiRequest.N = lo.ToPtr(*geminiRequest.GenerationConfig.CandidateCount)
 	}
 
-	// 转换工具调用
+	// Convert tool calls.
 	if len(geminiRequest.GetTools()) > 0 {
 		var tools []dto.ToolCallRequest
 		for _, tool := range geminiRequest.GetTools() {
@@ -771,7 +771,7 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 
 	// gemini system instructions
 	if geminiRequest.SystemInstructions != nil {
-		// 将系统指令作为第一条消息插入
+		// Insert system instructions as the first message.
 		systemMessage := dto.Message{
 			Role:    "system",
 			Content: extractTextFromGeminiParts(geminiRequest.SystemInstructions.Parts),
@@ -805,7 +805,7 @@ func extractTextFromGeminiParts(parts []dto.GeminiPart) string {
 	return strings.Join(texts, "\n")
 }
 
-// ResponseOpenAI2Gemini 将 OpenAI 响应转换为 Gemini 格式
+// ResponseOpenAI2Gemini converts an OpenAI response to the Gemini format.
 func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relaycommon.RelayInfo) *dto.GeminiChatResponse {
 	geminiResponse := &dto.GeminiChatResponse{
 		Candidates: make([]dto.GeminiChatCandidate, 0, len(openAIResponse.Choices)),
@@ -822,7 +822,7 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 			SafetyRatings: []dto.GeminiChatSafetyRating{},
 		}
 
-		// 设置结束原因
+		// Set the finish reason.
 		var finishReason string
 		switch choice.FinishReason {
 		case "stop":
@@ -838,17 +838,17 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 		}
 		candidate.FinishReason = &finishReason
 
-		// 转换消息内容
+		// Convert message content.
 		content := dto.GeminiChatContent{
 			Role:  "model",
 			Parts: make([]dto.GeminiPart, 0),
 		}
 
-		// 处理工具调用
+		// Process tool calls.
 		toolCalls := choice.Message.ParseToolCalls()
 		if len(toolCalls) > 0 {
 			for _, toolCall := range toolCalls {
-				// 解析参数
+				// Parse arguments.
 				var args map[string]interface{}
 				if toolCall.Function.Arguments != "" {
 					if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
@@ -867,7 +867,7 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 				content.Parts = append(content.Parts, part)
 			}
 		} else {
-			// 处理文本内容
+			// Process text content.
 			textContent := choice.Message.StringContent()
 			if textContent != "" {
 				part := dto.GeminiPart{
@@ -884,9 +884,9 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 	return geminiResponse
 }
 
-// StreamResponseOpenAI2Gemini 将 OpenAI 流式响应转换为 Gemini 格式
+// StreamResponseOpenAI2Gemini converts an OpenAI streaming response to the Gemini format.
 func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamResponse, info *relaycommon.RelayInfo) *dto.GeminiChatResponse {
-	// 检查是否有实际内容或结束标志
+	// Check whether there is actual content or a finish marker.
 	hasContent := false
 	hasFinishReason := false
 	for _, choice := range openAIResponse.Choices {
@@ -898,7 +898,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 		}
 	}
 
-	// 如果没有实际内容且没有结束标志，跳过。主要针对 openai 流响应开头的空数据
+	// Skip chunks with no actual content and no finish marker, mainly for empty data at the start of OpenAI streams.
 	if !hasContent && !hasFinishReason {
 		return nil
 	}
@@ -907,7 +907,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 		Candidates: make([]dto.GeminiChatCandidate, 0, len(openAIResponse.Choices)),
 		UsageMetadata: dto.GeminiUsageMetadata{
 			PromptTokenCount:     info.GetEstimatePromptTokens(),
-			CandidatesTokenCount: 0, // 流式响应中可能没有完整的 usage 信息
+			CandidatesTokenCount: 0, // Streaming responses may not contain complete usage information.
 			TotalTokenCount:      info.GetEstimatePromptTokens(),
 		},
 	}
@@ -924,7 +924,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 			SafetyRatings: []dto.GeminiChatSafetyRating{},
 		}
 
-		// 设置结束原因
+		// Set the finish reason.
 		if choice.FinishReason != nil {
 			var finishReason string
 			switch *choice.FinishReason {
@@ -942,16 +942,16 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 			candidate.FinishReason = &finishReason
 		}
 
-		// 转换消息内容
+		// Convert message content.
 		content := dto.GeminiChatContent{
 			Role:  "model",
 			Parts: make([]dto.GeminiPart, 0),
 		}
 
-		// 处理工具调用
+		// Process tool calls.
 		if choice.Delta.ToolCalls != nil {
 			for _, toolCall := range choice.Delta.ToolCalls {
-				// 解析参数
+				// Parse arguments.
 				var args map[string]interface{}
 				if toolCall.Function.Arguments != "" {
 					if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
@@ -970,7 +970,7 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 				content.Parts = append(content.Parts, part)
 			}
 		} else {
-			// 处理文本内容
+			// Process text content.
 			textContent := choice.Delta.GetContentString()
 			if textContent != "" {
 				part := dto.GeminiPart{
