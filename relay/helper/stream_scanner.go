@@ -27,6 +27,17 @@ const (
 	DefaultPingInterval         = 10 * time.Second
 )
 
+func NormalizeSSEPayload(data string) (payload string, done bool) {
+	payload = strings.TrimSpace(data)
+	for strings.HasPrefix(payload, "data:") {
+		payload = strings.TrimSpace(payload[len("data:"):])
+	}
+	if strings.HasPrefix(payload, "[DONE]") {
+		return "[DONE]", true
+	}
+	return payload, false
+}
+
 func getScannerBufferSize() int {
 	if constant.StreamScannerMaxBufferMB > 0 {
 		return constant.StreamScannerMaxBufferMB << 20
@@ -241,33 +252,30 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				println(data)
 			}
 
-			if len(data) < 6 {
+			trimmedLine := strings.TrimSpace(data)
+			if !strings.HasPrefix(trimmedLine, "data:") && !strings.HasPrefix(trimmedLine, "[DONE]") {
 				continue
 			}
-			if data[:5] != "data:" && data[:6] != "[DONE]" {
-				continue
-			}
-			data = data[5:]
-			data = strings.TrimSpace(data)
-			if data == "" {
-				continue
-			}
-			if !strings.HasPrefix(data, "[DONE]") {
-				info.SetFirstResponseTime()
-				info.ReceivedResponseCount++
-
-				select {
-				case dataChan <- data:
-				case <-ctx.Done():
-					return
-				case <-stopChan:
-					return
-				}
-			} else {
+			data, done := NormalizeSSEPayload(trimmedLine)
+			if done {
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				if common.DebugEnabled {
 					println("received [DONE], stopping scanner")
 				}
+				return
+			}
+			if data == "" {
+				continue
+			}
+
+			info.SetFirstResponseTime()
+			info.ReceivedResponseCount++
+
+			select {
+			case dataChan <- data:
+			case <-ctx.Done():
+				return
+			case <-stopChan:
 				return
 			}
 		}

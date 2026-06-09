@@ -1,7 +1,6 @@
 package openai
 
 import (
-	"encoding/json"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -20,6 +19,11 @@ import (
 
 // 辅助函数
 func HandleStreamFormat(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
+	data, done := helper.NormalizeSSEPayload(data)
+	if done || data == "" {
+		return nil
+	}
+
 	info.SendResponseCount++
 
 	switch info.RelayFormat {
@@ -92,7 +96,23 @@ func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, res
 	return nil
 }
 
+func normalizeStreamItems(streamItems []string) []string {
+	normalizedItems := make([]string, 0, len(streamItems))
+	for _, item := range streamItems {
+		payload, done := helper.NormalizeSSEPayload(item)
+		if done || payload == "" {
+			continue
+		}
+		normalizedItems = append(normalizedItems, payload)
+	}
+	return normalizedItems
+}
+
 func processTokens(relayMode int, streamItems []string, responseTextBuilder *strings.Builder, toolCount *int) error {
+	streamItems = normalizeStreamItems(streamItems)
+	if len(streamItems) == 0 {
+		return nil
+	}
 	streamResp := "[" + strings.Join(streamItems, ",") + "]"
 
 	switch relayMode {
@@ -106,12 +126,12 @@ func processTokens(relayMode int, streamItems []string, responseTextBuilder *str
 
 func processChatCompletions(streamResp string, streamItems []string, responseTextBuilder *strings.Builder, toolCount *int) error {
 	var streamResponses []dto.ChatCompletionsStreamResponse
-	if err := json.Unmarshal(common.StringToByteSlice(streamResp), &streamResponses); err != nil {
+	if err := common.Unmarshal(common.StringToByteSlice(streamResp), &streamResponses); err != nil {
 		// 一次性解析失败，逐个解析
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		for _, item := range streamItems {
 			var streamResponse dto.ChatCompletionsStreamResponse
-			if err := json.Unmarshal(common.StringToByteSlice(item), &streamResponse); err != nil {
+			if err := common.Unmarshal(common.StringToByteSlice(item), &streamResponse); err != nil {
 				return err
 			}
 			if err := ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount); err != nil {
@@ -142,12 +162,12 @@ func processChatCompletions(streamResp string, streamItems []string, responseTex
 
 func processCompletions(streamResp string, streamItems []string, responseTextBuilder *strings.Builder) error {
 	var streamResponses []dto.CompletionsStreamResponse
-	if err := json.Unmarshal(common.StringToByteSlice(streamResp), &streamResponses); err != nil {
+	if err := common.Unmarshal(common.StringToByteSlice(streamResp), &streamResponses); err != nil {
 		// 一次性解析失败，逐个解析
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		for _, item := range streamItems {
 			var streamResponse dto.CompletionsStreamResponse
-			if err := json.Unmarshal(common.StringToByteSlice(item), &streamResponse); err != nil {
+			if err := common.Unmarshal(common.StringToByteSlice(item), &streamResponse); err != nil {
 				continue
 			}
 			for _, choice := range streamResponse.Choices {
@@ -170,6 +190,12 @@ func handleLastResponse(lastStreamData string, responseId *string, createAt *int
 	systemFingerprint *string, model *string, usage **dto.Usage,
 	containStreamUsage *bool, info *relaycommon.RelayInfo,
 	shouldSendLastResp *bool) error {
+
+	lastStreamData, done := helper.NormalizeSSEPayload(lastStreamData)
+	if done || lastStreamData == "" {
+		*shouldSendLastResp = false
+		return nil
+	}
 
 	var lastStreamResponse dto.ChatCompletionsStreamResponse
 	if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &lastStreamResponse); err != nil {
@@ -208,6 +234,10 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 		helper.Done(c)
 
 	case types.RelayFormatClaude:
+		lastStreamData, done := helper.NormalizeSSEPayload(lastStreamData)
+		if done || lastStreamData == "" {
+			return
+		}
 		var streamResponse dto.ChatCompletionsStreamResponse
 		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
@@ -223,6 +253,10 @@ func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStream
 		info.ClaudeConvertInfo.Done = true
 
 	case types.RelayFormatGemini:
+		lastStreamData, done := helper.NormalizeSSEPayload(lastStreamData)
+		if done || lastStreamData == "" {
+			return
+		}
 		var streamResponse dto.ChatCompletionsStreamResponse
 		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())

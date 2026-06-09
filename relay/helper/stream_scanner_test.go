@@ -226,6 +226,96 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 	assert.Equal(t, "{\"trimmed\":true}", got)
 }
 
+func TestNormalizeSSEPayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		input       string
+		wantPayload string
+		wantDone    bool
+	}{
+		{
+			name:        "standard data",
+			input:       "data: {\"id\":1}",
+			wantPayload: "{\"id\":1}",
+		},
+		{
+			name:        "compact data",
+			input:       "data:{\"id\":1}",
+			wantPayload: "{\"id\":1}",
+		},
+		{
+			name:        "nested data",
+			input:       "data: data: {\"id\":1}",
+			wantPayload: "{\"id\":1}",
+		},
+		{
+			name:        "compact nested data",
+			input:       "data:data:{\"id\":1}",
+			wantPayload: "{\"id\":1}",
+		},
+		{
+			name:        "done",
+			input:       "data: [DONE]",
+			wantPayload: "[DONE]",
+			wantDone:    true,
+		},
+		{
+			name:        "nested done",
+			input:       "data: data: [DONE]",
+			wantPayload: "[DONE]",
+			wantDone:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gotPayload, gotDone := NormalizeSSEPayload(tt.input)
+			assert.Equal(t, tt.wantPayload, gotPayload)
+			assert.Equal(t, tt.wantDone, gotDone)
+		})
+	}
+}
+
+func TestStreamScannerHandler_NormalizesNestedDataPrefixes(t *testing.T) {
+	t.Parallel()
+
+	body := "data: data: {\"trimmed\":true}\ndata:data:{\"compact\":true}\ndata: {\"id\":1}\ndata: [DONE]\n"
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+
+	var got []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+
+	require.Equal(t, []string{
+		"{\"trimmed\":true}",
+		"{\"compact\":true}",
+		"{\"id\":1}",
+	}, got)
+	assert.Equal(t, 3, info.ReceivedResponseCount)
+}
+
+func TestStreamScannerHandler_NestedDoneStopsScanner(t *testing.T) {
+	t.Parallel()
+
+	body := "data: {\"id\":1}\ndata: data: [DONE]\ndata: {\"id\":2}\n"
+	c, resp, info := setupStreamTest(t, strings.NewReader(body))
+
+	var got []string
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {
+		got = append(got, data)
+	})
+
+	require.Equal(t, []string{"{\"id\":1}"}, got)
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+}
+
 // ---------- Decoupling ----------
 
 func TestStreamScannerHandler_ScannerDecoupledFromSlowHandler(t *testing.T) {
