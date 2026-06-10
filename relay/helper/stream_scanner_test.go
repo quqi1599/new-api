@@ -1,6 +1,7 @@
 package helper
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -64,6 +65,48 @@ type slowReader struct {
 func (s *slowReader) Read(p []byte) (int, error) {
 	time.Sleep(s.delay)
 	return s.r.Read(p)
+}
+
+type blockingReadCloser struct {
+	closeOnce sync.Once
+	closeCh   chan struct{}
+	closed    atomic.Bool
+	err       error
+}
+
+func newBlockingReadCloser(err error) *blockingReadCloser {
+	return &blockingReadCloser{
+		closeCh: make(chan struct{}),
+		err:     err,
+	}
+}
+
+func (r *blockingReadCloser) Read(p []byte) (int, error) {
+	<-r.closeCh
+	if r.err != nil {
+		return 0, r.err
+	}
+	return 0, io.EOF
+}
+
+func (r *blockingReadCloser) Close() error {
+	r.closed.Store(true)
+	r.closeOnce.Do(func() {
+		close(r.closeCh)
+	})
+	return nil
+}
+
+type errReadCloser struct {
+	err error
+}
+
+func (r *errReadCloser) Read(p []byte) (int, error) {
+	return 0, r.err
+}
+
+func (r *errReadCloser) Close() error {
+	return nil
 }
 
 // ---------- Basic correctness ----------
@@ -314,6 +357,88 @@ func TestStreamScannerHandler_NestedDoneStopsScanner(t *testing.T) {
 	require.Equal(t, []string{"{\"id\":1}"}, got)
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonDone, info.StreamStatus.EndReason)
+}
+
+func TestStreamScannerHandler_ClientGoneClosesUpstreamBodyBeforeWaiting(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx, cancel := context.WithCancel(req.Context())
+	c.Request = req.WithContext(ctx)
+
+	body := newBlockingReadCloser(fmt.Errorf("read tcp 192.168.135.228:1572->192.168.191.54:8317: use of closed network connection"))
+	resp := &http.Response{Body: body}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client_gone cleanup waited too long; upstream body was not closed promptly")
+	}
+
+	assert.True(t, body.closed.Load(), "upstream response body should be closed when client is gone")
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+func TestStreamScannerHandler_TimeoutClosesUpstreamBody(t *testing.T) {
+	// Not parallel: modifies global constant.StreamingTimeout
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	body := newBlockingReadCloser(fmt.Errorf("http: read on closed response body"))
+	resp := &http.Response{Body: body}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout cleanup waited too long; upstream body was not closed promptly")
+	}
+
+	assert.True(t, body.closed.Load(), "upstream response body should be closed on stream timeout")
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
+	assert.Less(t, time.Since(start), 3*time.Second)
+}
+
+func TestStreamScannerHandler_UnexpectedEOFStillScannerError(t *testing.T) {
+	t.Parallel()
+
+	c, resp, info := setupStreamTest(t, &errReadCloser{err: io.ErrUnexpectedEOF})
+
+	StreamScannerHandler(c, resp, info, func(data string, sr *StreamResult) {})
+
+	require.NotNil(t, info.StreamStatus)
+	assert.Equal(t, relaycommon.StreamEndReasonScannerErr, info.StreamStatus.EndReason)
+	assert.ErrorIs(t, info.StreamStatus.EndError, io.ErrUnexpectedEOF)
 }
 
 // ---------- Decoupling ----------

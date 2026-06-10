@@ -29,9 +29,9 @@ type StreamErrorEntry struct {
 }
 
 type StreamStatus struct {
-	EndReason  StreamEndReason
-	EndError   error
-	endOnce    sync.Once
+	EndReason StreamEndReason
+	EndError  error
+	endOnce   sync.Once
 
 	mu         sync.Mutex
 	Errors     []StreamErrorEntry
@@ -85,6 +85,26 @@ func (s *StreamStatus) TotalErrorCount() int {
 	return s.ErrorCount
 }
 
+func (s *StreamStatus) CopyErrorsFrom(src *StreamStatus) {
+	if s == nil || src == nil {
+		return
+	}
+	src.mu.Lock()
+	defer src.mu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ErrorCount += src.ErrorCount
+	if remaining := maxStreamErrorEntries - len(s.Errors); remaining > 0 {
+		errorsToCopy := src.Errors
+		if len(errorsToCopy) > remaining {
+			errorsToCopy = errorsToCopy[:remaining]
+		}
+		s.Errors = append(s.Errors, errorsToCopy...)
+	}
+}
+
 func (s *StreamStatus) IsNormalEnd() bool {
 	if s == nil {
 		return true
@@ -92,6 +112,16 @@ func (s *StreamStatus) IsNormalEnd() bool {
 	return s.EndReason == StreamEndReasonDone ||
 		s.EndReason == StreamEndReasonEOF ||
 		s.EndReason == StreamEndReasonHandlerStop
+}
+
+func (s *StreamStatus) IsAbortLikeEnd() bool {
+	if s == nil {
+		return false
+	}
+	return s.EndReason == StreamEndReasonClientGone ||
+		s.EndReason == StreamEndReasonTimeout ||
+		s.EndReason == StreamEndReasonHandlerStop ||
+		s.EndReason == StreamEndReasonPingFail
 }
 
 func (s *StreamStatus) Summary() string {

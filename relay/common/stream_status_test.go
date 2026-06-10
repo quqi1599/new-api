@@ -128,6 +128,21 @@ func TestStreamStatus_HasErrors_NilSafe(t *testing.T) {
 	assert.Equal(t, 0, s.TotalErrorCount())
 }
 
+func TestStreamStatus_CopyErrorsFrom(t *testing.T) {
+	t.Parallel()
+
+	src := NewStreamStatus()
+	src.RecordError("pre-existing error")
+	dst := NewStreamStatus()
+
+	dst.CopyErrorsFrom(src)
+
+	assert.True(t, dst.HasErrors())
+	assert.Equal(t, 1, dst.TotalErrorCount())
+	assert.Len(t, dst.Errors, 1)
+	assert.Equal(t, "pre-existing error", dst.Errors[0].Message)
+}
+
 func TestStreamStatus_IsNormalEnd(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -148,6 +163,31 @@ func TestStreamStatus_IsNormalEnd(t *testing.T) {
 		s := NewStreamStatus()
 		s.SetEndReason(tt.reason, nil)
 		assert.Equal(t, tt.normal, s.IsNormalEnd(), "reason=%s", tt.reason)
+	}
+}
+
+func TestStreamStatus_IsAbortLikeEnd(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		reason    StreamEndReason
+		abortLike bool
+	}{
+		{StreamEndReasonClientGone, true},
+		{StreamEndReasonTimeout, true},
+		{StreamEndReasonHandlerStop, true},
+		{StreamEndReasonPingFail, true},
+		{StreamEndReasonScannerErr, false},
+		{StreamEndReasonDone, false},
+		{StreamEndReasonEOF, false},
+		{StreamEndReasonPanic, false},
+		{StreamEndReasonNone, false},
+	}
+
+	for _, tt := range tests {
+		s := NewStreamStatus()
+		s.SetEndReason(tt.reason, nil)
+		assert.Equal(t, tt.abortLike, s.IsAbortLikeEnd(), "reason=%s", tt.reason)
 	}
 }
 
