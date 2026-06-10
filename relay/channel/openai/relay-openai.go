@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -574,6 +575,14 @@ func OpenaiHandlerWithUsage(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
+	if strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		normalizedBody, normalized := normalizeSSEPayloadForUsageResponse(responseBody)
+		if !normalized {
+			return nil, types.NewOpenAIError(fmt.Errorf("empty event-stream response body"), types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
+		}
+		responseBody = normalizedBody
+		resp.Header.Set("Content-Type", "application/json; charset=utf-8")
+	}
 
 	var usageResp dto.SimpleResponse
 	err = common.Unmarshal(responseBody, &usageResp)
@@ -600,6 +609,31 @@ func OpenaiHandlerWithUsage(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 	}
 	applyUsagePostProcessing(info, &usageResp.Usage, responseBody)
 	return &usageResp.Usage, nil
+}
+
+func normalizeSSEPayloadForUsageResponse(responseBody []byte) ([]byte, bool) {
+	if len(bytes.TrimSpace(responseBody)) == 0 {
+		return responseBody, false
+	}
+
+	var lastPayload []byte
+	for _, line := range bytes.Split(responseBody, []byte{'\n'}) {
+		payload := bytes.TrimSpace(line)
+		if len(payload) == 0 || !bytes.HasPrefix(payload, []byte("data:")) {
+			continue
+		}
+		for bytes.HasPrefix(payload, []byte("data:")) {
+			payload = bytes.TrimSpace(payload[len("data:"):])
+		}
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		lastPayload = append(lastPayload[:0], payload...)
+	}
+	if len(lastPayload) == 0 {
+		return responseBody, false
+	}
+	return lastPayload, true
 }
 
 func applyUsagePostProcessing(info *relaycommon.RelayInfo, usage *dto.Usage, responseBody []byte) {
