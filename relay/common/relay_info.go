@@ -153,6 +153,10 @@ type RelayInfo struct {
 	UseRuntimeHeadersOverride             bool
 	ParamOverrideAudit                    []string
 
+	// UpstreamRequestBodySize is used when the upstream request body is wrapped
+	// in a type-erased reader, so net/http can still send Content-Length.
+	UpstreamRequestBodySize int64
+
 	PriceData types.PriceData
 
 	// TieredBillingSnapshot is a frozen snapshot of tiered billing rules
