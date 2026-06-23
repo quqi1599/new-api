@@ -125,7 +125,10 @@ func GetLogByTokenIdPage(tokenId int, startTimestamp int64, endTimestamp int64, 
 	return logs, total, nil
 }
 
-func GetLogByTokenIdCursor(tokenId int, startTimestamp int64, endTimestamp int64, beforeId int, num int, startIdx int) (logs []*Log, nextBeforeId int, err error) {
+func GetLogByTokenIdCursor(ctx context.Context, tokenId int, startTimestamp int64, endTimestamp int64, beforeId int, num int, startIdx int) (logs []*Log, nextBeforeId int, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if num <= 0 {
 		num = common.ItemsPerPage
 	}
@@ -133,7 +136,7 @@ func GetLogByTokenIdCursor(tokenId int, startTimestamp int64, endTimestamp int64
 		startIdx = 0
 	}
 
-	tx := LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId)
+	tx := LOG_DB.WithContext(ctx).Model(&Log{}).Where("token_id = ?", tokenId)
 	if startTimestamp != 0 {
 		tx = tx.Where("created_at >= ?", startTimestamp)
 	}

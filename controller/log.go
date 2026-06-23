@@ -15,6 +15,10 @@ import (
 
 const tokenLogMaxPageSize = 1000
 const tokenLogExportBatchSize = 1000
+const tokenLogExportMaxConcurrent = 2
+const tokenLogExportMaxRangeSeconds int64 = 31 * 24 * 60 * 60
+
+var tokenLogExportSlots = make(chan struct{}, tokenLogExportMaxConcurrent)
 
 func GetAllLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
@@ -161,17 +165,35 @@ func ExportLogByKey(c *gin.Context) {
 		return
 	}
 
-	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
-	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
-	logs, nextBeforeId, err := model.GetLogByTokenIdCursor(tokenId, startTimestamp, endTimestamp, 0, tokenLogExportBatchSize, 0)
+	startTimestamp, endTimestamp, err := getTokenLogExportRange(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	if !acquireTokenLogExportSlot() {
+		c.Header("Retry-After", "30")
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"success": false,
+			"message": "当前导出任务较多，请稍后再试",
+		})
+		return
+	}
+	defer releaseTokenLogExportSlot()
+
+	logs, nextBeforeId, err := model.GetLogByTokenIdCursor(c.Request.Context(), tokenId, startTimestamp, endTimestamp, 0, tokenLogExportBatchSize, 0)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 
 	filename := fmt.Sprintf("token-logs-%d-%s.csv", tokenId, time.Now().Format("20060102150405"))
+	c.Header("Cache-Control", "no-store")
 	c.Header("Content-Type", "text/csv; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 
 	writer := csv.NewWriter(c.Writer)
@@ -203,12 +225,71 @@ func ExportLogByKey(c *gin.Context) {
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		logs, nextBeforeId, err = model.GetLogByTokenIdCursor(tokenId, startTimestamp, endTimestamp, nextBeforeId, tokenLogExportBatchSize, exported)
+		logs, nextBeforeId, err = model.GetLogByTokenIdCursor(c.Request.Context(), tokenId, startTimestamp, endTimestamp, nextBeforeId, tokenLogExportBatchSize, exported)
 		if err != nil {
 			common.SysError("failed to query token log csv rows: " + err.Error())
 			return
 		}
 	}
+}
+
+func acquireTokenLogExportSlot() bool {
+	select {
+	case tokenLogExportSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseTokenLogExportSlot() {
+	select {
+	case <-tokenLogExportSlots:
+	default:
+	}
+}
+
+func getTokenLogExportRange(c *gin.Context) (int64, int64, error) {
+	startTimestamp, err := parseOptionalTimestamp(c.Query("start_timestamp"), "start_timestamp")
+	if err != nil {
+		return 0, 0, err
+	}
+	endTimestamp, err := parseOptionalTimestamp(c.Query("end_timestamp"), "end_timestamp")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	now := time.Now().Unix()
+	if startTimestamp == 0 && endTimestamp == 0 {
+		endTimestamp = now
+		startTimestamp = endTimestamp - tokenLogExportMaxRangeSeconds
+	} else if startTimestamp == 0 {
+		startTimestamp = endTimestamp - tokenLogExportMaxRangeSeconds
+	} else if endTimestamp == 0 {
+		endTimestamp = now
+	}
+
+	if startTimestamp < 0 {
+		startTimestamp = 0
+	}
+	if endTimestamp < startTimestamp {
+		return 0, 0, fmt.Errorf("结束时间不能早于开始时间")
+	}
+	if endTimestamp-startTimestamp > tokenLogExportMaxRangeSeconds {
+		return 0, 0, fmt.Errorf("导出时间范围不能超过31天，请分段导出")
+	}
+	return startTimestamp, endTimestamp, nil
+}
+
+func parseOptionalTimestamp(value string, name string) (int64, error) {
+	if value == "" {
+		return 0, nil
+	}
+	timestamp, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || timestamp < 0 {
+		return 0, fmt.Errorf("%s 参数无效", name)
+	}
+	return timestamp, nil
 }
 
 func tokenLogCsvHeader() []string {

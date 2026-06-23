@@ -142,3 +142,30 @@ func TestExportLogByKeyStreamsCSVForMatchingRange(t *testing.T) {
 		}
 	}
 }
+
+func TestExportLogByKeyRejectsTooLargeRange(t *testing.T) {
+	w := performExportLogByKey(t, "/api/log/token/export?start_timestamp=1&end_timestamp=2678402", 7)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected http 400, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "导出时间范围不能超过31天") {
+		t.Fatalf("unexpected error response: %s", w.Body.String())
+	}
+}
+
+func TestExportLogByKeyRejectsWhenExportSlotsAreFull(t *testing.T) {
+	for i := 0; i < tokenLogExportMaxConcurrent; i++ {
+		if !acquireTokenLogExportSlot() {
+			t.Fatalf("failed to fill export slot %d", i)
+		}
+		defer releaseTokenLogExportSlot()
+	}
+
+	w := performExportLogByKey(t, "/api/log/token/export?start_timestamp=20&end_timestamp=40", 7)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected http 429, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "当前导出任务较多") {
+		t.Fatalf("unexpected error response: %s", w.Body.String())
+	}
+}
