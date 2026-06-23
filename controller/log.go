@@ -1,8 +1,11 @@
 package controller
 
 import (
+	"encoding/csv"
+	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -11,6 +14,7 @@ import (
 )
 
 const tokenLogMaxPageSize = 1000
+const tokenLogExportBatchSize = 1000
 
 func GetAllLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
@@ -145,6 +149,112 @@ func getTokenLogPageSize(c *gin.Context) int {
 		}
 	}
 	return 0
+}
+
+func ExportLogByKey(c *gin.Context) {
+	tokenId := c.GetInt("token_id")
+	if tokenId == 0 {
+		c.JSON(200, gin.H{
+			"success": false,
+			"message": "无效的令牌",
+		})
+		return
+	}
+
+	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+	logs, nextBeforeId, err := model.GetLogByTokenIdCursor(tokenId, startTimestamp, endTimestamp, 0, tokenLogExportBatchSize, 0)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	filename := fmt.Sprintf("token-logs-%d-%s.csv", tokenId, time.Now().Format("20060102150405"))
+	c.Header("Content-Type", "text/csv; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Status(http.StatusOK)
+
+	writer := csv.NewWriter(c.Writer)
+	if err := writer.Write(tokenLogCsvHeader()); err != nil {
+		common.SysError("failed to write token log csv header: " + err.Error())
+		return
+	}
+
+	exported := 0
+	for {
+		for _, log := range logs {
+			if err := writer.Write(tokenLogCsvRow(log)); err != nil {
+				common.SysError("failed to write token log csv row: " + err.Error())
+				return
+			}
+		}
+		exported += len(logs)
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			common.SysError("failed to flush token log csv: " + err.Error())
+			return
+		}
+		if flusher, ok := c.Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if len(logs) < tokenLogExportBatchSize || nextBeforeId == 0 {
+			return
+		}
+		if err := c.Request.Context().Err(); err != nil {
+			return
+		}
+		logs, nextBeforeId, err = model.GetLogByTokenIdCursor(tokenId, startTimestamp, endTimestamp, nextBeforeId, tokenLogExportBatchSize, exported)
+		if err != nil {
+			common.SysError("failed to query token log csv rows: " + err.Error())
+			return
+		}
+	}
+}
+
+func tokenLogCsvHeader() []string {
+	return []string{
+		"id",
+		"created_at",
+		"type",
+		"content",
+		"username",
+		"token_name",
+		"model_name",
+		"quota",
+		"prompt_tokens",
+		"completion_tokens",
+		"use_time",
+		"is_stream",
+		"channel",
+		"channel_name",
+		"group",
+		"ip",
+		"request_id",
+		"other",
+	}
+}
+
+func tokenLogCsvRow(log *model.Log) []string {
+	return []string{
+		strconv.Itoa(log.Id),
+		strconv.FormatInt(log.CreatedAt, 10),
+		strconv.Itoa(log.Type),
+		log.Content,
+		log.Username,
+		log.TokenName,
+		log.ModelName,
+		strconv.Itoa(log.Quota),
+		strconv.Itoa(log.PromptTokens),
+		strconv.Itoa(log.CompletionTokens),
+		strconv.Itoa(log.UseTime),
+		strconv.FormatBool(log.IsStream),
+		strconv.Itoa(log.ChannelId),
+		log.ChannelName,
+		log.Group,
+		log.Ip,
+		log.RequestId,
+		log.Other,
+	}
 }
 
 func GetLogsStat(c *gin.Context) {

@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"encoding/csv"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -33,6 +35,17 @@ func performGetLogByKey(t *testing.T, target string, tokenId int) *httptest.Resp
 	c.Request = httptest.NewRequest(http.MethodGet, target, nil)
 	c.Set("token_id", tokenId)
 	GetLogByKey(c)
+	return w
+}
+
+func performExportLogByKey(t *testing.T, target string, tokenId int) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, target, nil)
+	c.Set("token_id", tokenId)
+	ExportLogByKey(c)
 	return w
 }
 
@@ -95,5 +108,37 @@ func TestGetLogByKeySupportsPagedRangeResponse(t *testing.T) {
 	}
 	if response.Data.Items[0].Content != "middle" || response.Data.Items[0].Id != 3 {
 		t.Fatalf("unexpected paged log: %+v", response.Data.Items[0])
+	}
+}
+
+func TestExportLogByKeyStreamsCSVForMatchingRange(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	seedTokenLogsForGetLogByKey(t, 7)
+
+	w := performExportLogByKey(t, "/api/log/token/export?start_timestamp=20&end_timestamp=40", 7)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected http 200, got %d", w.Code)
+	}
+	if contentType := w.Header().Get("Content-Type"); !strings.Contains(contentType, "text/csv") {
+		t.Fatalf("expected csv content type, got %q", contentType)
+	}
+
+	rows, err := csv.NewReader(strings.NewReader(w.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read csv response: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("expected header plus 3 rows, got %d rows: %#v", len(rows), rows)
+	}
+	if rows[0][0] != "id" || rows[0][3] != "content" {
+		t.Fatalf("unexpected csv header: %#v", rows[0])
+	}
+	if rows[1][3] != "newest" || rows[2][3] != "newer" || rows[3][3] != "middle" {
+		t.Fatalf("unexpected csv content order: %#v", rows)
+	}
+	for _, row := range rows[1:] {
+		if row[3] == "other-token" {
+			t.Fatalf("csv response included another token's log: %#v", rows)
+		}
 	}
 }

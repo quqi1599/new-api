@@ -125,6 +125,36 @@ func GetLogByTokenIdPage(tokenId int, startTimestamp int64, endTimestamp int64, 
 	return logs, total, nil
 }
 
+func GetLogByTokenIdCursor(tokenId int, startTimestamp int64, endTimestamp int64, beforeId int, num int, startIdx int) (logs []*Log, nextBeforeId int, err error) {
+	if num <= 0 {
+		num = common.ItemsPerPage
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	tx := LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId)
+	if startTimestamp != 0 {
+		tx = tx.Where("created_at >= ?", startTimestamp)
+	}
+	if endTimestamp != 0 {
+		tx = tx.Where("created_at <= ?", endTimestamp)
+	}
+	if beforeId > 0 {
+		tx = tx.Where("id < ?", beforeId)
+	}
+
+	err = tx.Order("id desc").Limit(num).Find(&logs).Error
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(logs) > 0 {
+		nextBeforeId = logs[len(logs)-1].Id
+	}
+	formatUserLogs(logs, startIdx)
+	return logs, nextBeforeId, nil
+}
+
 func RecordLog(userId int, logType int, content string) {
 	if logType == LogTypeConsume && !common.LogConsumeEnabled {
 		return
