@@ -125,6 +125,9 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	if err := db.AutoMigrate(&model.Log{}); err != nil {
 		t.Fatalf("failed to migrate log table: %v", err)
 	}
+	if err := db.AutoMigrate(&model.LogExportJob{}); err != nil {
+		t.Fatalf("failed to migrate log export job table: %v", err)
+	}
 	return db
 }
 

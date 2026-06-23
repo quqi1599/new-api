@@ -1,11 +1,14 @@
 package controller
 
 import (
+	"compress/gzip"
 	"encoding/csv"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -47,6 +50,63 @@ func performExportLogByKey(t *testing.T, target string, tokenId int) *httptest.R
 	c.Set("token_id", tokenId)
 	ExportLogByKey(c)
 	return w
+}
+
+func performCreateTokenLogExportJob(t *testing.T, target string, tokenId int) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, target, nil)
+	c.Set("token_id", tokenId)
+	c.Set("id", 1)
+	CreateTokenLogExportJob(c)
+	return w
+}
+
+func performGetTokenLogExportJob(t *testing.T, jobId string, tokenId int) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/log/token/export-jobs/"+jobId, nil)
+	c.Params = gin.Params{{Key: "id", Value: jobId}}
+	c.Set("token_id", tokenId)
+	GetTokenLogExportJob(c)
+	return w
+}
+
+func performDownloadTokenLogExportJob(t *testing.T, jobId string, downloadToken string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/log/token/export-jobs/"+jobId+"/download?download_token="+downloadToken, nil)
+	c.Params = gin.Params{{Key: "id", Value: jobId}}
+	DownloadTokenLogExportJob(c)
+	return w
+}
+
+func waitForLogExportJobStatus(t *testing.T, jobId string, status string) *model.LogExportJob {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := model.GetLogExportJobById(jobId)
+		if err != nil {
+			t.Fatalf("failed to load export job: %v", err)
+		}
+		if job.Status == status {
+			return job
+		}
+		if job.Status == model.LogExportJobStatusFailed {
+			t.Fatalf("export job failed: %s", job.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	job, _ := model.GetLogExportJobById(jobId)
+	t.Fatalf("timed out waiting for export job %s, last job: %+v", status, job)
+	return nil
 }
 
 func TestGetLogByKeyKeepsLegacyArrayResponse(t *testing.T) {
@@ -167,5 +227,90 @@ func TestExportLogByKeyRejectsWhenExportSlotsAreFull(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "当前导出任务较多") {
 		t.Fatalf("unexpected error response: %s", w.Body.String())
+	}
+}
+
+func TestCreateTokenLogExportJobWritesGzipCSV(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	t.Setenv("LOG_EXPORT_DIR", t.TempDir())
+	seedTokenLogsForGetLogByKey(t, 7)
+
+	w := performCreateTokenLogExportJob(t, "/api/log/token/export-jobs?start_timestamp=20&end_timestamp=40", 7)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected http 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response struct {
+		Success bool                      `json:"success"`
+		Data    tokenLogExportJobResponse `json:"data"`
+	}
+	if err := common.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !response.Success || response.Data.Id == "" || response.Data.Status != model.LogExportJobStatusQueued {
+		t.Fatalf("unexpected create response: %+v", response)
+	}
+
+	job := waitForLogExportJobStatus(t, response.Data.Id, model.LogExportJobStatusSucceeded)
+	if job.Total != 3 || job.Exported != 3 {
+		t.Fatalf("unexpected job counts: %+v", job)
+	}
+	if !strings.HasSuffix(job.FileName, ".csv.gz") {
+		t.Fatalf("expected gzip csv filename, got %q", job.FileName)
+	}
+
+	file, err := os.Open(job.FilePath)
+	if err != nil {
+		t.Fatalf("failed to open export file: %v", err)
+	}
+	defer file.Close()
+	gzipReader, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatalf("failed to open gzip reader: %v", err)
+	}
+	defer gzipReader.Close()
+	rows, err := csv.NewReader(gzipReader).ReadAll()
+	if err != nil {
+		t.Fatalf("failed to read gzip csv: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("expected header plus 3 rows, got %d rows: %#v", len(rows), rows)
+	}
+	if rows[1][3] != "newest" || rows[2][3] != "newer" || rows[3][3] != "middle" {
+		t.Fatalf("unexpected csv content order: %#v", rows)
+	}
+}
+
+func TestTokenLogExportJobStatusAndDownloadAreTokenScoped(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	t.Setenv("LOG_EXPORT_DIR", t.TempDir())
+	seedTokenLogsForGetLogByKey(t, 7)
+
+	w := performCreateTokenLogExportJob(t, "/api/log/token/export-jobs?start_timestamp=20&end_timestamp=40", 7)
+	var response struct {
+		Success bool                      `json:"success"`
+		Data    tokenLogExportJobResponse `json:"data"`
+	}
+	if err := common.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	job := waitForLogExportJobStatus(t, response.Data.Id, model.LogExportJobStatusSucceeded)
+
+	statusResp := performGetTokenLogExportJob(t, job.Id, 7)
+	if statusResp.Code != http.StatusOK || !strings.Contains(statusResp.Body.String(), model.LogExportJobStatusSucceeded) {
+		t.Fatalf("unexpected status response: code=%d body=%s", statusResp.Code, statusResp.Body.String())
+	}
+
+	downloadResp := performDownloadTokenLogExportJob(t, job.Id, job.DownloadToken)
+	if downloadResp.Code != http.StatusOK {
+		t.Fatalf("expected download http 200, got %d: %s", downloadResp.Code, downloadResp.Body.String())
+	}
+	if contentType := downloadResp.Header().Get("Content-Type"); !strings.Contains(contentType, "application/gzip") {
+		t.Fatalf("expected gzip content type, got %q", contentType)
+	}
+
+	wrongDownloadTokenResp := performDownloadTokenLogExportJob(t, job.Id, "wrong-token")
+	if !strings.Contains(wrongDownloadTokenResp.Body.String(), "导出任务不存在") {
+		t.Fatalf("expected download token denial, got %s", wrongDownloadTokenResp.Body.String())
 	}
 }

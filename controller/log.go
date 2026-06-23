@@ -258,7 +258,10 @@ func getTokenLogExportRange(c *gin.Context) (int64, int64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
+	return normalizeTokenLogExportRange(startTimestamp, endTimestamp)
+}
 
+func normalizeTokenLogExportRange(startTimestamp int64, endTimestamp int64) (int64, int64, error) {
 	now := time.Now().Unix()
 	if startTimestamp == 0 && endTimestamp == 0 {
 		endTimestamp = now
