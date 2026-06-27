@@ -25,16 +25,20 @@ import { codeInspectorPlugin } from 'code-inspector-plugin';
 const { vitePluginSemi } = pkg;
 
 // https://vitejs.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
   },
   plugins: [
-    codeInspectorPlugin({
-      bundler: 'vite',
-    }),
+    ...(mode === 'production'
+      ? []
+      : [
+          codeInspectorPlugin({
+            bundler: 'vite',
+          }),
+        ]),
     {
       name: 'treat-js-files-as-jsx',
       async transform(code, id) {
@@ -70,6 +74,16 @@ export default defineConfig({
         manualChunks: {
           'react-core': ['react', 'react-dom', 'react-router-dom'],
           'semi-ui': ['@douyinfe/semi-icons', '@douyinfe/semi-ui'],
+          charts: ['@visactor/react-vchart', '@visactor/vchart'],
+          markdown: [
+            'katex',
+            'mermaid',
+            'react-markdown',
+            'rehype-katex',
+            'remark-gfm',
+            'remark-math',
+          ],
+          icons: ['@lobehub/icons', 'lucide-react', 'react-icons'],
           tools: ['axios', 'history', 'marked'],
           'react-components': [
             'react-dropzone',
@@ -104,4 +118,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

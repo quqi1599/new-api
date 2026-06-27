@@ -17,20 +17,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal } from '@douyinfe/semi-ui';
+import { API } from '../../helpers/api';
 import {
-  API,
   getTodayStartTimestamp,
   isAdmin,
   showError,
   showSuccess,
   timestamp2string,
+  copy,
+} from '../../helpers/utils';
+import {
   renderQuota,
   renderNumber,
-  getLogOther,
-  copy,
   renderClaudeLogContent,
   renderLogContent,
   renderAudioModelPrice,
@@ -38,7 +39,8 @@ import {
   renderModelPrice,
   renderTieredModelPrice,
   renderTaskBillingProcess,
-} from '../../helpers';
+} from '../../helpers/render';
+import { getLogOther } from '../../helpers/log';
 import { ITEMS_PER_PAGE } from '../../constants';
 import { useTableCompactMode } from '../common/useTableCompactMode';
 import ParamOverrideEntry from '../../components/table/usage-logs/components/ParamOverrideEntry';
@@ -93,6 +95,8 @@ export const useLogsData = () => {
 
   // Form state
   const [formApi, setFormApi] = useState(null);
+  const listRequestRef = useRef({ seq: 0, controller: null });
+  const statRequestRef = useRef({ seq: 0, controller: null });
   let now = new Date();
   const formInitValues = {
     username: '',
@@ -164,7 +168,9 @@ export const useLogsData = () => {
   };
 
   // Column visibility state
-  const [visibleColumns, setVisibleColumns] = useState(getInitialVisibleColumns);
+  const [visibleColumns, setVisibleColumns] = useState(
+    getInitialVisibleColumns,
+  );
   const [showColumnSelector, setShowColumnSelector] = useState(false);
   const [billingDisplayMode, setBillingDisplayMode] = useState(
     getInitialBillingDisplayMode,
@@ -261,31 +267,30 @@ export const useLogsData = () => {
     };
   };
 
-  // Statistics functions
-  const getLogSelfStat = async () => {
-    const {
-      token_name,
-      model_name,
-      start_timestamp,
-      end_timestamp,
-      group,
-      logType: formLogType,
-    } = getFormValues();
-    const currentLogType = formLogType !== undefined ? formLogType : logType;
-    let localStartTimestamp = Date.parse(start_timestamp) / 1000;
-    let localEndTimestamp = Date.parse(end_timestamp) / 1000;
-    let url = `/api/log/self/stat?type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}`;
-    url = encodeURI(url);
-    let res = await API.get(url);
-    const { success, message, data } = res.data;
-    if (success) {
-      setStat(data);
-    } else {
-      showError(message);
-    }
+  const isCanceledRequest = (error) =>
+    error?.code === 'ERR_CANCELED' ||
+    error?.name === 'CanceledError' ||
+    error?.message === 'canceled';
+
+  const beginRequest = (requestRef) => {
+    requestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const seq = requestRef.current.seq + 1;
+    requestRef.current = { seq, controller };
+    return { seq, controller };
   };
 
-  const getLogStat = async () => {
+  const isCurrentRequest = (requestRef, seq) => requestRef.current.seq === seq;
+
+  const buildQueryString = (params) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      query.set(key, value ?? '');
+    });
+    return query.toString();
+  };
+
+  const getFilterSnapshot = (customLogType = null) => {
     const {
       username,
       token_name,
@@ -294,34 +299,104 @@ export const useLogsData = () => {
       end_timestamp,
       channel,
       group,
+      request_id,
       logType: formLogType,
     } = getFormValues();
-    const currentLogType = formLogType !== undefined ? formLogType : logType;
-    let localStartTimestamp = Date.parse(start_timestamp) / 1000;
-    let localEndTimestamp = Date.parse(end_timestamp) / 1000;
-    let url = `/api/log/stat?type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}`;
-    url = encodeURI(url);
-    let res = await API.get(url);
-    const { success, message, data } = res.data;
-    if (success) {
-      setStat(data);
-    } else {
-      showError(message);
-    }
+
+    const currentLogType =
+      customLogType !== null
+        ? customLogType
+        : formLogType !== undefined
+          ? formLogType
+          : logType;
+
+    return {
+      username,
+      token_name,
+      model_name,
+      start_timestamp: Date.parse(start_timestamp) / 1000,
+      end_timestamp: Date.parse(end_timestamp) / 1000,
+      channel,
+      group,
+      request_id,
+      logType: currentLogType,
+    };
   };
 
-  const handleEyeClick = async () => {
-    if (loadingStat) {
-      return;
-    }
-    setLoadingStat(true);
+  const buildLogsUrl = (page, size, filters) => {
+    const baseUrl = isAdminUser ? '/api/log/' : '/api/log/self/';
+    const params = {
+      p: page,
+      page_size: size,
+      type: filters.logType,
+      token_name: filters.token_name,
+      model_name: filters.model_name,
+      start_timestamp: filters.start_timestamp,
+      end_timestamp: filters.end_timestamp,
+      group: filters.group,
+      request_id: filters.request_id,
+    };
+
     if (isAdminUser) {
-      await getLogStat();
-    } else {
-      await getLogSelfStat();
+      params.username = filters.username;
+      params.channel = filters.channel;
     }
-    setShowStat(true);
-    setLoadingStat(false);
+
+    return `${baseUrl}?${buildQueryString(params)}`;
+  };
+
+  const buildStatUrl = (filters) => {
+    const baseUrl = isAdminUser ? '/api/log/stat' : '/api/log/self/stat';
+    const params = {
+      type: filters.logType,
+      token_name: filters.token_name,
+      model_name: filters.model_name,
+      start_timestamp: filters.start_timestamp,
+      end_timestamp: filters.end_timestamp,
+      group: filters.group,
+    };
+
+    if (isAdminUser) {
+      params.username = filters.username;
+      params.channel = filters.channel;
+    }
+
+    return `${baseUrl}?${buildQueryString(params)}`;
+  };
+
+  // Statistics functions
+  const fetchLogStat = async (filters, signal) => {
+    const res = await API.get(buildStatUrl(filters), {
+      signal,
+      disableDuplicate: true,
+      skipErrorHandler: true,
+    });
+    const { success, message, data } = res.data;
+    if (success) {
+      return data;
+    }
+    throw new Error(message);
+  };
+
+  const handleEyeClick = async (filters = getFilterSnapshot()) => {
+    const { seq, controller } = beginRequest(statRequestRef);
+    setLoadingStat(true);
+    try {
+      const data = await fetchLogStat(filters, controller.signal);
+      if (!isCurrentRequest(statRequestRef, seq)) {
+        return;
+      }
+      setStat(data);
+      setShowStat(true);
+    } catch (error) {
+      if (!isCanceledRequest(error) && isCurrentRequest(statRequestRef, seq)) {
+        showError(error.message || error);
+      }
+    } finally {
+      if (isCurrentRequest(statRequestRef, seq)) {
+        setLoadingStat(false);
+      }
+    }
   };
 
   // User info function
@@ -383,7 +458,10 @@ export const useLogsData = () => {
       let other = getLogOther(logs[i].other);
       let expandDataLocal = [];
 
-      if (isAdminUser && (logs[i].type === 0 || logs[i].type === 2 || logs[i].type === 6)) {
+      if (
+        isAdminUser &&
+        (logs[i].type === 0 || logs[i].type === 2 || logs[i].type === 6)
+      ) {
         expandDataLocal.push({
           key: t('渠道信息'),
           value: `${logs[i].channel} - ${logs[i].channel_name || '[未知]'}`,
@@ -430,7 +508,10 @@ export const useLogsData = () => {
           expandDataLocal.push({
             key: t('日志详情'),
             value: other?.claude
-              ? renderClaudeLogContent({ ...other, displayMode: billingDisplayMode })
+              ? renderClaudeLogContent({
+                  ...other,
+                  displayMode: billingDisplayMode,
+                })
               : renderLogContent({ ...other, displayMode: billingDisplayMode }),
           });
         }
@@ -520,7 +601,14 @@ export const useLogsData = () => {
           expandDataLocal.push({
             key: t('失败原因'),
             value: (
-              <div style={{ maxWidth: 600, whiteSpace: 'normal', wordBreak: 'break-word', lineHeight: 1.6 }}>
+              <div
+                style={{
+                  maxWidth: 600,
+                  whiteSpace: 'normal',
+                  wordBreak: 'break-word',
+                  lineHeight: 1.6,
+                }}
+              >
                 {other.reason}
               </div>
             ),
@@ -537,7 +625,8 @@ export const useLogsData = () => {
         const ss = other.stream_status;
         const isOk = ss.status === 'ok';
         const statusLabel = isOk ? '✓ ' + t('正常') : '✗ ' + t('异常');
-        let streamValue = statusLabel + ' (' + (ss.end_reason || 'unknown') + ')';
+        let streamValue =
+          statusLabel + ' (' + (ss.end_reason || 'unknown') + ')';
         if (ss.error_count > 0) {
           streamValue += ` [${t('软错误')}: ${ss.error_count}]`;
         }
@@ -552,7 +641,14 @@ export const useLogsData = () => {
           expandDataLocal.push({
             key: t('流错误详情'),
             value: (
-              <div style={{ maxWidth: 600, whiteSpace: 'pre-line', wordBreak: 'break-word', lineHeight: 1.6 }}>
+              <div
+                style={{
+                  maxWidth: 600,
+                  whiteSpace: 'pre-line',
+                  wordBreak: 'break-word',
+                  lineHeight: 1.6,
+                }}
+              >
                 {ss.errors.join('\n')}
               </div>
             ),
@@ -726,74 +822,66 @@ export const useLogsData = () => {
   };
 
   // Load logs function
-  const loadLogs = async (startIdx, pageSize, customLogType = null) => {
+  const loadLogs = async (
+    startIdx,
+    pageSize,
+    customLogType = null,
+    filterSnapshot = null,
+  ) => {
+    const filters = filterSnapshot || getFilterSnapshot(customLogType);
+    const { seq, controller } = beginRequest(listRequestRef);
     setLoading(true);
+    try {
+      const res = await API.get(buildLogsUrl(startIdx, pageSize, filters), {
+        signal: controller.signal,
+        disableDuplicate: true,
+        skipErrorHandler: true,
+      });
+      if (!isCurrentRequest(listRequestRef, seq)) {
+        return;
+      }
 
-    let url = '';
-    const {
-      username,
-      token_name,
-      model_name,
-      start_timestamp,
-      end_timestamp,
-      channel,
-      group,
-      request_id,
-      logType: formLogType,
-    } = getFormValues();
+      const { success, message, data } = res.data;
+      if (success) {
+        const newPageData = data.items;
+        setActivePage(data.page);
+        setPageSize(data.page_size);
+        setLogCount(data.total);
 
-    const currentLogType =
-      customLogType !== null
-        ? customLogType
-        : formLogType !== undefined
-          ? formLogType
-          : logType;
-
-    let localStartTimestamp = Date.parse(start_timestamp) / 1000;
-    let localEndTimestamp = Date.parse(end_timestamp) / 1000;
-    if (isAdminUser) {
-      url = `/api/log/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&username=${username}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&channel=${channel}&group=${group}&request_id=${request_id}`;
-    } else {
-      url = `/api/log/self/?p=${startIdx}&page_size=${pageSize}&type=${currentLogType}&token_name=${token_name}&model_name=${model_name}&start_timestamp=${localStartTimestamp}&end_timestamp=${localEndTimestamp}&group=${group}&request_id=${request_id}`;
+        setLogsFormat(newPageData);
+      } else {
+        showError(message);
+      }
+    } catch (error) {
+      if (!isCanceledRequest(error) && isCurrentRequest(listRequestRef, seq)) {
+        showError(error.message || error);
+      }
+    } finally {
+      if (isCurrentRequest(listRequestRef, seq)) {
+        setLoading(false);
+      }
     }
-    url = encodeURI(url);
-    const res = await API.get(url);
-    const { success, message, data } = res.data;
-    if (success) {
-      const newPageData = data.items;
-      setActivePage(data.page);
-      setPageSize(data.page_size);
-      setLogCount(data.total);
-
-      setLogsFormat(newPageData);
-    } else {
-      showError(message);
-    }
-    setLoading(false);
   };
 
   // Page handlers
   const handlePageChange = (page) => {
     setActivePage(page);
-    loadLogs(page, pageSize).then((r) => {});
+    loadLogs(page, pageSize);
   };
 
   const handlePageSizeChange = async (size) => {
     localStorage.setItem('page-size', size + '');
     setPageSize(size);
     setActivePage(1);
-    loadLogs(activePage, size)
-      .then()
-      .catch((reason) => {
-        showError(reason);
-      });
+    loadLogs(1, size);
   };
 
   // Refresh function
   const refresh = async () => {
+    const filters = getFilterSnapshot();
     setActivePage(1);
-    handleEyeClick();
-    await loadLogs(1, pageSize);
+    handleEyeClick(filters);
+    await loadLogs(1, pageSize, null, filters);
   };
 
   // Copy text function
@@ -806,16 +894,19 @@ export const useLogsData = () => {
     }
   };
 
+  useEffect(() => {
+    return () => {
+      listRequestRef.current.controller?.abort();
+      statRequestRef.current.controller?.abort();
+    };
+  }, []);
+
   // Initialize data
   useEffect(() => {
     const localPageSize =
       parseInt(localStorage.getItem('page-size')) || ITEMS_PER_PAGE;
     setPageSize(localPageSize);
-    loadLogs(activePage, localPageSize)
-      .then()
-      .catch((reason) => {
-        showError(reason);
-      });
+    loadLogs(activePage, localPageSize);
   }, []);
 
   // Initialize statistics when formApi is available

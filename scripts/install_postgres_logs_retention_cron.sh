@@ -46,6 +46,7 @@ DECLARE
   from_epoch bigint;
   to_epoch bigint;
   partition_name text;
+  partition_empty boolean;
 BEGIN
   WHILE d <= end_day LOOP
     from_epoch := extract(epoch FROM d::timestamptz)::bigint;
@@ -57,6 +58,17 @@ BEGIN
       from_epoch,
       to_epoch
     );
+    EXECUTE format(
+      'SELECT NOT EXISTS (SELECT 1 FROM public.%I LIMIT 1)',
+      partition_name
+    ) INTO partition_empty;
+    IF partition_empty THEN
+      EXECUTE format(
+        'CREATE INDEX IF NOT EXISTS %I ON public.%I (channel_id, created_at DESC) INCLUDE (quota, prompt_tokens, completion_tokens) WHERE type = 2',
+        partition_name || '_channel_consume_created_cover_idx',
+        partition_name
+      );
+    END IF;
     d := d + 1;
   END LOOP;
 END;

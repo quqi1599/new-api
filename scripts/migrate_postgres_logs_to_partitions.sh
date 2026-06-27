@@ -182,6 +182,7 @@ CREATE INDEX idx_logs_type_created_id ON public.logs (type, created_at DESC, id 
 CREATE INDEX idx_logs_channel_created_id ON public.logs (channel_id, created_at DESC, id DESC);
 CREATE INDEX idx_logs_group_created_id ON public.logs ("group", created_at DESC, id DESC);
 CREATE INDEX idx_logs_consume_created_cover ON public.logs (created_at DESC) INCLUDE (quota, prompt_tokens, completion_tokens) WHERE type = 2;
+CREATE INDEX idx_logs_channel_consume_created_cover ON public.logs (channel_id, created_at DESC) INCLUDE (quota, prompt_tokens, completion_tokens) WHERE type = 2;
 CREATE INDEX idx_logs_request_id_present ON public.logs (request_id) WHERE request_id <> '';
 CREATE INDEX idx_logs_upstream_request_id_present ON public.logs (upstream_request_id) WHERE upstream_request_id <> '';
 

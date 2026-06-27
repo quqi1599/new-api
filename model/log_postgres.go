@@ -100,15 +100,30 @@ func postgresLogDayStart(t time.Time) time.Time {
 }
 
 func postgresCreateLogPartitionStatement(from time.Time, to time.Time) string {
+	partitionName := postgresLogPartitionName(from)
 	return fmt.Sprintf(
-		`CREATE TABLE IF NOT EXISTS public.%s PARTITION OF public.logs FOR VALUES FROM (%d) TO (%d)`,
-		postgresLogPartitionName(from),
+		`DO $$
+BEGIN
+	CREATE TABLE IF NOT EXISTS public.%s PARTITION OF public.logs FOR VALUES FROM (%d) TO (%d);
+	IF NOT EXISTS (SELECT 1 FROM public.%s LIMIT 1) THEN
+		CREATE INDEX IF NOT EXISTS %s ON public.%s (channel_id, created_at DESC) INCLUDE (quota, prompt_tokens, completion_tokens) WHERE type = 2;
+	END IF;
+END;
+$$`,
+		partitionName,
 		from.Unix(),
 		to.Unix(),
+		partitionName,
+		postgresLogChannelConsumeIndexName(partitionName),
+		partitionName,
 	)
 }
 
 func postgresLogPartitionName(day time.Time) string {
 	day = postgresLogDayStart(day)
 	return fmt.Sprintf("logs_y%04d%02d%02d", day.Year(), day.Month(), day.Day())
+}
+
+func postgresLogChannelConsumeIndexName(partitionName string) string {
+	return fmt.Sprintf("%s_channel_consume_created_cover_idx", partitionName)
 }

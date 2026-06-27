@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"strings"
+
 	"github.com/gin-gonic/gin"
 )
 
@@ -8,6 +10,8 @@ func Cache() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		if c.Request.RequestURI == "/" {
 			c.Header("Cache-Control", "no-cache")
+		} else if strings.HasPrefix(c.Request.URL.Path, "/assets/") {
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
 		} else {
 			c.Header("Cache-Control", "max-age=604800") // one week
 		}

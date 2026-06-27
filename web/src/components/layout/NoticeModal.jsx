@@ -27,7 +27,8 @@ import {
   Timeline,
 } from '@douyinfe/semi-ui';
 import { useTranslation } from 'react-i18next';
-import { API, showError, getRelativeTime } from '../../helpers';
+import { API } from '../../helpers/api';
+import { showError, getRelativeTime } from '../../helpers/utils';
 import { marked } from 'marked';
 import {
   IllustrationNoContent,

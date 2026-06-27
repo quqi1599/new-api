@@ -3,6 +3,7 @@ package model
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -70,5 +71,23 @@ func TestPostgresPartitionedLogSchemaStatements(t *testing.T) {
 	}
 	if strings.Contains(strings.ToUpper(joined), "PRIMARY KEY") {
 		t.Fatalf("partitioned logs schema must not create an id-only primary key:\n%s", joined)
+	}
+}
+
+func TestPostgresCreateLogPartitionStatementCreatesChannelConsumeIndex(t *testing.T) {
+	statement := postgresCreateLogPartitionStatement(
+		time.Date(2026, 6, 28, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 6, 29, 0, 0, 0, 0, time.UTC),
+	)
+
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS public.logs_y20260628 PARTITION OF public.logs",
+		"logs_y20260628_channel_consume_created_cover_idx",
+		"(channel_id, created_at DESC) INCLUDE (quota, prompt_tokens, completion_tokens) WHERE type = 2",
+		"IF NOT EXISTS (SELECT 1 FROM public.logs_y20260628 LIMIT 1)",
+	} {
+		if !strings.Contains(statement, want) {
+			t.Fatalf("expected partition statement to contain %q, got:\n%s", want, statement)
+		}
 	}
 }

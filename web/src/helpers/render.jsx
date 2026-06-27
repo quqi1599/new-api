@@ -19,7 +19,8 @@ For commercial licensing, please contact support@quantumnous.com
 
 import i18next from 'i18next';
 import { Modal, Tag, Typography, Avatar } from '@douyinfe/semi-ui';
-import { copy, showSuccess } from './utils';
+import { copy, showSuccess, stringToColor } from './utils';
+export { getLucideIcon } from './navIcons';
 import { MOBILE_BREAKPOINT } from '../hooks/common/useIsMobile';
 import {
   BILLING_PRICING_VARS,
@@ -64,24 +65,6 @@ import {
 } from '@lobehub/icons';
 
 import {
-  LayoutDashboard,
-  TerminalSquare,
-  MessageSquare,
-  Key,
-  BarChart3,
-  Image as ImageIcon,
-  CheckSquare,
-  CreditCard,
-  Layers,
-  Gift,
-  User,
-  Settings,
-  CircleUser,
-  Package,
-  Server,
-  CalendarClock,
-} from 'lucide-react';
-import {
   SiAtlassian,
   SiAuth0,
   SiAuthentik,
@@ -106,56 +89,6 @@ import {
   SiWechat,
   SiX,
 } from 'react-icons/si';
-
-// 获取侧边栏Lucide图标组件
-export function getLucideIcon(key, selected = false) {
-  const size = 16;
-  const strokeWidth = 2;
-  const SELECTED_COLOR = 'var(--semi-color-primary)';
-  const iconColor = selected ? SELECTED_COLOR : 'currentColor';
-  const commonProps = {
-    size,
-    strokeWidth,
-    className: `transition-colors duration-200 ${selected ? 'transition-transform duration-200 scale-105' : ''}`,
-  };
-
-  // 根据不同的key返回不同的图标
-  switch (key) {
-    case 'detail':
-      return <LayoutDashboard {...commonProps} color={iconColor} />;
-    case 'playground':
-      return <TerminalSquare {...commonProps} color={iconColor} />;
-    case 'chat':
-      return <MessageSquare {...commonProps} color={iconColor} />;
-    case 'token':
-      return <Key {...commonProps} color={iconColor} />;
-    case 'log':
-      return <BarChart3 {...commonProps} color={iconColor} />;
-    case 'midjourney':
-      return <ImageIcon {...commonProps} color={iconColor} />;
-    case 'task':
-      return <CheckSquare {...commonProps} color={iconColor} />;
-    case 'topup':
-      return <CreditCard {...commonProps} color={iconColor} />;
-    case 'channel':
-      return <Layers {...commonProps} color={iconColor} />;
-    case 'redemption':
-      return <Gift {...commonProps} color={iconColor} />;
-    case 'user':
-    case 'personal':
-      return <User {...commonProps} color={iconColor} />;
-    case 'models':
-      return <Package {...commonProps} color={iconColor} />;
-    case 'deployment':
-      return <Server {...commonProps} color={iconColor} />;
-    case 'subscription':
-      return <CalendarClock {...commonProps} color={iconColor} />;
-    case 'setting':
-      return <Settings {...commonProps} color={iconColor} />;
-    default:
-      return <CircleUser {...commonProps} color={iconColor} />;
-  }
-}
 
 // 获取模型分类
 export const getModelCategories = (() => {
@@ -604,25 +537,6 @@ export function getOAuthProviderIcon(iconName, size = 20) {
   );
 }
 
-// 颜色列表
-const colors = [
-  'amber',
-  'blue',
-  'cyan',
-  'green',
-  'grey',
-  'indigo',
-  'light-blue',
-  'lime',
-  'orange',
-  'pink',
-  'purple',
-  'red',
-  'teal',
-  'violet',
-  'yellow',
-];
-
 // 基础10色色板 (N ≤ 10)
 const baseColors = [
   '#1664FF', // 主色
@@ -725,15 +639,6 @@ export function modelToColor(modelName) {
   // 4. 使用hash值选择颜色
   const index = hash % colorPalette.length;
   return colorPalette[index];
-}
-
-export function stringToColor(str) {
-  let sum = 0;
-  for (let i = 0; i < str.length; i++) {
-    sum += str.charCodeAt(i);
-  }
-  let i = sum % colors.length;
-  return colors[i];
 }
 
 // 渲染带有模型图标的标签
@@ -1627,10 +1532,9 @@ function renderPriceSimpleCore({
 
 export function renderTaskBillingProcess(other, content) {
   if (other?.task_id != null) {
-    return renderBillingArticle(
-      [content].filter(Boolean),
-      { showReferenceNote: false },
-    );
+    return renderBillingArticle([content].filter(Boolean), {
+      showReferenceNote: false,
+    });
   }
   return renderBillingArticle([
     buildBillingText('任务预扣费（将在任务完成后按实际token重算）'),
@@ -2247,7 +2151,10 @@ export function parseTiersFromExpr(exprStr) {
   try {
     const { body } = stripExprVersion(exprStr);
     const condGroup = `((?:(?:p|c|len)\\s*(?:<|<=|>|>=)\\s*[\\d.eE+]+)(?:\\s*&&\\s*(?:p|c|len)\\s*(?:<|<=|>|>=)\\s*[\\d.eE+]+)*)`;
-    const tierRe = new RegExp(`(?:${condGroup}\\s*\\?\\s*)?tier\\("([^"]*)",\\s*([^)]+)\\)`, 'g');
+    const tierRe = new RegExp(
+      `(?:${condGroup}\\s*\\?\\s*)?tier\\("([^"]*)",\\s*([^)]+)\\)`,
+      'g',
+    );
     const tiers = [];
     let m;
     while ((m = tierRe.exec(body)) !== null) {
@@ -2256,7 +2163,8 @@ export function parseTiersFromExpr(exprStr) {
       if (condStr) {
         for (const cp of condStr.split(/\s*&&\s*/)) {
           const cm = cp.trim().match(/^(p|c|len)\s*(<|<=|>|>=)\s*([\d.eE+]+)$/);
-          if (cm) conditions.push({ var: cm[1], op: cm[2], value: Number(cm[3]) });
+          if (cm)
+            conditions.push({ var: cm[1], op: cm[2], value: Number(cm[3]) });
         }
       }
       const tier = parseTierBody(m[3]);
@@ -2283,7 +2191,11 @@ export function renderTieredModelPrice(opts) {
     cache_creation_tokens_1h: cacheCreationTokens1h = 0,
   } = opts;
   let exprStr = '';
-  try { exprStr = atob(exprB64); } catch { /* ignore */ }
+  try {
+    exprStr = atob(exprB64);
+  } catch {
+    /* ignore */
+  }
   const tiers = parseTiersFromExpr(exprStr);
   if (tiers.length === 0) {
     return i18next.t('阶梯计费（表达式解析失败）');
@@ -2300,7 +2212,11 @@ export function renderTieredModelPrice(opts) {
     ...priceLines
       .filter(([field]) => tier[field] > 0)
       .map(([field, label]) =>
-        buildBillingPriceText(`${label}：{{symbol}}{{price}} / 1M tokens`, { symbol, usdAmount: tier[field], rate }),
+        buildBillingPriceText(`${label}：{{symbol}}{{price}} / 1M tokens`, {
+          symbol,
+          usdAmount: tier[field],
+          rate,
+        }),
       ),
   ];
 
@@ -2321,7 +2237,11 @@ export function renderTieredModelPriceSimple(opts) {
     outputMode = 'segments',
   } = opts;
   let exprStr = '';
-  try { exprStr = atob(exprB64); } catch { /* ignore */ }
+  try {
+    exprStr = atob(exprB64);
+  } catch {
+    /* ignore */
+  }
   const tiers = parseTiersFromExpr(exprStr);
   const tier = tiers.find((t) => t.label === matchedTier) || tiers[0];
 
@@ -2334,7 +2254,10 @@ export function renderTieredModelPriceSimple(opts) {
     ];
 
     if (tier && isPriceDisplayMode(displayMode)) {
-      const priceSegments = BILLING_PRICING_VARS.map((v) => [v.field, v.shortLabel]);
+      const priceSegments = BILLING_PRICING_VARS.map((v) => [
+        v.field,
+        v.shortLabel,
+      ]);
       for (const [field, label] of priceSegments) {
         if (tier[field] > 0) {
           segments.push({
