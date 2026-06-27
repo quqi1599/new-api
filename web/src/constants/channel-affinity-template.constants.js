@@ -28,11 +28,15 @@ const buildPassHeadersTemplate = (headers) => ({
 });
 
 export const CODEX_CLI_HEADER_PASSTHROUGH_HEADERS = [
+  'X-Session-ID',
+  'Session-Id',
   'Originator',
   'Session_id',
   'User-Agent',
+  'X-Client-Request-Id',
   'X-Codex-Beta-Features',
   'X-Codex-Turn-Metadata',
+  'X-Codex-Window-Id',
 ];
 
 export const CLAUDE_CLI_HEADER_PASSTHROUGH_HEADERS = [
@@ -64,7 +68,12 @@ export const CHANNEL_AFFINITY_RULE_TEMPLATES = {
     name: 'codex cli trace',
     model_regex: ['^gpt-.*$'],
     path_regex: ['/v1/responses'],
-    key_sources: [{ type: 'gjson', path: 'prompt_cache_key' }],
+    key_sources: [
+      { type: 'header', key: 'X-Session-ID' },
+      { type: 'header', key: 'Session-Id' },
+      { type: 'header', key: 'Session_id' },
+      { type: 'gjson', path: 'prompt_cache_key' },
+    ],
     param_override_template: CODEX_CLI_HEADER_PASSTHROUGH_TEMPLATE,
     value_regex: '',
     ttl_seconds: 0,

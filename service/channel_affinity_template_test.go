@@ -219,9 +219,11 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 
 	info := &relaycommon.RelayInfo{
 		RequestHeaders: map[string]string{
-			"Originator": "Codex CLI",
-			"Session_id": "sess-123",
-			"User-Agent": "codex-cli-test",
+			"Originator":            "Codex CLI",
+			"Session_id":            "sess-123",
+			"User-Agent":            "codex-cli-test",
+			"X-Client-Request-Id":   "req-123",
+			"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		},
 		ChannelMeta: &relaycommon.ChannelMeta{
 			ParamOverride: mergedOverride,
@@ -239,9 +241,52 @@ func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
 	require.Equal(t, "Codex CLI", info.RuntimeHeadersOverride["originator"])
 	require.Equal(t, "sess-123", info.RuntimeHeadersOverride["session_id"])
 	require.Equal(t, "codex-cli-test", info.RuntimeHeadersOverride["user-agent"])
+	require.Equal(t, "req-123", info.RuntimeHeadersOverride["x-client-request-id"])
+	require.Equal(t, `{"turn_id":"turn-1"}`, info.RuntimeHeadersOverride["x-codex-turn-metadata"])
 
 	_, exists := info.RuntimeHeadersOverride["x-codex-beta-features"]
 	require.False(t, exists)
-	_, exists = info.RuntimeHeadersOverride["x-codex-turn-metadata"]
+	_, exists = info.RuntimeHeadersOverride["x-codex-window-id"]
 	require.False(t, exists)
+}
+
+func TestChannelAffinityHitCodexTemplateHeaderSourcePreferred(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	setting := operation_setting.GetChannelAffinitySetting()
+	require.NotNil(t, setting)
+
+	var codexRule *operation_setting.ChannelAffinityRule
+	for i := range setting.Rules {
+		rule := &setting.Rules[i]
+		if strings.EqualFold(strings.TrimSpace(rule.Name), "codex cli trace") {
+			codexRule = rule
+			break
+		}
+	}
+	require.NotNil(t, codexRule)
+
+	affinityValue := fmt.Sprintf("header-hit-%d", time.Now().UnixNano())
+	cacheKeySuffix := buildChannelAffinityCacheKeySuffix(*codexRule, "gpt-5", "default", affinityValue)
+
+	cache := getChannelAffinityCache()
+	require.NoError(t, cache.SetWithTTL(cacheKeySuffix, 9528, time.Minute))
+	t.Cleanup(func() {
+		_, _ = cache.DeleteMany([]string{cacheKeySuffix})
+	})
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"prompt_cache_key":"body-session"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Request.Header.Set("X-Session-ID", affinityValue)
+
+	channelID, found := GetPreferredChannelByAffinity(ctx, "gpt-5", "default")
+	require.True(t, found)
+	require.Equal(t, 9528, channelID)
+
+	meta, ok := getChannelAffinityMeta(ctx)
+	require.True(t, ok)
+	require.Equal(t, "header", meta.KeySourceType)
+	require.Equal(t, "X-Session-ID", meta.KeySourceKey)
 }
