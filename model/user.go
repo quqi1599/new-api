@@ -219,7 +219,7 @@ func GetAllUsers(pageInfo *common.PageInfo, order string) (users []*User, total 
 	}
 
 	// Get paginated users within same transaction
-	err = tx.Unscoped().Order(normalizeUserOrder(order)).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password").Find(&users).Error
+	err = tx.Unscoped().Order(normalizeUserOrder(order)).Limit(pageInfo.GetPageSize()).Offset(pageInfo.GetStartIdx()).Omit("password", "access_token").Find(&users).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -286,7 +286,7 @@ func SearchUsers(keyword string, group string, startIdx int, num int, order stri
 	}
 
 	// 获取分页数据
-	err = query.Omit("password").Order(normalizeUserOrder(order)).Limit(num).Offset(startIdx).Find(&users).Error
+	err = query.Omit("password", "access_token").Order(normalizeUserOrder(order)).Limit(num).Offset(startIdx).Find(&users).Error
 	if err != nil {
 		tx.Rollback()
 		return nil, 0, err
@@ -309,7 +309,7 @@ func GetUserById(id int, selectAll bool) (*User, error) {
 	if selectAll {
 		err = DB.First(&user, "id = ?", id).Error
 	} else {
-		err = DB.Omit("password").First(&user, "id = ?", id).Error
+		err = DB.Omit("password", "access_token").First(&user, "id = ?", id).Error
 	}
 	return &user, err
 }
