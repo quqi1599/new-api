@@ -49,6 +49,7 @@ func setupLogMigrationTestState(t *testing.T, sourceDB *gorm.DB, targetDB *gorm.
 	oldDB := DB
 	oldLogDB := LOG_DB
 	oldAutoMigrate := common.AutoMigrateOldLogsToLogDB
+	oldOldLogSqlDsn := common.OldLogSqlDsn
 	oldBatchSize := common.LogMigrationBatchSize
 	oldUsingSQLite := common.UsingSQLite
 	oldUsingPostgreSQL := common.UsingPostgreSQL
@@ -63,6 +64,7 @@ func setupLogMigrationTestState(t *testing.T, sourceDB *gorm.DB, targetDB *gorm.
 		DB = oldDB
 		LOG_DB = oldLogDB
 		common.AutoMigrateOldLogsToLogDB = oldAutoMigrate
+		common.OldLogSqlDsn = oldOldLogSqlDsn
 		common.LogMigrationBatchSize = oldBatchSize
 		common.UsingSQLite = oldUsingSQLite
 		common.UsingPostgreSQL = oldUsingPostgreSQL
@@ -77,6 +79,7 @@ func setupLogMigrationTestState(t *testing.T, sourceDB *gorm.DB, targetDB *gorm.
 	DB = sourceDB
 	LOG_DB = targetDB
 	common.AutoMigrateOldLogsToLogDB = true
+	common.OldLogSqlDsn = ""
 	common.LogMigrationBatchSize = 1
 	common.UsingSQLite = true
 	common.UsingPostgreSQL = false
@@ -84,6 +87,51 @@ func setupLogMigrationTestState(t *testing.T, sourceDB *gorm.DB, targetDB *gorm.
 	common.LogSqlType = common.DatabaseTypeSQLite
 	common.AllowLogMigrationToNonEmptyTarget = false
 	setLogMigrationState(logMigrationStageIdle, 0, 0, 0)
+}
+
+func TestMigrateOldLogsToLogDBFromIndependentSource(t *testing.T) {
+	unusedMainDB, targetDB := setupLogMigrationTestDB(t)
+	sourceDB, _ := setupLogMigrationTestDB(t)
+	setupLogMigrationTestState(t, unusedMainDB, targetDB)
+
+	logs := []Log{
+		{Id: 3, UserId: 3, CreatedAt: 3, Type: LogTypeConsume, Content: "old-source", Username: "u3"},
+		{Id: 8, UserId: 8, CreatedAt: 8, Type: LogTypeTopup, Content: "topup", Username: "u8"},
+	}
+	if err := sourceDB.Create(&logs).Error; err != nil {
+		t.Fatalf("failed to seed independent source logs: %v", err)
+	}
+
+	if err := migrateLogsBetweenDBs(sourceDB, common.DatabaseTypeSQLite, LOG_DB, common.DatabaseTypeSQLite); err != nil {
+		t.Fatalf("failed to migrate independent source logs: %v", err)
+	}
+
+	var mainCount int64
+	if err := DB.Model(&Log{}).Count(&mainCount).Error; err != nil {
+		t.Fatalf("failed to count main logs: %v", err)
+	}
+	if mainCount != 0 {
+		t.Fatalf("expected main db to remain unused, got %d logs", mainCount)
+	}
+
+	var sourceCount int64
+	if err := sourceDB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
+		t.Fatalf("failed to count source logs: %v", err)
+	}
+	if sourceCount != 0 {
+		t.Fatalf("expected independent source logs to be cleared, got %d", sourceCount)
+	}
+
+	var targetLogs []Log
+	if err := LOG_DB.Order("id asc").Find(&targetLogs).Error; err != nil {
+		t.Fatalf("failed to query target logs: %v", err)
+	}
+	if len(targetLogs) != len(logs) {
+		t.Fatalf("expected %d target logs, got %d", len(logs), len(targetLogs))
+	}
+	if targetLogs[0].Id != 3 || targetLogs[1].Id != 8 {
+		t.Fatalf("unexpected target log ids: %+v", targetLogs)
+	}
 }
 
 func TestMigrateOldLogsToLogDBIfNeeded(t *testing.T) {
@@ -156,5 +204,19 @@ func TestMigrateOldLogsToLogDBRejectsNonEmptyTarget(t *testing.T) {
 	}
 	if sourceCount != 1 {
 		t.Fatalf("expected source log to remain, got %d", sourceCount)
+	}
+}
+
+func TestShouldMigrateOldLogsToLogDBAllowsIndependentSourceWhenDBsMatch(t *testing.T) {
+	sourceDB, _ := setupLogMigrationTestDB(t)
+	setupLogMigrationTestState(t, sourceDB, sourceDB)
+
+	if shouldMigrateOldLogsToLogDB() {
+		t.Fatal("expected migration to be disabled when DB and LOG_DB match without independent source")
+	}
+
+	common.OldLogSqlDsn = "local"
+	if !shouldMigrateOldLogsToLogDB() {
+		t.Fatal("expected migration to be enabled when independent source DSN is configured")
 	}
 }

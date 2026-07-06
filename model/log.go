@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -48,13 +49,62 @@ func applyExplicitLogTextFilter(tx *gorm.DB, column string, value string) (*gorm
 		return tx, nil
 	}
 	if strings.Contains(value, "%") {
-		pattern, err := sanitizeLikePattern(value)
+		condition, pattern, err := buildLogLikeCondition(column, value)
 		if err != nil {
 			return nil, err
 		}
-		return tx.Where(column+" LIKE ? ESCAPE '!'", pattern), nil
+		return tx.Where(condition, pattern), nil
 	}
 	return tx.Where(column+" = ?", value), nil
+}
+
+func buildLogLikeCondition(column string, value string) (string, string, error) {
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		pattern, err := sanitizeClickHouseLikePattern(value)
+		if err != nil {
+			return "", "", err
+		}
+		return column + " LIKE ?", pattern, nil
+	}
+
+	pattern, err := sanitizeLikePattern(value)
+	if err != nil {
+		return "", "", err
+	}
+	return column + " LIKE ? ESCAPE '!'", pattern, nil
+}
+
+func sanitizeClickHouseLikePattern(input string) (string, error) {
+	input = strings.ReplaceAll(input, `\`, `\\`)
+	input = strings.ReplaceAll(input, `_`, `\_`)
+	if err := validateLikePattern(input); err != nil {
+		return "", err
+	}
+	return input, nil
+}
+
+func ensureLogRequestId(log *Log) {
+	if log != nil && log.RequestId == "" {
+		log.RequestId = common.NewRequestId()
+	}
+}
+
+func createLog(log *Log) error {
+	ensureLogRequestId(log)
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) && log.Id == 0 {
+		log.Id = int(time.Now().UnixMicro())
+	}
+	return LOG_DB.Create(log).Error
+}
+
+func clickHouseLogOrder(prefix string) string {
+	return prefix + "created_at desc, " + prefix + "request_id desc"
+}
+
+func assignDisplayLogIds(logs []*Log, startIdx int) {
+	for i := range logs {
+		logs[i].Id = startIdx + i + 1
+	}
 }
 
 type Log struct {
@@ -104,8 +154,8 @@ func formatUserLogs(logs []*Log, startIdx int) {
 			delete(otherMap, "stream_status")
 		}
 		logs[i].Other = common.MapToJsonStr(otherMap)
-		logs[i].Id = startIdx + i + 1
 	}
+	assignDisplayLogIds(logs, startIdx)
 }
 
 func GetLogByTokenId(tokenId int) (logs []*Log, err error) {
@@ -133,7 +183,11 @@ func GetLogByTokenIdPage(tokenId int, startTimestamp int64, endTimestamp int64, 
 	if err != nil {
 		return nil, 0, err
 	}
-	err = tx.Order("id desc").Limit(num).Offset(startIdx).Find(&logs).Error
+	order := "id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("")
+	}
+	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		return nil, 0, err
 	}
@@ -198,7 +252,7 @@ func RecordLog(userId int, logType int, content string) {
 		Type:      logType,
 		Content:   content,
 	}
-	err := LOG_DB.Create(log).Error
+	err := createLog(log)
 	if err != nil {
 		common.SysLog("failed to record log: " + err.Error())
 	}
@@ -223,7 +277,7 @@ func RecordLogWithAdminInfo(userId int, logType int, content string, adminInfo m
 		}
 		log.Other = common.MapToJsonStr(other)
 	}
-	if err := LOG_DB.Create(log).Error; err != nil {
+	if err := createLog(log); err != nil {
 		common.SysLog("failed to record log: " + err.Error())
 	}
 }
@@ -250,7 +304,7 @@ func RecordTopupLog(userId int, content string, callerIp string, paymentMethod s
 		Ip:        callerIp,
 		Other:     common.MapToJsonStr(other),
 	}
-	err := LOG_DB.Create(log).Error
+	err := createLog(log)
 	if err != nil {
 		common.SysLog("failed to record topup log: " + err.Error())
 	}
@@ -296,7 +350,7 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
-	err := LOG_DB.Create(log).Error
+	err := createLog(log)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
 	}
@@ -359,7 +413,7 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
-	err := LOG_DB.Create(log).Error
+	err := createLog(log)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
 	}
@@ -407,7 +461,7 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		Group:     params.Group,
 		Other:     common.MapToJsonStr(params.Other),
 	}
-	err := LOG_DB.Create(log).Error
+	err := createLog(log)
 	if err != nil {
 		common.SysLog("failed to record task billing log: " + err.Error())
 	}
@@ -452,7 +506,11 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 	if err != nil {
 		return nil, 0, err
 	}
-	err = tx.Order("logs.created_at desc, logs.id desc").Limit(num).Offset(startIdx).Find(&logs).Error
+	order := "logs.created_at desc, logs.id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("logs.")
+	}
+	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		return nil, 0, err
 	}
@@ -536,7 +594,11 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 		common.SysError("failed to count user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
 	}
-	err = tx.Order("logs.created_at desc, logs.id desc").Limit(num).Offset(startIdx).Find(&logs).Error
+	order := "logs.created_at desc, logs.id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("logs.")
+	}
+	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
@@ -553,10 +615,10 @@ type Stat struct {
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("sum(quota) quota")
+	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
 
 	// 为rpm和tpm创建单独的查询
-	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, sum(prompt_tokens) + sum(completion_tokens) tpm")
+	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err
@@ -609,7 +671,7 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 }
 
 func SumUsedToken(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string) (token int) {
-	tx := LOG_DB.Table("logs").Select("ifnull(sum(prompt_tokens),0) + ifnull(sum(completion_tokens),0)")
+	tx := LOG_DB.Table("logs").Select("COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0)")
 	if username != "" {
 		tx = tx.Where("username = ?", username)
 	}
@@ -630,6 +692,22 @@ func SumUsedToken(logType int, startTimestamp int64, endTimestamp int64, modelNa
 }
 
 func DeleteOldLog(ctx context.Context, targetTimestamp int64, limit int, logType int) (int64, error) {
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		var total int64
+		if err := LOG_DB.WithContext(ctx).Model(&Log{}).Where("created_at < ? AND type = ?", targetTimestamp, logType).Count(&total).Error; err != nil {
+			return 0, err
+		}
+		if total == 0 {
+			return 0, nil
+		}
+		err := LOG_DB.WithContext(ctx).Exec(
+			"ALTER TABLE logs DELETE WHERE created_at < ? AND type = ? SETTINGS mutations_sync = 1",
+			targetTimestamp,
+			logType,
+		).Error
+		return total, err
+	}
+
 	var total int64 = 0
 
 	for {
@@ -667,10 +745,55 @@ func MigrateOldLogsToLogDBIfNeeded() {
 }
 
 func migrateOldLogsToLogDB() error {
+	sourceDB, sourceType, cleanup, err := getOldLogMigrationSource()
+	if err != nil {
+		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	return migrateLogsBetweenDBs(sourceDB, sourceType, LOG_DB, common.LogDatabaseType())
+}
+
+func getOldLogMigrationSource() (*gorm.DB, common.DatabaseType, func(), error) {
+	if common.OldLogSqlDsn == "" {
+		return DB, common.MainDatabaseType(), nil, nil
+	}
+	if common.OldLogSqlDsn == os.Getenv("LOG_SQL_DSN") {
+		return nil, "", nil, fmt.Errorf("old log migration aborted: OLD_LOG_SQL_DSN must not equal LOG_SQL_DSN")
+	}
+	oldLogDB, oldLogType, err := openLogMigrationSourceDB(common.OldLogSqlDsn)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	cleanup := func() {
+		if sqlDB, err := oldLogDB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}
+	return oldLogDB, oldLogType, cleanup, nil
+}
+
+func openLogMigrationSourceDB(dsn string) (*gorm.DB, common.DatabaseType, error) {
+	previous, hadPrevious := os.LookupEnv("OLD_LOG_SQL_DSN")
+	if err := os.Setenv("OLD_LOG_SQL_DSN", dsn); err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		if hadPrevious {
+			_ = os.Setenv("OLD_LOG_SQL_DSN", previous)
+		} else {
+			_ = os.Unsetenv("OLD_LOG_SQL_DSN")
+		}
+	}()
+	return chooseDB("OLD_LOG_SQL_DSN", true)
+}
+
+func migrateLogsBetweenDBs(sourceDB *gorm.DB, sourceType common.DatabaseType, targetDB *gorm.DB, targetType common.DatabaseType) error {
 	batchSize := getLogMigrationBatchSize()
 
 	var sourceCount int64
-	if err := DB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
+	if err := sourceDB.Model(&Log{}).Count(&sourceCount).Error; err != nil {
 		return err
 	}
 	if sourceCount == 0 {
@@ -678,12 +801,12 @@ func migrateOldLogsToLogDB() error {
 		return nil
 	}
 	var maxLog Log
-	if err := DB.Select("id").Order("id desc").First(&maxLog).Error; err != nil {
+	if err := sourceDB.Select("id").Order("id desc").First(&maxLog).Error; err != nil {
 		return err
 	}
 
 	var targetCount int64
-	if err := LOG_DB.Model(&Log{}).Count(&targetCount).Error; err != nil {
+	if err := targetDB.Model(&Log{}).Count(&targetCount).Error; err != nil {
 		return err
 	}
 	if targetCount > 0 && !common.AllowLogMigrationToNonEmptyTarget {
@@ -699,16 +822,13 @@ func migrateOldLogsToLogDB() error {
 	lastProgressRows := int64(0)
 	for {
 		var batch []Log
-		if err := DB.Where("id > ? AND id <= ?", lastID, maxLog.Id).Order("id asc").Limit(batchSize).Find(&batch).Error; err != nil {
+		if err := sourceDB.Where("id > ? AND id <= ?", lastID, maxLog.Id).Order("id asc").Limit(batchSize).Find(&batch).Error; err != nil {
 			return err
 		}
 		if len(batch) == 0 {
 			break
 		}
-		if err := LOG_DB.Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "id"}},
-			DoNothing: true,
-		}).CreateInBatches(batch, batchSize).Error; err != nil {
+		if err := createMigratedLogBatch(targetDB, targetType, batch, batchSize); err != nil {
 			return err
 		}
 		lastID = batch[len(batch)-1].Id
@@ -723,23 +843,23 @@ func migrateOldLogsToLogDB() error {
 	setLogMigrationState(logMigrationStageCopied, sourceCount, maxLog.Id, migrated)
 	common.SysLog(fmt.Sprintf("log migration copy completed: %d/%d rows", migrated, sourceCount))
 
-	if err := syncLogIDSequence(LOG_DB); err != nil {
+	if err := syncLogIDSequence(targetDB, targetType); err != nil {
 		return err
 	}
 
-	if err := verifyMigratedLogs(maxLog.Id, batchSize); err != nil {
+	if err := verifyMigratedLogs(sourceDB, targetDB, maxLog.Id, batchSize); err != nil {
 		return err
 	}
 	setLogMigrationState(logMigrationStageVerified, sourceCount, maxLog.Id, migrated)
 
-	if err := clearSourceLogs(); err != nil {
+	if err := clearSourceLogs(sourceDB, sourceType); err != nil {
 		return err
 	}
 	setLogMigrationState(logMigrationStageCleared, sourceCount, maxLog.Id, migrated)
 	common.SysLog(fmt.Sprintf("log migration source cleanup completed: cleared %d rows", sourceCount))
 
 	var sourceCountAfter int64
-	if err := DB.Model(&Log{}).Count(&sourceCountAfter).Error; err != nil {
+	if err := sourceDB.Model(&Log{}).Count(&sourceCountAfter).Error; err != nil {
 		return err
 	}
 	if sourceCountAfter != 0 {
@@ -751,6 +871,19 @@ func migrateOldLogsToLogDB() error {
 	return nil
 }
 
+func createMigratedLogBatch(targetDB *gorm.DB, targetType common.DatabaseType, batch []Log, batchSize int) error {
+	if targetType == common.DatabaseTypeClickHouse {
+		for i := range batch {
+			ensureLogRequestId(&batch[i])
+		}
+		return targetDB.CreateInBatches(batch, batchSize).Error
+	}
+	return targetDB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).CreateInBatches(batch, batchSize).Error
+}
+
 func setLogMigrationState(stage logMigrationStage, sourceCount int64, maxID int, migrated int64) {
 	logMigrationState.Lock()
 	defer logMigrationState.Unlock()
@@ -760,11 +893,11 @@ func setLogMigrationState(stage logMigrationStage, sourceCount int64, maxID int,
 	logMigrationState.Migrated = migrated
 }
 
-func verifyMigratedLogs(maxID int, batchSize int) error {
+func verifyMigratedLogs(sourceDB *gorm.DB, targetDB *gorm.DB, maxID int, batchSize int) error {
 	lastID := 0
 	for {
 		var ids []int
-		if err := DB.Model(&Log{}).
+		if err := sourceDB.Model(&Log{}).
 			Where("id > ? AND id <= ?", lastID, maxID).
 			Order("id asc").
 			Limit(batchSize).
@@ -775,7 +908,7 @@ func verifyMigratedLogs(maxID int, batchSize int) error {
 			return nil
 		}
 		var targetCount int64
-		if err := LOG_DB.Model(&Log{}).Where("id IN ?", ids).Count(&targetCount).Error; err != nil {
+		if err := targetDB.Model(&Log{}).Where("id IN ?", ids).Count(&targetCount).Error; err != nil {
 			return err
 		}
 		if targetCount != int64(len(ids)) {
@@ -786,7 +919,7 @@ func verifyMigratedLogs(maxID int, batchSize int) error {
 }
 
 func shouldMigrateOldLogsToLogDB() bool {
-	return common.AutoMigrateOldLogsToLogDB && DB != nil && LOG_DB != nil && DB != LOG_DB
+	return common.AutoMigrateOldLogsToLogDB && DB != nil && LOG_DB != nil && (DB != LOG_DB || common.OldLogSqlDsn != "")
 }
 
 func getLogMigrationBatchSize() int {
@@ -796,17 +929,17 @@ func getLogMigrationBatchSize() int {
 	return 10000
 }
 
-func clearSourceLogs() error {
-	switch {
-	case common.UsingPostgreSQL, common.UsingMySQL:
-		return DB.Exec("TRUNCATE TABLE logs").Error
+func clearSourceLogs(sourceDB *gorm.DB, sourceType common.DatabaseType) error {
+	switch sourceType {
+	case common.DatabaseTypePostgreSQL, common.DatabaseTypeMySQL:
+		return sourceDB.Exec("TRUNCATE TABLE logs").Error
 	default:
-		return DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Log{}).Error
+		return sourceDB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&Log{}).Error
 	}
 }
 
-func syncLogIDSequence(db *gorm.DB) error {
-	switch common.LogSqlType {
+func syncLogIDSequence(db *gorm.DB, dbType common.DatabaseType) error {
+	switch dbType {
 	case common.DatabaseTypePostgreSQL:
 		return db.Exec("SELECT setval(pg_get_serial_sequence('logs', 'id'), COALESCE((SELECT MAX(id) FROM logs), 1), (SELECT COUNT(*) > 0 FROM logs))").Error
 	default:

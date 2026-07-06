@@ -33,6 +33,13 @@ type LogExportJob struct {
 	ExpiresAt      int64  `json:"expires_at" gorm:"bigint;index"`
 }
 
+func logExportJobDB() *gorm.DB {
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		return DB
+	}
+	return LOG_DB
+}
+
 func CreateLogExportJob(userId int, tokenId int, startTimestamp int64, endTimestamp int64, expiresAt int64) (*LogExportJob, error) {
 	now := common.GetTimestamp()
 	job := &LogExportJob{
@@ -47,12 +54,12 @@ func CreateLogExportJob(userId int, tokenId int, startTimestamp int64, endTimest
 		UpdatedAt:      now,
 		ExpiresAt:      expiresAt,
 	}
-	return job, LOG_DB.Create(job).Error
+	return job, logExportJobDB().Create(job).Error
 }
 
 func GetLogExportJobById(id string) (*LogExportJob, error) {
 	var job LogExportJob
-	if err := LOG_DB.Where("id = ?", id).First(&job).Error; err != nil {
+	if err := logExportJobDB().Where("id = ?", id).First(&job).Error; err != nil {
 		return nil, err
 	}
 	return &job, nil
@@ -60,7 +67,7 @@ func GetLogExportJobById(id string) (*LogExportJob, error) {
 
 func GetActiveLogExportJobByTokenId(tokenId int) (*LogExportJob, error) {
 	var job LogExportJob
-	err := LOG_DB.Where("token_id = ? AND status IN ?", tokenId, []string{LogExportJobStatusQueued, LogExportJobStatusRunning}).
+	err := logExportJobDB().Where("token_id = ? AND status IN ?", tokenId, []string{LogExportJobStatusQueued, LogExportJobStatusRunning}).
 		Order("created_at asc").
 		First(&job).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -73,7 +80,7 @@ func GetActiveLogExportJobByTokenId(tokenId int) (*LogExportJob, error) {
 }
 
 func MarkLogExportJobRunning(id string, total int64) error {
-	return LOG_DB.Model(&LogExportJob{}).
+	return logExportJobDB().Model(&LogExportJob{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"status":     LogExportJobStatusRunning,
@@ -83,7 +90,7 @@ func MarkLogExportJobRunning(id string, total int64) error {
 }
 
 func UpdateLogExportJobProgress(id string, exported int64) error {
-	return LOG_DB.Model(&LogExportJob{}).
+	return logExportJobDB().Model(&LogExportJob{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"exported":   exported,
@@ -92,7 +99,7 @@ func UpdateLogExportJobProgress(id string, exported int64) error {
 }
 
 func MarkLogExportJobSucceeded(id string, filePath string, fileName string, fileSize int64, exported int64) error {
-	return LOG_DB.Model(&LogExportJob{}).
+	return logExportJobDB().Model(&LogExportJob{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"status":     LogExportJobStatusSucceeded,
@@ -109,7 +116,7 @@ func MarkLogExportJobFailed(id string, err error) error {
 	if err != nil {
 		message = err.Error()
 	}
-	return LOG_DB.Model(&LogExportJob{}).
+	return logExportJobDB().Model(&LogExportJob{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
 			"status":     LogExportJobStatusFailed,
@@ -123,12 +130,12 @@ func ListExpiredLogExportJobs(now int64, limit int) ([]LogExportJob, error) {
 		limit = 100
 	}
 	var jobs []LogExportJob
-	err := LOG_DB.Where("expires_at > 0 AND expires_at < ?", now).
+	err := logExportJobDB().Where("expires_at > 0 AND expires_at < ?", now).
 		Limit(limit).
 		Find(&jobs).Error
 	return jobs, err
 }
 
 func DeleteLogExportJob(id string) error {
-	return LOG_DB.Where("id = ?", id).Delete(&LogExportJob{}).Error
+	return logExportJobDB().Where("id = ?", id).Delete(&LogExportJob{}).Error
 }

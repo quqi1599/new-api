@@ -84,6 +84,7 @@ func InitEnv() {
 	IsMasterNode = os.Getenv("NODE_TYPE") != "slave"
 	NodeName = os.Getenv("NODE_NAME")
 	AutoMigrateOldLogsToLogDB = GetEnvOrDefaultBool("AUTO_MIGRATE_OLD_LOGS_TO_LOG_DB", false)
+	OldLogSqlDsn = os.Getenv("OLD_LOG_SQL_DSN")
 	LogMigrationBatchSize = GetEnvOrDefault("LOG_MIGRATION_BATCH_SIZE", 10000)
 	AllowLogMigrationToNonEmptyTarget = GetEnvOrDefaultBool("ALLOW_LOG_MIGRATION_TO_NON_EMPTY_TARGET", false)
 	TLSInsecureSkipVerify = GetEnvOrDefaultBool("TLS_INSECURE_SKIP_VERIFY", false)

@@ -74,6 +74,7 @@ var MemoryCacheEnabled bool
 
 var LogConsumeEnabled = true
 var AutoMigrateOldLogsToLogDB bool
+var OldLogSqlDsn string
 var LogMigrationBatchSize int
 var AllowLogMigrationToNonEmptyTarget bool
 
