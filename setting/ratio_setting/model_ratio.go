@@ -528,8 +528,12 @@ func getHardcodedCompletionModelRatio(name string) (float64, bool) {
 				}
 				return 6, true
 			}
-			// gpt-5.5 and later models are unlocked
-			return 6, false
+			if strings.HasPrefix(name, "gpt-5.5") || strings.HasPrefix(name, "gpt-5.6") {
+				return 6, false
+			}
+			// Keep established and unknown GPT-5 variants on the conservative
+			// completion ratio until their pricing is explicitly configured.
+			return 8, true
 		}
 		// gpt-4.5-preview匹配
 		if strings.HasPrefix(name, "gpt-4.5-preview") {
