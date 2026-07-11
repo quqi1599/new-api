@@ -49,7 +49,7 @@ require (
 	github.com/waffo-com/waffo-go v1.3.1
 	github.com/yapingcat/gomedia v0.0.0-20240906162731-17feea57090c
 	golang.org/x/crypto v0.54.0
-	golang.org/x/image v0.38.0
+	golang.org/x/image v0.43.0
 	golang.org/x/net v0.57.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.47.0
@@ -62,16 +62,17 @@ require (
 )
 
 require (
-	github.com/ClickHouse/ch-go v0.58.2 // indirect
-	github.com/ClickHouse/clickhouse-go/v2 v2.15.0 // indirect
+	github.com/ClickHouse/ch-go v0.65.0 // indirect
+	github.com/ClickHouse/clickhouse-go/v2 v2.32.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
-	github.com/go-faster/errors v0.6.1 // indirect
-	github.com/hashicorp/go-version v1.6.0 // indirect
-	github.com/paulmach/orb v0.10.0 // indirect
-	github.com/pierrec/lz4/v4 v4.1.18 // indirect
+	github.com/go-faster/errors v0.7.1 // indirect
+	github.com/hashicorp/go-version v1.7.0 // indirect
+	github.com/paulmach/orb v0.11.1 // indirect
+	github.com/pierrec/lz4/v4 v4.1.22 // indirect
+	github.com/rogpeppe/go-internal v1.13.1 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
-	go.opentelemetry.io/otel v1.19.0 // indirect
-	go.opentelemetry.io/otel/trace v1.19.0 // indirect
+	go.opentelemetry.io/otel v1.34.0 // indirect
+	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 )
 
 require (
