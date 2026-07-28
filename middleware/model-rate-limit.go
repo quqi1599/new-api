@@ -19,7 +19,58 @@ import (
 const (
 	ModelRequestRateLimitCountMark        = "MRRL"
 	ModelRequestRateLimitSuccessCountMark = "MRRLS"
+	TokenRPMRateLimitMark                 = "TRPM"
+	tokenRPMRateLimitScript               = `
+local now = redis.call('TIME')
+local now_ms = now[1] * 1000 + math.floor(now[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms - 60000)
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then
+	return 0
+end
+redis.call('ZADD', KEYS[1], now_ms, ARGV[2])
+redis.call('PEXPIRE', KEYS[1], 60000)
+return 1
+`
 )
+
+func tokenRPMRateLimit(c *gin.Context) bool {
+	tokenID := c.GetInt("token_id")
+	rpm, limited := common.TokenRPMRateLimits[tokenID]
+	if !limited {
+		return true
+	}
+
+	key := fmt.Sprintf("rateLimit:%s:%d", TokenRPMRateLimitMark, tokenID)
+	if common.RedisEnabled {
+		ctx := c.Request.Context()
+		requestID := c.GetString(common.RequestIdKey)
+		if requestID == "" {
+			requestID = common.NewRequestId()
+		}
+		allowed, err := common.RDB.Eval(
+			ctx,
+			tokenRPMRateLimitScript,
+			[]string{key},
+			rpm,
+			requestID,
+		).Int()
+		if err != nil {
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, "rate_limit_check_failed")
+			return false
+		}
+		if allowed == 1 {
+			return true
+		}
+	} else {
+		inMemoryRateLimiter.Init(common.RateLimitKeyExpirationDuration)
+		if inMemoryRateLimiter.Request(key, rpm, 60) {
+			return true
+		}
+	}
+
+	abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("该令牌每分钟最多请求 %d 次", rpm))
+	return false
+}
 
 // 检查Redis中的请求限制
 func checkRedisRateLimit(ctx context.Context, rdb *redis.Client, key string, maxCount int, duration int64) (bool, error) {
@@ -166,6 +217,10 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 // ModelRequestRateLimit 模型请求限流中间件
 func ModelRequestRateLimit() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		if !tokenRPMRateLimit(c) {
+			return
+		}
+
 		// 在每个请求时检查是否启用限流
 		if !setting.ModelRequestRateLimitEnabled {
 			c.Next()

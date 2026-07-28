@@ -133,6 +133,11 @@ func InitEnv() {
 	SearchRateLimitEnable = GetEnvOrDefaultBool("SEARCH_RATE_LIMIT_ENABLE", true)
 	SearchRateLimitNum = GetEnvOrDefault("SEARCH_RATE_LIMIT", 10)
 	SearchRateLimitDuration = int64(GetEnvOrDefault("SEARCH_RATE_LIMIT_DURATION", 60))
+	tokenRPMRateLimits, err := ParseTokenRPMRateLimits(os.Getenv("TOKEN_RPM_LIMITS"))
+	if err != nil {
+		log.Fatalf("invalid TOKEN_RPM_LIMITS: %v", err)
+	}
+	TokenRPMRateLimits = tokenRPMRateLimits
 	initConstantEnv()
 }
 

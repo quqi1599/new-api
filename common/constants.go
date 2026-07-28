@@ -193,6 +193,8 @@ var (
 	SearchRateLimitEnable         = true
 	SearchRateLimitNum            = 10
 	SearchRateLimitDuration int64 = 60
+
+	TokenRPMRateLimits = map[int]int{}
 )
 
 var RateLimitKeyExpirationDuration = 20 * time.Minute
