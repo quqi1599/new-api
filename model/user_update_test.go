@@ -92,32 +92,6 @@ func TestUpdateUserSettingOnlyUpdatesSetting(t *testing.T) {
 	assert.Equal(t, "zh", got.GetSetting().Language)
 }
 
-func TestAddUserBlockedChannelIsPersistentAndIdempotent(t *testing.T) {
-	setupUserUpdateTestState(t)
-
-	user := User{
-		Id:       3,
-		Username: "blocked-channel-user",
-		Password: "password",
-		Status:   common.UserStatusEnabled,
-	}
-	user.SetSetting(dto.UserSetting{Language: "zh", BlockedChannelIds: []int{9}})
-	require.NoError(t, DB.Create(&user).Error)
-
-	added, err := AddUserBlockedChannel(user.Id, 131)
-	require.NoError(t, err)
-	require.True(t, added)
-
-	added, err = AddUserBlockedChannel(user.Id, 131)
-	require.NoError(t, err)
-	require.False(t, added)
-
-	var got User
-	require.NoError(t, DB.First(&got, user.Id).Error)
-	assert.Equal(t, "zh", got.GetSetting().Language)
-	assert.Equal(t, []int{9, 131}, got.GetSetting().BlockedChannelIds)
-}
-
 func TestEnsureEmailAvailableRejectsExistingEmailCaseInsensitive(t *testing.T) {
 	setupUserUpdateTestState(t)
 

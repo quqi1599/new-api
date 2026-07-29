@@ -10,7 +10,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -179,16 +178,16 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 	}
 }
 
-func TestUserBlockedChannelsAreExcludedFromSelection(t *testing.T) {
+func TestTokenExcludedChannelsAreExcludedFromSelection(t *testing.T) {
 	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{})
-	common.SetContextKey(ctx, constant.ContextKeyUserSetting, dto.UserSetting{BlockedChannelIds: []int{131}})
+	common.SetContextKey(ctx, constant.ContextKeyTokenExcludedChannels, []int{131})
 
 	excluded := excludedChannelIdsForRequest(&RetryParam{
 		Ctx:                ctx,
 		ExcludedChannelIds: []int{9},
 	})
 	require.ElementsMatch(t, []int{9, 131}, excluded)
-	require.True(t, isUserChannelBlocked(ctx, 131))
+	require.True(t, isTokenChannelExcluded(ctx, 131))
 }
 
 func TestClearChannelAffinityAllowsRequestFallback(t *testing.T) {

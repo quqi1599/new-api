@@ -36,10 +36,16 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		excludedChannelIds := model.GetTokenChannelExclusionIds(c.GetInt("token_id"))
+		common.SetContextKey(c, constant.ContextKeyTokenExcludedChannels, excludedChannelIds)
 		if ok {
 			id, err := strconv.Atoi(channelId.(string))
 			if err != nil {
 				abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidChannelId))
+				return
+			}
+			if slices.Contains(excludedChannelIds, id) {
+				abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorChannelDisabled))
 				return
 			}
 			channel, err = model.GetChannelById(id, true)

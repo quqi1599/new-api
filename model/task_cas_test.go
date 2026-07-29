@@ -37,6 +37,7 @@ func TestMain(m *testing.M) {
 		&Task{},
 		&User{},
 		&Token{},
+		&TokenChannelExclusion{},
 		&Log{},
 		&Channel{},
 		&TopUp{},
@@ -56,6 +57,8 @@ func truncateTables(t *testing.T) {
 		DB.Exec("DELETE FROM tasks")
 		DB.Exec("DELETE FROM users")
 		DB.Exec("DELETE FROM tokens")
+		DB.Exec("DELETE FROM token_channel_exclusions")
+		resetTokenChannelExclusionCache()
 		DB.Exec("DELETE FROM logs")
 		DB.Exec("DELETE FROM channels")
 		DB.Exec("DELETE FROM top_ups")

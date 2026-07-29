@@ -6,7 +6,6 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
@@ -49,21 +48,21 @@ func (p *RetryParam) ResetRetryNextTry() {
 	p.resetNextTry = true
 }
 
-func userBlockedChannelIds(c *gin.Context) []int {
-	setting, ok := common.GetContextKeyType[dto.UserSetting](c, constant.ContextKeyUserSetting)
+func tokenExcludedChannelIds(c *gin.Context) []int {
+	channelIds, ok := common.GetContextKeyType[[]int](c, constant.ContextKeyTokenExcludedChannels)
 	if !ok {
 		return nil
 	}
-	return setting.BlockedChannelIds
+	return channelIds
 }
 
-func isUserChannelBlocked(c *gin.Context, channelId int) bool {
-	return slices.Contains(userBlockedChannelIds(c), channelId)
+func isTokenChannelExcluded(c *gin.Context, channelId int) bool {
+	return slices.Contains(tokenExcludedChannelIds(c), channelId)
 }
 
 func excludedChannelIdsForRequest(param *RetryParam) []int {
 	excluded := append([]int(nil), param.ExcludedChannelIds...)
-	return append(excluded, userBlockedChannelIds(param.Ctx)...)
+	return append(excluded, tokenExcludedChannelIds(param.Ctx)...)
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.

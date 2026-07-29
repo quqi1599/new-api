@@ -233,12 +233,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
 		sessionBlocked := isGPTSessionBlockedError(relayInfo, newAPIError)
-		if sessionBlocked {
-			added, err := model.AddUserBlockedChannel(relayInfo.UserId, channel.Id)
+		if sessionBlocked && relayInfo.TokenId > 0 {
+			added, err := model.AddTokenChannelExclusion(relayInfo.TokenId, channel.Id)
 			if err != nil {
-				logger.LogError(c, fmt.Sprintf("failed to block channel #%d for user #%d: %v", channel.Id, relayInfo.UserId, err))
+				logger.LogError(c, fmt.Sprintf("failed to exclude channel #%d for token #%d: %v", channel.Id, relayInfo.TokenId, err))
 			} else if added {
-				logger.LogWarn(c, fmt.Sprintf("blocked channel #%d for user #%d after upstream session policy rejection", channel.Id, relayInfo.UserId))
+				logger.LogWarn(c, fmt.Sprintf("excluded channel #%d for token #%d after upstream session policy rejection", channel.Id, relayInfo.TokenId))
 			}
 		}
 

@@ -616,7 +616,7 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 			return 0, false
 		}
 		if found {
-			if isUserChannelBlocked(c, channelID) {
+			if isTokenChannelExcluded(c, channelID) {
 				ClearChannelAffinityForRequest(c)
 				return 0, false
 			}

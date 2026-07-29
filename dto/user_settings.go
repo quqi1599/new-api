@@ -16,7 +16,6 @@ type UserSetting struct {
 	SidebarModules                   string  `json:"sidebar_modules,omitempty"`                      // SidebarModules 左侧边栏模块配置
 	BillingPreference                string  `json:"billing_preference,omitempty"`                   // BillingPreference 扣费策略（订阅/钱包）
 	Language                         string  `json:"language,omitempty"`                             // Language 用户语言偏好 (zh, en)
-	BlockedChannelIds                []int   `json:"blocked_channel_ids,omitempty"`                  // 上游策略封禁后不再为该用户选择的渠道
 }
 
 var (
