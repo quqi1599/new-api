@@ -641,6 +641,16 @@ func ShouldSkipRetryAfterChannelAffinityFailure(c *gin.Context) bool {
 	return meta.SkipRetry
 }
 
+func ClearChannelAffinityForRequest(c *gin.Context) {
+	cacheKey, _, ok := getChannelAffinityContext(c)
+	if !ok {
+		return
+	}
+	if _, err := getChannelAffinityCache().DeleteMany([]string{cacheKey}); err != nil {
+		common.SysError(fmt.Sprintf("channel affinity cache delete failed: key=%s, err=%v", cacheKey, err))
+	}
+}
+
 func MarkChannelAffinityUsed(c *gin.Context, selectedGroup string, channelID int) {
 	if c == nil || channelID <= 0 {
 		return

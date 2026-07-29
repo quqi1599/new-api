@@ -232,7 +232,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
+		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError)
+		canGPTFallback := gptFallback && canRetryGPTChannelFallback(relayInfo, len(retryParam.ExcludedChannelIds))
+		if canGPTFallback {
+			service.ClearChannelAffinityForRequest(c)
+		}
+		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) ||
+			(gptFallback && !canGPTFallback) {
 			break
 		}
 	}
@@ -348,6 +354,23 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		return false
 	}
 	return operation_setting.ShouldRetryByStatusCode(code)
+}
+
+func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
+	if info == nil || openaiErr == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(info.OriginModelName)), "gpt-") {
+		return false
+	}
+	switch openaiErr.StatusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+	default:
+		return false
+	}
+	return true
+}
+
+func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels int) bool {
+	return info != nil && attemptedChannels < 2 &&
+		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {

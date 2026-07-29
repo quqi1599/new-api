@@ -115,13 +115,6 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, preferredC
 		return nil, nil
 	}
 
-	if len(channels) == 1 {
-		if channel, ok := channelsIDM[channels[0]]; ok {
-			return channel, nil
-		}
-		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
-	}
-
 	// If preferred channel types are set, filter channels to prioritize native types
 	if len(preferredChannelTypes) > 0 {
 		typeSet := make(map[int]bool, len(preferredChannelTypes))
@@ -152,10 +145,17 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, preferredC
 				filtered = append(filtered, id)
 			}
 		}
-		// fallback to full list if all channels are excluded
-		if len(filtered) > 0 {
-			channels = filtered
+		channels = filtered
+	}
+
+	if len(channels) == 0 {
+		return nil, nil
+	}
+	if len(channels) == 1 {
+		if channel, ok := channelsIDM[channels[0]]; ok {
+			return channel, nil
 		}
+		return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channels[0])
 	}
 
 	uniquePriorities := make(map[int]bool)
