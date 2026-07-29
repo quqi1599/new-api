@@ -282,7 +282,7 @@ func migrateDB() error {
 	err := DB.AutoMigrate(
 		&Channel{},
 		&Token{},
-		&TokenChannelExclusion{},
+		&TokenProtectedChannelBan{},
 		&User{},
 		&PasskeyCredential{},
 		&Option{},
@@ -310,6 +310,9 @@ func migrateDB() error {
 	if err != nil {
 		return err
 	}
+	if err := migrateLegacyTokenChannelExclusions(); err != nil {
+		return err
+	}
 	if common.UsingSQLite {
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {
 			return err
@@ -332,7 +335,7 @@ func migrateDBFast() error {
 	}{
 		{&Channel{}, "Channel"},
 		{&Token{}, "Token"},
-		{&TokenChannelExclusion{}, "TokenChannelExclusion"},
+		{&TokenProtectedChannelBan{}, "TokenProtectedChannelBan"},
 		{&User{}, "User"},
 		{&PasskeyCredential{}, "PasskeyCredential"},
 		{&Option{}, "Option"},
@@ -379,6 +382,9 @@ func migrateDBFast() error {
 		if err != nil {
 			return err
 		}
+	}
+	if err := migrateLegacyTokenChannelExclusions(); err != nil {
+		return err
 	}
 	if common.UsingSQLite {
 		if err := ensureSubscriptionPlanTableSQLite(); err != nil {

@@ -275,6 +275,22 @@ const isRequestPassThroughEnabled = (record) => {
   }
 };
 
+const isAPIKeyPolicyProtectionEnabled = (record) => {
+  if (!record || record.children !== undefined || !record.settings) {
+    return false;
+  }
+  if (typeof record.settings === 'object') {
+    return record.settings.api_key_policy_protection_enabled === true;
+  }
+  try {
+    return (
+      JSON.parse(record.settings)?.api_key_policy_protection_enabled === true
+    );
+  } catch (error) {
+    return false;
+  }
+};
+
 const getUpstreamUpdateMeta = (record) => {
   const supported =
     !!record &&
@@ -340,6 +356,7 @@ export const getChannelsColumns = ({
       dataIndex: 'name',
       render: (text, record, index) => {
         const passThroughEnabled = isRequestPassThroughEnabled(record);
+        const policyProtectionEnabled = isAPIKeyPolicyProtectionEnabled(record);
         const upstreamUpdateMeta = getUpstreamUpdateMeta(record);
         const pendingAddCount = upstreamUpdateMeta.pendingAddModels.length;
         const pendingRemoveCount =
@@ -383,13 +400,29 @@ export const getChannelsColumns = ({
             <span>{text}</span>
           );
 
-        if (!passThroughEnabled && !showUpstreamUpdateTag) {
+        if (
+          !passThroughEnabled &&
+          !policyProtectionEnabled &&
+          !showUpstreamUpdateTag
+        ) {
           return nameNode;
         }
 
         return (
           <Space spacing={6} align='center'>
             {nameNode}
+            {policyProtectionEnabled && (
+              <Tooltip
+                content={t(
+                  '该渠道已启用 API Key 内容策略保护。被上游策略拦截的 API Key 将不再进入任何受保护渠道。',
+                )}
+                position='topLeft'
+              >
+                <Tag color='blue' type='light' size='small' shape='circle'>
+                  {t('策略保护')}
+                </Tag>
+              </Tooltip>
+            )}
             {passThroughEnabled && (
               <Tooltip
                 content={t(

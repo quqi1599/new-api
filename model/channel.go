@@ -852,6 +852,13 @@ func (channel *Channel) ValidateSettings() error {
 	return nil
 }
 
+func (channel *Channel) ValidateOtherSettings() error {
+	if channel.OtherSettings == "" {
+		return nil
+	}
+	return common.UnmarshalJsonStr(channel.OtherSettings, &dto.ChannelOtherSettings{})
+}
+
 func (channel *Channel) GetSetting() dto.ChannelSettings {
 	setting := dto.ChannelSettings{}
 	if channel.Setting != nil && *channel.Setting != "" {

@@ -3642,6 +3642,27 @@
     "默认折叠侧边栏": "Réduire la barre latérale par défaut",
     "默认测试模型": "Modèle de test par défaut",
     "默认用户消息": "Bonjour",
-    "默认补全倍率": "Taux de complétion par défaut"
+    "默认补全倍率": "Taux de complétion par défaut",
+    "API Key 策略保护": "Protection de stratégie des clés API",
+    "启用内容策略保护": "Activer la protection de contenu",
+    "开启后，当 GPT 请求被上游内容策略拦截时，会将当前 API Key 加入全局保护名单；后续不再进入任何已开启此保护的渠道，并尝试其他 GPT 渠道。": "Lorsqu'une requête GPT est bloquée par la stratégie de contenu en amont, la clé API rejoint la liste de protection globale, évite tous les canaux protégés et essaie un autre canal GPT.",
+    "该渠道已启用 API Key 内容策略保护。被上游策略拦截的 API Key 将不再进入任何受保护渠道。": "La protection de contenu des clés API est active sur ce canal. Les clés bloquées n'accéderont plus aux canaux protégés.",
+    "策略保护": "Protection active",
+    "API Key 保护名单": "Liste de protection des clés API",
+    "解除 API Key 保护限制": "Retirer la restriction de la clé API",
+    "解除后，该 API Key 将可以再次进入所有受保护渠道。确定继续吗？": "Après le retrait, cette clé API pourra de nouveau accéder aux canaux protégés. Continuer ?",
+    "已解除保护限制": "Restriction retirée",
+    "已删除的令牌": "Jeton supprimé",
+    "所属用户": "Propriétaire",
+    "触发渠道": "Canal déclencheur",
+    "已删除的渠道": "Canal supprimé",
+    "上游内容策略封禁": "Blocage par la stratégie de contenu",
+    "封禁时间": "Bloqué le",
+    "解除": "Retirer",
+    "全局": "Global",
+    "共 {{count}} 条": "{{count}} au total",
+    "名单以 API Key 为单位，与用户账号无关。名单中的 Key 会跳过当前和未来所有已启用内容策略保护的渠道。": "La liste est indexée par clé API, pas par compte utilisateur. Les clés listées évitent tous les canaux actuels et futurs protégés.",
+    "搜索令牌 ID、名称、用户或触发渠道": "Rechercher un ID, un nom, un propriétaire ou un canal",
+    "暂无被封禁的 API Key": "Aucune clé API bloquée"
   }
 }

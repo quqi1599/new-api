@@ -186,8 +186,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	retryLimit := common.RetryTimes
+	policyFallbackStarted := false
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	for ; retryParam.GetRetry() <= retryLimit; retryParam.IncreaseRetry() {
+		wasPolicyFallbackAttempt := policyFallbackStarted
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -228,27 +231,46 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError)
+		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
+		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, sessionBlocked)
 
 		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
-		sessionBlocked := isGPTSessionBlockedError(relayInfo, newAPIError)
+		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
-			added, err := model.AddTokenChannelExclusion(relayInfo.TokenId, channel.Id)
+			added, err := model.BanTokenFromProtectedChannels(relayInfo.TokenId, channel.Id)
 			if err != nil {
-				logger.LogError(c, fmt.Sprintf("failed to exclude channel #%d for token #%d: %v", channel.Id, relayInfo.TokenId, err))
+				policyProtectionReady = false
+				logger.LogError(c, fmt.Sprintf("failed to persist protected channel ban for token #%d after channel #%d rejection: %v", relayInfo.TokenId, channel.Id, err))
 			} else if added {
-				logger.LogWarn(c, fmt.Sprintf("excluded channel #%d for token #%d after upstream session policy rejection", channel.Id, relayInfo.TokenId))
+				logger.LogWarn(c, fmt.Sprintf("globally protected token #%d after upstream session policy rejection on channel #%d", relayInfo.TokenId, channel.Id))
+			}
+
+			protectedChannelIds, err := model.GetAPIKeyPolicyProtectedChannelIds()
+			if err != nil {
+				policyProtectionReady = false
+				logger.LogError(c, fmt.Sprintf("failed to load protected channels for token #%d: %v", relayInfo.TokenId, err))
+			} else {
+				retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, protectedChannelIds...)
+				common.SetContextKey(c, constant.ContextKeyTokenExcludedChannels, protectedChannelIds)
 			}
 		}
 
 		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError) || sessionBlocked
-		canGPTFallback := gptFallback && canRetryGPTChannelFallback(relayInfo, len(retryParam.ExcludedChannelIds))
+		canGPTFallback := gptFallback && policyProtectionReady &&
+			canRetryGPTChannelFallback(relayInfo, len(c.GetStringSlice("use_channel")))
 		if canGPTFallback {
 			service.ClearChannelAffinityForRequest(c)
 		}
-		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) ||
-			(gptFallback && !canGPTFallback) {
+		if sessionBlocked && canGPTFallback {
+			policyFallbackStarted = true
+			retryLimit = extendRetryLimitForGatewayPolicyFallback(retryLimit, retryParam.GetRetry())
+		}
+		retryAllowed := shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		if sessionBlocked {
+			retryAllowed = canGPTFallback
+		}
+		if !canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback, wasPolicyFallbackAttempt) {
 			break
 		}
 	}
@@ -378,11 +400,15 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 	return true
 }
 
-func isGPTSessionBlockedError(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
-	return info != nil && openaiErr != nil &&
-		strings.HasPrefix(strings.ToLower(strings.TrimSpace(info.OriginModelName)), "gpt-") &&
-		openaiErr.StatusCode == http.StatusForbidden &&
+func isGatewaySessionBlockedError(openaiErr *types.NewAPIError) bool {
+	return openaiErr != nil &&
 		strings.Contains(strings.ToLower(openaiErr.Error()), "this session has been blocked by the gateway content policy")
+}
+
+func shouldBanTokenFromProtectedChannels(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
+	return info != nil && info.ChannelMeta != nil &&
+		info.ChannelOtherSettings.APIKeyPolicyProtectionEnabled &&
+		isGatewaySessionBlockedError(openaiErr)
 }
 
 func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels int) bool {
@@ -390,11 +416,22 @@ func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels i
 		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0
 }
 
-func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
+func extendRetryLimitForGatewayPolicyFallback(retryLimit int, currentRetry int) int {
+	if currentRetry >= retryLimit {
+		return currentRetry + 1
+	}
+	return retryLimit
+}
+
+func canContinueRelayRetry(retryAllowed bool, fallbackError bool, canFallback bool, wasPolicyFallbackAttempt bool) bool {
+	return !wasPolicyFallbackAttempt && retryAllowed && (!fallbackError || canFallback)
+}
+
+func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, skipAutoDisable bool) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
+	if !skipAutoDisable && service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})
@@ -592,7 +629,8 @@ func RelayTask(c *gin.Context) {
 			processChannelError(c,
 				*types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey,
 					common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()),
-				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode))
+				types.NewOpenAIError(taskErr.Error, types.ErrorCodeBadResponseStatusCode, taskErr.StatusCode),
+				false)
 		}
 
 		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {

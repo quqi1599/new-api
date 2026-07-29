@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 var group2model2channels map[string]map[string][]int // enabled channel
 var channelsIDM map[int]*Channel                     // all channels include disabled
+var apiKeyPolicyProtectedChannelIds []int
 var channelSyncLock sync.RWMutex
 
 func InitChannelCache() {
@@ -23,11 +25,16 @@ func InitChannelCache() {
 		return
 	}
 	newChannelId2channel := make(map[int]*Channel)
+	newProtectedChannelIds := make([]int, 0)
 	var channels []*Channel
 	DB.Find(&channels)
 	for _, channel := range channels {
 		newChannelId2channel[channel.Id] = channel
+		if channel.GetOtherSettings().APIKeyPolicyProtectionEnabled {
+			newProtectedChannelIds = append(newProtectedChannelIds, channel.Id)
+		}
 	}
+	sort.Ints(newProtectedChannelIds)
 	var abilities []*Ability
 	DB.Find(&abilities)
 	groups := make(map[string]bool)
@@ -81,6 +88,7 @@ func InitChannelCache() {
 		}
 	}
 	channelsIDM = newChannelId2channel
+	apiKeyPolicyProtectedChannelIds = newProtectedChannelIds
 	channelSyncLock.Unlock()
 	common.SysLog("channels synced from database")
 }
@@ -224,6 +232,27 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, preferredC
 	}
 	// return null if no channel is not found
 	return nil, errors.New("channel not found")
+}
+
+func GetAPIKeyPolicyProtectedChannelIds() ([]int, error) {
+	if !common.MemoryCacheEnabled {
+		var channels []*Channel
+		if err := DB.Select("id", "settings").Find(&channels).Error; err != nil {
+			return nil, err
+		}
+		channelIds := make([]int, 0)
+		for _, channel := range channels {
+			if channel.GetOtherSettings().APIKeyPolicyProtectionEnabled {
+				channelIds = append(channelIds, channel.Id)
+			}
+		}
+		sort.Ints(channelIds)
+		return channelIds, nil
+	}
+
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+	return slices.Clone(apiKeyPolicyProtectedChannelIds), nil
 }
 
 func CacheGetChannel(id int) (*Channel, error) {

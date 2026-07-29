@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Button,
   Dropdown,
@@ -27,6 +27,7 @@ import {
   Select,
 } from '@douyinfe/semi-ui';
 import CompactModeToggle from '../../common/ui/CompactModeToggle';
+import ProtectedChannelBansSideSheet from './modals/ProtectedChannelBansSideSheet';
 
 const ChannelsActions = ({
   enableBatchDelete,
@@ -58,12 +59,15 @@ const ChannelsActions = ({
   setActivePage,
   t,
 }) => {
+  const [showProtectedChannelBans, setShowProtectedChannelBans] =
+    useState(false);
+
   return (
     <div className='flex flex-col gap-2'>
       {/* 第一行：批量操作按钮 + 设置开关 */}
       <div className='flex flex-col md:flex-row justify-between gap-2'>
         {/* 左侧：批量操作按钮 */}
-        <div className='flex flex-wrap md:flex-nowrap items-center gap-2 w-full md:w-auto order-2 md:order-1'>
+        <div className='flex flex-wrap items-center gap-2 w-full md:w-auto order-2 md:order-1'>
           <Button
             size='small'
             disabled={!enableBatchDelete}
@@ -228,6 +232,16 @@ const ChannelsActions = ({
             setCompactMode={setCompactMode}
             t={t}
           />
+
+          <Button
+            size='small'
+            type='primary'
+            theme='light'
+            className='w-full md:w-auto'
+            onClick={() => setShowProtectedChannelBans(true)}
+          >
+            {t('API Key 保护名单')}
+          </Button>
         </div>
 
         {/* 右侧：设置开关区域 */}
@@ -322,6 +336,12 @@ const ChannelsActions = ({
           </div>
         </div>
       </div>
+
+      <ProtectedChannelBansSideSheet
+        visible={showProtectedChannelBans}
+        onCancel={() => setShowProtectedChannelBans(false)}
+        t={t}
+      />
     </div>
   );
 };

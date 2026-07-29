@@ -215,6 +215,7 @@ const EditChannelModal = (props) => {
     upstream_model_update_last_check_time: 0,
     upstream_model_update_last_detected_models: [],
     upstream_model_update_ignored_models: '',
+    api_key_policy_protection_enabled: false,
   };
   const [batch, setBatch] = useState(false);
   const [multiToSingle, setMultiToSingle] = useState(false);
@@ -927,6 +928,8 @@ const EditChannelModal = (props) => {
           )
             ? parsedSettings.upstream_model_update_ignored_models.join(',')
             : '';
+          data.api_key_policy_protection_enabled =
+            parsedSettings.api_key_policy_protection_enabled === true;
         } catch (error) {
           console.error('解析其他设置失败:', error);
           data.azure_responses_version = '';
@@ -946,6 +949,7 @@ const EditChannelModal = (props) => {
           data.upstream_model_update_last_check_time = 0;
           data.upstream_model_update_last_detected_models = [];
           data.upstream_model_update_ignored_models = '';
+          data.api_key_policy_protection_enabled = false;
         }
       } else {
         // 兼容历史数据：老渠道没有 settings 时，默认按 json 展示
@@ -964,6 +968,7 @@ const EditChannelModal = (props) => {
         data.upstream_model_update_last_check_time = 0;
         data.upstream_model_update_last_detected_models = [];
         data.upstream_model_update_ignored_models = '';
+        data.api_key_policy_protection_enabled = false;
       }
 
       if (
@@ -1037,7 +1042,8 @@ const EditChannelModal = (props) => {
         data.pass_through_body_enabled ||
         data.force_format ||
         data.claude_beta_query ||
-        data.system_prompt_override;
+        data.system_prompt_override ||
+        data.api_key_policy_protection_enabled;
       if (hasAdvancedValues) {
         setAdvancedSettingsOpen(true);
       }
@@ -1825,6 +1831,8 @@ const EditChannelModal = (props) => {
     if (typeof settings.upstream_model_update_last_check_time !== 'number') {
       settings.upstream_model_update_last_check_time = 0;
     }
+    settings.api_key_policy_protection_enabled =
+      localInputs.api_key_policy_protection_enabled === true;
 
     localInputs.settings = JSON.stringify(settings);
 
@@ -1853,6 +1861,7 @@ const EditChannelModal = (props) => {
     delete localInputs.upstream_model_update_last_check_time;
     delete localInputs.upstream_model_update_last_detected_models;
     delete localInputs.upstream_model_update_ignored_models;
+    delete localInputs.api_key_policy_protection_enabled;
 
     let res;
     localInputs.auto_ban = localInputs.auto_ban ? 1 : 0;
@@ -2211,6 +2220,27 @@ const EditChannelModal = (props) => {
           {() => {
             const advancedSettingsContent = (
               <div className='space-y-4'>
+                <div className='pb-3 border-b border-gray-100'>
+                  <Text className='text-sm font-medium text-gray-500 mb-3 block'>
+                    {t('API Key 策略保护')}
+                  </Text>
+                  <Form.Switch
+                    field='api_key_policy_protection_enabled'
+                    label={t('启用内容策略保护')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleChannelOtherSettingsChange(
+                        'api_key_policy_protection_enabled',
+                        value,
+                      )
+                    }
+                    extraText={t(
+                      '开启后，当 GPT 请求被上游内容策略拦截时，会将当前 API Key 加入全局保护名单；后续不再进入任何已开启此保护的渠道，并尝试其他 GPT 渠道。',
+                    )}
+                  />
+                </div>
+
                 {/* Upstream Model Management Section */}
                 {MODEL_FETCHABLE_CHANNEL_TYPES.has(inputs.type) && (
                 <div className='pb-3 border-b border-gray-100'>
