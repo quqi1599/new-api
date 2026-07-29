@@ -294,9 +294,6 @@ func InitResources() error {
 		common.FatalLog("failed to initialize database: " + err.Error())
 		return err
 	}
-	if err = model.InitTokenChannelExclusionCache(); err != nil {
-		return fmt.Errorf("failed to initialize token channel exclusions: %w", err)
-	}
 
 	model.CheckSetup()
 

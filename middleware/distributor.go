@@ -36,7 +36,12 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		excludedChannelIds := model.GetTokenChannelExclusionIds(c.GetInt("token_id"))
+		excludedChannelIds, err := model.GetTokenChannelExclusionIds(c.GetInt("token_id"))
+		if err != nil {
+			common.SysLog("failed to load token channel exclusions: " + err.Error())
+			abortWithOpenAiMessage(c, http.StatusInternalServerError, common.TranslateMessage(c, i18n.MsgDatabaseError))
+			return
+		}
 		common.SetContextKey(c, constant.ContextKeyTokenExcludedChannels, excludedChannelIds)
 		if ok {
 			id, err := strconv.Atoi(channelId.(string))

@@ -14,40 +14,42 @@ type TokenChannelExclusion struct {
 	CreatedAt int64 `json:"created_at" gorm:"autoCreateTime"`
 }
 
-var tokenChannelExclusionCache = struct {
-	sync.RWMutex
-	byToken map[int][]int
-}{
-	byToken: make(map[int][]int),
+var tokenChannelExclusionCache sync.Map
+
+type tokenChannelExclusionCacheEntry struct {
+	once       sync.Once
+	mu         sync.RWMutex
+	channelIds []int
+	err        error
 }
 
-// InitTokenChannelExclusionCache loads the durable exclusions once at startup.
-// ponytail: full preload fits the current small table; use a bounded cache if it grows beyond active-key scale.
-func InitTokenChannelExclusionCache() error {
-	var exclusions []TokenChannelExclusion
-	if err := DB.Order("token_id, channel_id").Find(&exclusions).Error; err != nil {
-		return err
-	}
-
-	byToken := make(map[int][]int)
-	for _, exclusion := range exclusions {
-		byToken[exclusion.TokenId] = append(byToken[exclusion.TokenId], exclusion.ChannelId)
-	}
-
-	tokenChannelExclusionCache.Lock()
-	tokenChannelExclusionCache.byToken = byToken
-	tokenChannelExclusionCache.Unlock()
-	return nil
+func (entry *tokenChannelExclusionCacheEntry) load(tokenId int) {
+	entry.err = DB.Model(&TokenChannelExclusion{}).
+		Where("token_id = ?", tokenId).
+		Order("channel_id").
+		Pluck("channel_id", &entry.channelIds).Error
 }
 
-func GetTokenChannelExclusionIds(tokenId int) []int {
+// GetTokenChannelExclusionIds loads one API key on its first request, then serves it from memory.
+func GetTokenChannelExclusionIds(tokenId int) ([]int, error) {
 	if tokenId <= 0 {
-		return nil
+		return nil, nil
 	}
-	tokenChannelExclusionCache.RLock()
-	channelIds := slices.Clone(tokenChannelExclusionCache.byToken[tokenId])
-	tokenChannelExclusionCache.RUnlock()
-	return channelIds
+
+	cached, _ := tokenChannelExclusionCache.LoadOrStore(tokenId, &tokenChannelExclusionCacheEntry{})
+	entry := cached.(*tokenChannelExclusionCacheEntry)
+	entry.once.Do(func() {
+		entry.load(tokenId)
+	})
+	if entry.err != nil {
+		tokenChannelExclusionCache.CompareAndDelete(tokenId, entry)
+		return nil, entry.err
+	}
+
+	entry.mu.RLock()
+	channelIds := slices.Clone(entry.channelIds)
+	entry.mu.RUnlock()
+	return channelIds, nil
 }
 
 func AddTokenChannelExclusion(tokenId int, channelId int) (bool, error) {
@@ -63,19 +65,29 @@ func AddTokenChannelExclusion(tokenId int, channelId int) (bool, error) {
 		return false, result.Error
 	}
 
-	tokenChannelExclusionCache.Lock()
-	channelIds := tokenChannelExclusionCache.byToken[tokenId]
-	if !slices.Contains(channelIds, channelId) {
-		channelIds = append(channelIds, channelId)
-		slices.Sort(channelIds)
-		tokenChannelExclusionCache.byToken[tokenId] = channelIds
+	if cached, ok := tokenChannelExclusionCache.Load(tokenId); ok {
+		entry := cached.(*tokenChannelExclusionCacheEntry)
+		entry.once.Do(func() {
+			entry.load(tokenId)
+		})
+		if entry.err != nil {
+			tokenChannelExclusionCache.CompareAndDelete(tokenId, entry)
+			return result.RowsAffected > 0, nil
+		}
+
+		entry.mu.Lock()
+		if !slices.Contains(entry.channelIds, channelId) {
+			entry.channelIds = append(entry.channelIds, channelId)
+			slices.Sort(entry.channelIds)
+		}
+		entry.mu.Unlock()
 	}
-	tokenChannelExclusionCache.Unlock()
 	return result.RowsAffected > 0, nil
 }
 
 func resetTokenChannelExclusionCache() {
-	tokenChannelExclusionCache.Lock()
-	tokenChannelExclusionCache.byToken = make(map[int][]int)
-	tokenChannelExclusionCache.Unlock()
+	tokenChannelExclusionCache.Range(func(key, _ any) bool {
+		tokenChannelExclusionCache.Delete(key)
+		return true
+	})
 }
