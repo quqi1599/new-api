@@ -232,7 +232,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
-		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError)
+		sessionBlocked := isGPTSessionBlockedError(relayInfo, newAPIError)
+		if sessionBlocked {
+			added, err := model.AddUserBlockedChannel(relayInfo.UserId, channel.Id)
+			if err != nil {
+				logger.LogError(c, fmt.Sprintf("failed to block channel #%d for user #%d: %v", channel.Id, relayInfo.UserId, err))
+			} else if added {
+				logger.LogWarn(c, fmt.Sprintf("blocked channel #%d for user #%d after upstream session policy rejection", channel.Id, relayInfo.UserId))
+			}
+		}
+
+		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError) || sessionBlocked
 		canGPTFallback := gptFallback && canRetryGPTChannelFallback(relayInfo, len(retryParam.ExcludedChannelIds))
 		if canGPTFallback {
 			service.ClearChannelAffinityForRequest(c)
@@ -366,6 +376,13 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 		return false
 	}
 	return true
+}
+
+func isGPTSessionBlockedError(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
+	return info != nil && openaiErr != nil &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(info.OriginModelName)), "gpt-") &&
+		openaiErr.StatusCode == http.StatusForbidden &&
+		strings.Contains(strings.ToLower(openaiErr.Error()), "this session has been blocked by the gateway content policy")
 }
 
 func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels int) bool {

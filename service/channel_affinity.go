@@ -616,6 +616,10 @@ func GetPreferredChannelByAffinity(c *gin.Context, modelName string, usingGroup 
 			return 0, false
 		}
 		if found {
+			if isUserChannelBlocked(c, channelID) {
+				ClearChannelAffinityForRequest(c)
+				return 0, false
+			}
 			return channelID, true
 		}
 		return 0, false
@@ -642,6 +646,10 @@ func ShouldSkipRetryAfterChannelAffinityFailure(c *gin.Context) bool {
 }
 
 func ClearChannelAffinityForRequest(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(ginKeyChannelAffinitySkipRetry, false)
 	cacheKey, _, ok := getChannelAffinityContext(c)
 	if !ok {
 		return

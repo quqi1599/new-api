@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -97,10 +99,24 @@ func (user *User) SetSetting(setting dto.UserSetting) {
 	user.Setting = string(settingBytes)
 }
 
+// ponytail: process-local striping is enough for the current single replica; use DB row locks before multi-replica setting writes.
+var userSettingLocks [64]sync.Mutex
+
+func userSettingLock(userId int) *sync.Mutex {
+	return &userSettingLocks[uint(userId)%uint(len(userSettingLocks))]
+}
+
 func UpdateUserSetting(userId int, setting dto.UserSetting) error {
 	if userId == 0 {
 		return errors.New("id 为空！")
 	}
+	lock := userSettingLock(userId)
+	lock.Lock()
+	defer lock.Unlock()
+	return updateUserSetting(userId, setting)
+}
+
+func updateUserSetting(userId int, setting dto.UserSetting) error {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {
 		return err
@@ -110,6 +126,33 @@ func UpdateUserSetting(userId int, setting dto.UserSetting) error {
 		return err
 	}
 	return updateUserSettingCache(userId, settingValue)
+}
+
+func AddUserBlockedChannel(userId int, channelId int) (bool, error) {
+	if userId <= 0 || channelId <= 0 {
+		return false, errors.New("用户或渠道 id 无效")
+	}
+
+	lock := userSettingLock(userId)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var user User
+	if err := DB.Select("setting").First(&user, "id = ?", userId).Error; err != nil {
+		return false, err
+	}
+	setting := dto.UserSetting{}
+	if user.Setting != "" {
+		if err := common.Unmarshal([]byte(user.Setting), &setting); err != nil {
+			return false, err
+		}
+	}
+	if slices.Contains(setting.BlockedChannelIds, channelId) {
+		return false, nil
+	}
+	setting.BlockedChannelIds = append(setting.BlockedChannelIds, channelId)
+	slices.Sort(setting.BlockedChannelIds)
+	return true, updateUserSetting(userId, setting)
 }
 
 // 根据用户角色生成默认的边栏配置

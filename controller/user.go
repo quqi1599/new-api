@@ -1263,6 +1263,7 @@ func UpdateUserSetting(c *gin.Context) {
 		UpstreamModelUpdateNotifyEnabled: upstreamModelUpdateNotifyEnabled,
 		AcceptUnsetRatioModel:            req.AcceptUnsetModelRatioModel,
 		RecordIpLog:                      req.RecordIpLog,
+		BlockedChannelIds:                existingSettings.BlockedChannelIds,
 	}
 
 	// 如果是webhook类型,添加webhook相关设置

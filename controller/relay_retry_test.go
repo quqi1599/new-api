@@ -24,3 +24,20 @@ func TestGPTChannelFallbackStopsAfterOutputOrOneFallback(t *testing.T) {
 		t.Fatal("must not retry after output starts")
 	}
 }
+
+func TestGPTSessionBlockedError(t *testing.T) {
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-luna"}
+	err := types.NewErrorWithStatusCode(
+		errors.New("This session has been blocked by the gateway content policy. Contact the administrator."),
+		types.ErrorCodeBadResponse,
+		http.StatusForbidden,
+	)
+	if !isGPTSessionBlockedError(info, err) {
+		t.Fatal("expected GPT gateway session policy rejection")
+	}
+
+	info.OriginModelName = "claude-sonnet-4"
+	if isGPTSessionBlockedError(info, err) {
+		t.Fatal("must not block channels for non-GPT models")
+	}
+}

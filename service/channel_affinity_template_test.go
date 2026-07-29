@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
@@ -174,6 +177,26 @@ func TestShouldSkipRetryAfterChannelAffinityFailure(t *testing.T) {
 			require.Equal(t, tt.want, ShouldSkipRetryAfterChannelAffinityFailure(tt.ctx()))
 		})
 	}
+}
+
+func TestUserBlockedChannelsAreExcludedFromSelection(t *testing.T) {
+	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{})
+	common.SetContextKey(ctx, constant.ContextKeyUserSetting, dto.UserSetting{BlockedChannelIds: []int{131}})
+
+	excluded := excludedChannelIdsForRequest(&RetryParam{
+		Ctx:                ctx,
+		ExcludedChannelIds: []int{9},
+	})
+	require.ElementsMatch(t, []int{9, 131}, excluded)
+	require.True(t, isUserChannelBlocked(ctx, 131))
+}
+
+func TestClearChannelAffinityAllowsRequestFallback(t *testing.T) {
+	ctx := buildChannelAffinityTemplateContextForTest(channelAffinityMeta{SkipRetry: true})
+	ctx.Set(ginKeyChannelAffinitySkipRetry, true)
+
+	ClearChannelAffinityForRequest(ctx)
+	require.False(t, ShouldSkipRetryAfterChannelAffinityFailure(ctx))
 }
 
 func TestChannelAffinityHitCodexTemplatePassHeadersEffective(t *testing.T) {
