@@ -4190,13 +4190,14 @@
     "所属用户": "Chủ sở hữu",
     "触发渠道": "Kênh kích hoạt",
     "已删除的渠道": "Kênh đã xóa",
+    "Moderation ID": "ID kiểm duyệt",
     "上游内容策略封禁": "Bị chính sách nội dung thượng nguồn chặn",
     "封禁时间": "Thời gian chặn",
     "解除": "Gỡ",
     "全局": "Toàn cục",
     "共 {{count}} 条": "Tổng cộng {{count}}",
     "名单以 API Key 为单位，与用户账号无关。名单中的 Key 会跳过当前和未来所有已启用内容策略保护的渠道。": "Danh sách được quản lý theo API Key, không theo tài khoản người dùng. Các khóa trong danh sách bỏ qua mọi kênh hiện tại và tương lai đã bật bảo vệ.",
-    "搜索令牌 ID、名称、用户或触发渠道": "Tìm ID token, tên, chủ sở hữu hoặc kênh kích hoạt",
+    "搜索令牌 ID、名称、用户、触发渠道或 Moderation ID": "Tìm ID token, tên, chủ sở hữu, kênh kích hoạt hoặc ID kiểm duyệt",
     "暂无被封禁的 API Key": "Không có API Key bị chặn"
   }
 }

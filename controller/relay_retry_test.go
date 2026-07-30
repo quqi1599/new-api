@@ -110,6 +110,28 @@ func TestGatewaySessionBlockedError(t *testing.T) {
 	}
 }
 
+func TestExtractModerationReviewId(t *testing.T) {
+	const moderationId = "e2bb21e3d0a60657d6895957df3585300633fc1b1390cf727a2e37892f5bcbf8"
+	err := types.NewErrorWithStatusCode(
+		errors.New("This session has been blocked by the gateway content policy. Contact the administrator if you believe this is a mistake. Moderation review id: "+moderationId+"."),
+		types.ErrorCodeBadResponse,
+		http.StatusForbidden,
+	)
+	if got := extractModerationReviewId(err); got != moderationId {
+		t.Fatalf("moderation review id = %q, want %q", got, moderationId)
+	}
+
+	err.SetMessage("Moderation_id=" + moderationId)
+	if got := extractModerationReviewId(err); got != moderationId {
+		t.Fatalf("moderation id alternate format = %q, want %q", got, moderationId)
+	}
+
+	err.SetMessage("This session has been blocked by the gateway content policy.")
+	if got := extractModerationReviewId(err); got != "" {
+		t.Fatalf("unexpected moderation review id %q", got)
+	}
+}
+
 func TestProtectedChannelControlsGlobalTokenBan(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "o4-mini"}
 	err := types.NewErrorWithStatusCode(

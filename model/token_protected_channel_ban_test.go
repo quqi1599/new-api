@@ -44,13 +44,17 @@ func TestTokenProtectedChannelBanIsPersistentIdempotentAndCached(t *testing.T) {
 	require.True(t, DB.Migrator().HasTable(&TokenProtectedChannelBan{}))
 	resetProtectedChannelBanTestState(t)
 
-	added, err := BanTokenFromProtectedChannels(1001, 131)
+	added, err := BanTokenFromProtectedChannels(1001, 131, "review-id-1001")
 	require.NoError(t, err)
 	require.True(t, added)
 
-	added, err = BanTokenFromProtectedChannels(1001, 132)
+	added, err = BanTokenFromProtectedChannels(1001, 132, "review-id-should-not-replace")
 	require.NoError(t, err)
 	require.False(t, added)
+
+	var storedBan TokenProtectedChannelBan
+	require.NoError(t, DB.Where("token_id = ?", 1001).Take(&storedBan).Error)
+	require.Equal(t, "review-id-1001", storedBan.ModerationId)
 
 	resetTokenProtectedChannelBanCache()
 	banned, err := IsTokenProtectedChannelBanned(1001)
@@ -110,7 +114,7 @@ func TestTokenProtectedChannelBanPersistErrorIsRetried(t *testing.T) {
 		_ = DB.Callback().Create().Remove(callbackName)
 	})
 
-	added, err := BanTokenFromProtectedChannels(2501, 131)
+	added, err := BanTokenFromProtectedChannels(2501, 131, "review-id-persist-retry")
 	require.False(t, added)
 	require.ErrorIs(t, err, persistErr)
 
@@ -122,6 +126,9 @@ func TestTokenProtectedChannelBanPersistErrorIsRetried(t *testing.T) {
 	banned, err = IsTokenProtectedChannelBanned(2501)
 	require.NoError(t, err)
 	require.True(t, banned, "retry must persist the ban before serving from a cold cache")
+	var storedBan TokenProtectedChannelBan
+	require.NoError(t, DB.Where("token_id = ?", 2501).Take(&storedBan).Error)
+	require.Equal(t, "review-id-persist-retry", storedBan.ModerationId)
 }
 
 func TestTokenProtectedChannelBanConcurrentFirstLoadQueriesOnce(t *testing.T) {
@@ -168,7 +175,8 @@ func TestSearchAndDeleteAdminProtectedChannelBan(t *testing.T) {
 		_ = DB.Delete(channel).Error
 	})
 
-	added, err := BanTokenFromProtectedChannels(token.Id, channel.Id)
+	const moderationId = "review-id-admin-search"
+	added, err := BanTokenFromProtectedChannels(token.Id, channel.Id, moderationId)
 	require.NoError(t, err)
 	require.True(t, added)
 
@@ -182,6 +190,13 @@ func TestSearchAndDeleteAdminProtectedChannelBan(t *testing.T) {
 	require.Equal(t, user.Username, items[0].Username)
 	require.Equal(t, channel.Id, items[0].TriggerChannelId)
 	require.Equal(t, channel.Name, items[0].TriggerChannelName)
+	require.Equal(t, moderationId, items[0].ModerationId)
+
+	items, total, err = SearchAdminProtectedChannelBans(moderationId, 0, 20)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Len(t, items, 1)
+	require.Equal(t, token.Id, items[0].TokenId)
 
 	deleted, err := DeleteTokenProtectedChannelBan(token.Id)
 	require.NoError(t, err)

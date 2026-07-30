@@ -12,9 +12,10 @@ import (
 )
 
 type TokenProtectedChannelBan struct {
-	TokenId          int   `json:"token_id" gorm:"primaryKey;autoIncrement:false"`
-	TriggerChannelId int   `json:"trigger_channel_id" gorm:"index"`
-	CreatedAt        int64 `json:"created_at" gorm:"autoCreateTime"`
+	TokenId          int    `json:"token_id" gorm:"primaryKey;autoIncrement:false"`
+	TriggerChannelId int    `json:"trigger_channel_id" gorm:"index"`
+	ModerationId     string `json:"moderation_id" gorm:"size:128;index"`
+	CreatedAt        int64  `json:"created_at" gorm:"autoCreateTime"`
 }
 
 type legacyTokenChannelExclusion struct {
@@ -36,6 +37,7 @@ type AdminProtectedChannelBan struct {
 	Username           string `json:"username"`
 	TriggerChannelId   int    `json:"trigger_channel_id"`
 	TriggerChannelName string `json:"trigger_channel_name"`
+	ModerationId       string `json:"moderation_id"`
 	CreatedAt          int64  `json:"created_at"`
 }
 
@@ -47,6 +49,7 @@ type tokenProtectedChannelBanCacheEntry struct {
 	banned           bool
 	persistPending   bool
 	triggerChannelId int
+	moderationId     string
 }
 
 func getTokenProtectedChannelBanCacheEntry(tokenId int) *tokenProtectedChannelBanCacheEntry {
@@ -67,6 +70,7 @@ func IsTokenProtectedChannelBanned(tokenId int) (bool, error) {
 			result := DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&TokenProtectedChannelBan{
 				TokenId:          tokenId,
 				TriggerChannelId: entry.triggerChannelId,
+				ModerationId:     entry.moderationId,
 			})
 			if result.Error != nil {
 				entry.mu.Unlock()
@@ -92,10 +96,11 @@ func IsTokenProtectedChannelBanned(tokenId int) (bool, error) {
 	return banned, nil
 }
 
-func BanTokenFromProtectedChannels(tokenId int, triggerChannelId int) (bool, error) {
+func BanTokenFromProtectedChannels(tokenId int, triggerChannelId int, moderationId string) (bool, error) {
 	if tokenId <= 0 || triggerChannelId <= 0 {
 		return false, errors.New("令牌或渠道 id 无效")
 	}
+	moderationId = strings.TrimSpace(moderationId)
 
 	entry := getTokenProtectedChannelBanCacheEntry(tokenId)
 	entry.mu.Lock()
@@ -104,18 +109,21 @@ func BanTokenFromProtectedChannels(tokenId int, triggerChannelId int) (bool, err
 	result := DB.Clauses(clause.OnConflict{DoNothing: true}).Create(&TokenProtectedChannelBan{
 		TokenId:          tokenId,
 		TriggerChannelId: triggerChannelId,
+		ModerationId:     moderationId,
 	})
 	if result.Error != nil {
 		entry.loaded = true
 		entry.banned = true
 		entry.persistPending = true
 		entry.triggerChannelId = triggerChannelId
+		entry.moderationId = moderationId
 		return false, result.Error
 	}
 	entry.loaded = true
 	entry.banned = true
 	entry.persistPending = false
 	entry.triggerChannelId = triggerChannelId
+	entry.moderationId = moderationId
 	return result.RowsAffected > 0, nil
 }
 
@@ -152,6 +160,7 @@ func DeleteTokenProtectedChannelBan(tokenId int) (bool, error) {
 	entry.banned = false
 	entry.persistPending = false
 	entry.triggerChannelId = 0
+	entry.moderationId = ""
 	return rowsAffected > 0, nil
 }
 
@@ -174,13 +183,13 @@ func SearchAdminProtectedChannelBans(keyword string, offset int, limit int) ([]*
 		pattern := sanitizeAdminContainsPattern(keyword)
 		if id, err := strconv.Atoi(keyword); err == nil {
 			baseQuery = baseQuery.Where(
-				"(bans.token_id = ? OR bans.trigger_channel_id = ? OR tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
-				id, id, pattern, pattern, pattern,
+				"(bans.token_id = ? OR bans.trigger_channel_id = ? OR bans.moderation_id LIKE ? ESCAPE '!' OR tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
+				id, id, pattern, pattern, pattern, pattern,
 			)
 		} else {
 			baseQuery = baseQuery.Where(
-				"(tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
-				pattern, pattern, pattern,
+				"(bans.moderation_id LIKE ? ESCAPE '!' OR tokens.name LIKE ? ESCAPE '!' OR users.username LIKE ? ESCAPE '!' OR channels.name LIKE ? ESCAPE '!')",
+				pattern, pattern, pattern, pattern,
 			)
 		}
 	}
@@ -194,7 +203,7 @@ func SearchAdminProtectedChannelBans(keyword string, offset int, limit int) ([]*
 	var items []*AdminProtectedChannelBan
 	err := baseQuery.
 		Select(
-			"bans.token_id, bans.trigger_channel_id, bans.created_at, " +
+			"bans.token_id, bans.trigger_channel_id, bans.moderation_id, bans.created_at, " +
 				"tokens.name AS token_name, tokens." + commonKeyCol + " AS token_key, tokens.user_id, " +
 				"users.username, channels.name AS trigger_channel_name",
 		).

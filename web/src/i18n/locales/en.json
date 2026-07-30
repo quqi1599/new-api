@@ -3801,13 +3801,14 @@
     "所属用户": "Owner",
     "触发渠道": "Trigger channel",
     "已删除的渠道": "Deleted channel",
+    "Moderation ID": "Moderation ID",
     "上游内容策略封禁": "Upstream content policy block",
     "封禁时间": "Blocked at",
     "解除": "Remove",
     "全局": "Global",
     "共 {{count}} 条": "{{count}} total",
     "名单以 API Key 为单位，与用户账号无关。名单中的 Key 会跳过当前和未来所有已启用内容策略保护的渠道。": "The list is keyed by API Key, not user account. Listed keys skip all current and future channels with content policy protection enabled.",
-    "搜索令牌 ID、名称、用户或触发渠道": "Search token ID, name, owner, or trigger channel",
+    "搜索令牌 ID、名称、用户、触发渠道或 Moderation ID": "Search token ID, name, owner, trigger channel, or Moderation ID",
     "暂无被封禁的 API Key": "No blocked API Keys"
   }
 }

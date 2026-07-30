@@ -182,6 +182,29 @@ const ProtectedChannelBansSideSheet = ({ visible, onCancel, t }) => {
         ),
       },
       {
+        title: t('Moderation ID'),
+        dataIndex: 'moderation_id',
+        key: 'moderation_id',
+        width: 260,
+        render: (value) =>
+          value ? (
+            <Text
+              code
+              copyable={{ content: value }}
+              ellipsis={{ showTooltip: true }}
+              style={{
+                display: 'inline-block',
+                maxWidth: 220,
+                verticalAlign: 'middle',
+              }}
+            >
+              {value}
+            </Text>
+          ) : (
+            <Text type='tertiary'>-</Text>
+          ),
+      },
+      {
         title: t('封禁时间'),
         dataIndex: 'created_at',
         key: 'created_at',
@@ -254,7 +277,7 @@ const ProtectedChannelBansSideSheet = ({ visible, onCancel, t }) => {
             value={keyword}
             prefix={<IconSearch />}
             showClear
-            placeholder={t('搜索令牌 ID、名称、用户或触发渠道')}
+            placeholder={t('搜索令牌 ID、名称、用户、触发渠道或 Moderation ID')}
             onChange={setKeyword}
             onEnterPress={search}
           />

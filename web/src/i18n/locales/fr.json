@@ -3656,13 +3656,14 @@
     "所属用户": "Propriétaire",
     "触发渠道": "Canal déclencheur",
     "已删除的渠道": "Canal supprimé",
+    "Moderation ID": "ID de modération",
     "上游内容策略封禁": "Blocage par la stratégie de contenu",
     "封禁时间": "Bloqué le",
     "解除": "Retirer",
     "全局": "Global",
     "共 {{count}} 条": "{{count}} au total",
     "名单以 API Key 为单位，与用户账号无关。名单中的 Key 会跳过当前和未来所有已启用内容策略保护的渠道。": "La liste est indexée par clé API, pas par compte utilisateur. Les clés listées évitent tous les canaux actuels et futurs protégés.",
-    "搜索令牌 ID、名称、用户或触发渠道": "Rechercher un ID, un nom, un propriétaire ou un canal",
+    "搜索令牌 ID、名称、用户、触发渠道或 Moderation ID": "Rechercher un ID, un nom, un propriétaire, un canal ou un ID de modération",
     "暂无被封禁的 API Key": "Aucune clé API bloquée"
   }
 }

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -32,6 +33,8 @@ import (
 )
 
 const statusCodeCloudflareTimeout = 524
+
+var moderationReviewIdPattern = regexp.MustCompile(`(?i)\bmoderation(?:[\s_-]+review)?[\s_-]+id\s*[:=]\s*([a-z0-9][a-z0-9_-]{7,127})\b`)
 
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
@@ -241,7 +244,8 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
-			added, err := model.BanTokenFromProtectedChannels(relayInfo.TokenId, channel.Id)
+			moderationId := extractModerationReviewId(newAPIError)
+			added, err := model.BanTokenFromProtectedChannels(relayInfo.TokenId, channel.Id, moderationId)
 			if err != nil {
 				policyProtectionReady = false
 				logger.LogError(c, fmt.Sprintf("failed to persist protected channel ban for token #%d after channel #%d rejection: %v", relayInfo.TokenId, channel.Id, err))
@@ -420,6 +424,17 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 func isGatewaySessionBlockedError(openaiErr *types.NewAPIError) bool {
 	return openaiErr != nil &&
 		strings.Contains(strings.ToLower(openaiErr.Error()), "this session has been blocked by the gateway content policy")
+}
+
+func extractModerationReviewId(openaiErr *types.NewAPIError) string {
+	if openaiErr == nil {
+		return ""
+	}
+	matches := moderationReviewIdPattern.FindStringSubmatch(openaiErr.Error())
+	if len(matches) != 2 {
+		return ""
+	}
+	return matches[1]
 }
 
 func shouldBanTokenFromProtectedChannels(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
