@@ -31,6 +31,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const statusCodeCloudflareTimeout = 524
+
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
 	switch info.RelayMode {
@@ -187,10 +189,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	retryLimit := common.RetryTimes
-	policyFallbackStarted := false
+	forcedFallbackStarted := false
 
 	for ; retryParam.GetRetry() <= retryLimit; retryParam.IncreaseRetry() {
-		wasPolicyFallbackAttempt := policyFallbackStarted
+		wasForcedFallbackAttempt := forcedFallbackStarted
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
@@ -259,18 +261,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError) || sessionBlocked
 		canGPTFallback := gptFallback && policyProtectionReady &&
 			canRetryGPTChannelFallback(relayInfo, len(c.GetStringSlice("use_channel")))
+		forceGPTFallback := sessionBlocked ||
+			(gptFallback && newAPIError.StatusCode == statusCodeCloudflareTimeout)
 		if canGPTFallback {
 			service.ClearChannelAffinityForRequest(c)
 		}
-		if sessionBlocked && canGPTFallback {
-			policyFallbackStarted = true
-			retryLimit = extendRetryLimitForGatewayPolicyFallback(retryLimit, retryParam.GetRetry())
+		if forceGPTFallback && canGPTFallback {
+			forcedFallbackStarted = true
+			retryLimit = extendRetryLimitForForcedGPTFallback(retryLimit, retryParam.GetRetry())
 		}
 		retryAllowed := shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
-		if sessionBlocked {
+		if forceGPTFallback {
 			retryAllowed = canGPTFallback
 		}
-		if !canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback, wasPolicyFallbackAttempt) {
+		if !canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback, wasForcedFallbackAttempt) {
 			break
 		}
 	}
@@ -393,7 +397,7 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 		return false
 	}
 	switch openaiErr.StatusCode {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable:
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, statusCodeCloudflareTimeout:
 	default:
 		return false
 	}
@@ -416,7 +420,7 @@ func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels i
 		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0
 }
 
-func extendRetryLimitForGatewayPolicyFallback(retryLimit int, currentRetry int) int {
+func extendRetryLimitForForcedGPTFallback(retryLimit int, currentRetry int) int {
 	if currentRetry >= retryLimit {
 		return currentRetry + 1
 	}

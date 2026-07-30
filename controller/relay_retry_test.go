@@ -26,6 +26,19 @@ func TestGPTChannelFallbackStopsAfterOutputOrOneFallback(t *testing.T) {
 	}
 }
 
+func TestGPT524GetsOneForcedFallback(t *testing.T) {
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
+	err := types.NewErrorWithStatusCode(errors.New("proxy read timeout"), types.ErrorCodeBadResponse, statusCodeCloudflareTimeout)
+	if !isGPTChannelFallbackError(info, err) || !canRetryGPTChannelFallback(info, 1) {
+		t.Fatal("expected one pre-output GPT 524 fallback")
+	}
+
+	info.OriginModelName = "claude-sonnet-5"
+	if isGPTChannelFallbackError(info, err) {
+		t.Fatal("524 fallback must remain GPT-only")
+	}
+}
+
 func TestGatewaySessionBlockedError(t *testing.T) {
 	err := types.NewErrorWithStatusCode(
 		errors.New("This session has been blocked by the gateway content policy. Contact the administrator."),
@@ -62,12 +75,12 @@ func TestProtectedChannelControlsGlobalTokenBan(t *testing.T) {
 	}
 }
 
-func TestGatewayPolicyFallbackExtendsZeroRetryBudgetOnce(t *testing.T) {
-	retryLimit := extendRetryLimitForGatewayPolicyFallback(0, 0)
+func TestForcedGPTFallbackExtendsZeroRetryBudgetOnce(t *testing.T) {
+	retryLimit := extendRetryLimitForForcedGPTFallback(0, 0)
 	if retryLimit != 1 {
 		t.Fatalf("retry limit = %d, want 1", retryLimit)
 	}
-	if retryLimit = extendRetryLimitForGatewayPolicyFallback(retryLimit, 0); retryLimit != 1 {
+	if retryLimit = extendRetryLimitForForcedGPTFallback(retryLimit, 0); retryLimit != 1 {
 		t.Fatalf("existing retry budget changed to %d, want 1", retryLimit)
 	}
 	if canContinueRelayRetry(true, false, false, true) {
