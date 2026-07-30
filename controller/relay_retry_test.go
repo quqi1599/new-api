@@ -3,11 +3,13 @@ package controller
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 )
 
 func TestGPTChannelFallbackStopsAfterOutputOrOneFallback(t *testing.T) {
@@ -36,6 +38,59 @@ func TestGPT524GetsOneForcedFallback(t *testing.T) {
 	info.OriginModelName = "claude-sonnet-5"
 	if isGPTChannelFallbackError(info, err) {
 		t.Fatal("524 fallback must remain GPT-only")
+	}
+}
+
+func TestGPTChannelFallbackCoversUpstreamFailuresButSkipsRequestErrors(t *testing.T) {
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
+	tests := []struct {
+		name       string
+		statusCode int
+		options    []types.NewAPIErrorOptions
+		want       bool
+	}{
+		{name: "upstream 401", statusCode: http.StatusUnauthorized, want: true},
+		{name: "upstream 403", statusCode: http.StatusForbidden, want: true},
+		{name: "upstream 404", statusCode: http.StatusNotFound, want: true},
+		{name: "upstream 429", statusCode: http.StatusTooManyRequests, want: true},
+		{name: "upstream 500", statusCode: http.StatusInternalServerError, want: true},
+		{name: "gateway 504", statusCode: http.StatusGatewayTimeout, want: true},
+		{name: "gateway 524", statusCode: statusCodeCloudflareTimeout, want: true},
+		{name: "network error without status", statusCode: 0, want: true},
+		{name: "invalid request", statusCode: http.StatusBadRequest, want: false},
+		{
+			name:       "explicit skip retry",
+			statusCode: http.StatusServiceUnavailable,
+			options:    []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()},
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := types.NewErrorWithStatusCode(errors.New(tt.name), types.ErrorCodeBadResponse, tt.statusCode, tt.options...)
+			if got := isGPTChannelFallbackError(info, err); got != tt.want {
+				t.Fatalf("isGPTChannelFallbackError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	info.OriginModelName = "claude-sonnet-4-6"
+	err := types.NewErrorWithStatusCode(errors.New("upstream 500"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	if isGPTChannelFallbackError(info, err) {
+		t.Fatal("generic upstream fallback must remain GPT-only")
+	}
+}
+
+func TestExplicitSkipRetryOverridesChannelError(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	err := types.NewError(
+		errors.New("invalid channel parameter override"),
+		types.ErrorCodeChannelParamOverrideInvalid,
+		types.ErrOptionWithSkipRetry(),
+	)
+	if shouldRetry(c, err, 10) {
+		t.Fatal("explicit skip retry must override the channel error classification")
 	}
 }
 

@@ -227,6 +227,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			logRelayRetryRoute(c)
 			return
 		}
 
@@ -261,8 +262,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError) || sessionBlocked
 		canGPTFallback := gptFallback && policyProtectionReady &&
 			canRetryGPTChannelFallback(relayInfo, len(c.GetStringSlice("use_channel")))
-		forceGPTFallback := sessionBlocked ||
-			(gptFallback && newAPIError.StatusCode == statusCodeCloudflareTimeout)
+		forceGPTFallback := sessionBlocked || gptFallback
 		if canGPTFallback {
 			service.ClearChannelAffinityForRequest(c)
 		}
@@ -279,11 +279,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}
 
-	useChannel := c.GetStringSlice("use_channel")
-	if len(useChannel) > 1 {
-		retryLogStr := fmt.Sprintf("重试：%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
-		logger.LogInfo(c, retryLogStr)
-	}
+	logRelayRetryRoute(c)
 }
 
 var upgrader = websocket.Upgrader{
@@ -297,6 +293,15 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	useChannel := c.GetStringSlice("use_channel")
 	useChannel = append(useChannel, fmt.Sprintf("%d", channelId))
 	c.Set("use_channel", useChannel)
+}
+
+func logRelayRetryRoute(c *gin.Context) {
+	useChannel := c.GetStringSlice("use_channel")
+	if len(useChannel) <= 1 {
+		return
+	}
+	retryLogStr := fmt.Sprintf("重试：%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
+	logger.LogInfo(c, retryLogStr)
 }
 
 func fastTokenCountMetaForPricing(request dto.Request) *types.TokenCountMeta {
@@ -367,11 +372,11 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
-	if types.IsChannelError(openaiErr) {
-		return true
-	}
 	if types.IsSkipRetryError(openaiErr) {
 		return false
+	}
+	if types.IsChannelError(openaiErr) {
+		return true
 	}
 	if retryTimes <= 0 {
 		return false
@@ -396,12 +401,20 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 	if info == nil || openaiErr == nil || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(info.OriginModelName)), "gpt-") {
 		return false
 	}
-	switch openaiErr.StatusCode {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, statusCodeCloudflareTimeout:
-	default:
+	if types.IsSkipRetryError(openaiErr) || operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
 	}
-	return true
+	if types.IsChannelError(openaiErr) {
+		return true
+	}
+	code := openaiErr.StatusCode
+	if code < 100 || code > 599 {
+		return true
+	}
+	if code == http.StatusGatewayTimeout || code == statusCodeCloudflareTimeout {
+		return true
+	}
+	return operation_setting.ShouldRetryByStatusCode(code)
 }
 
 func isGatewaySessionBlockedError(openaiErr *types.NewAPIError) bool {
