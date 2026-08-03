@@ -150,8 +150,9 @@ func TestStreamStatus_IsNormalEnd(t *testing.T) {
 		normal bool
 	}{
 		{StreamEndReasonDone, true},
-		{StreamEndReasonEOF, true},
-		{StreamEndReasonHandlerStop, true},
+		{StreamEndReasonEOF, false},
+		{StreamEndReasonHandlerStop, false},
+		{StreamEndReasonFirstEventTimeout, false},
 		{StreamEndReasonTimeout, false},
 		{StreamEndReasonClientGone, false},
 		{StreamEndReasonScannerErr, false},
@@ -174,6 +175,7 @@ func TestStreamStatus_IsAbortLikeEnd(t *testing.T) {
 		abortLike bool
 	}{
 		{StreamEndReasonClientGone, true},
+		{StreamEndReasonFirstEventTimeout, true},
 		{StreamEndReasonTimeout, true},
 		{StreamEndReasonHandlerStop, true},
 		{StreamEndReasonPingFail, true},

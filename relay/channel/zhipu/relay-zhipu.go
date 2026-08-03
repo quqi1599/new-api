@@ -1,8 +1,8 @@
 package zhipu
 
 import (
-	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -157,70 +157,101 @@ func streamMetaResponseZhipu2OpenAI(zhipuResponse *ZhipuStreamMetaResponse) (*dt
 
 func zhipuStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var usage *dto.Usage
-	scanner := helper.NewStreamScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
-	dataChan := make(chan string)
-	metaChan := make(chan string)
-	stopChan := make(chan bool)
-	go func() {
-		for scanner.Scan() {
-			data := scanner.Text()
-			lines := strings.Split(data, "\n")
-			for i, line := range lines {
-				if len(line) < 5 {
-					continue
-				}
-				if line[:5] == "data:" {
-					dataChan <- line[5:]
-					if i != len(lines)-1 {
-						dataChan <- "\n"
-					}
-				} else if line[:5] == "meta:" {
-					metaChan <- line[5:]
-				}
+	var responseText strings.Builder
+
+	helper.StreamScannerHandlerWithDecoder(c, resp, info, zhipuV3LineDecoder{}, func(frame helper.StreamFrame, sr *helper.StreamResult) {
+		switch frame.Kind {
+		case "data":
+			data := frame.Data
+			if strings.TrimSpace(data) == "" {
+				sr.Error(fmt.Errorf("empty Zhipu data frame"))
+				return
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			common.SysLog("error reading stream: " + err.Error())
-		}
-		stopChan <- true
-	}()
-	helper.SetEventStreamHeaders(c)
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case data := <-dataChan:
+			if strings.TrimSpace(data) == "[DONE]" {
+				// The v3 protocol is complete only when its meta frame reports
+				// task_status=SUCCESS.
+				sr.Error(fmt.Errorf("Zhipu stream received [DONE] without SUCCESS meta"))
+				return
+			}
+			if !sr.Accept() {
+				return
+			}
 			response := streamResponseZhipu2OpenAI(data)
-			jsonResponse, err := json.Marshal(response)
-			if err != nil {
-				common.SysLog("error marshalling stream response: " + err.Error())
-				return true
+			response.Model = info.UpstreamModelName
+			responseText.WriteString(data)
+			if err := helper.ObjectData(c, response); err != nil {
+				sr.Stop(fmt.Errorf("write Zhipu data response: %w", err))
 			}
-			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
-			return true
-		case data := <-metaChan:
+
+		case "meta":
 			var zhipuResponse ZhipuStreamMetaResponse
-			err := json.Unmarshal([]byte(data), &zhipuResponse)
-			if err != nil {
-				common.SysLog("error unmarshalling stream response: " + err.Error())
-				return true
+			if err := common.Unmarshal([]byte(frame.Data), &zhipuResponse); err != nil {
+				sr.Stop(fmt.Errorf("invalid Zhipu meta frame: %w", err))
+				return
 			}
-			response, zhipuUsage := streamMetaResponseZhipu2OpenAI(&zhipuResponse)
-			jsonResponse, err := json.Marshal(response)
-			if err != nil {
-				common.SysLog("error marshalling stream response: " + err.Error())
-				return true
+
+			status := strings.ToUpper(strings.TrimSpace(zhipuResponse.TaskStatus))
+			switch status {
+			case "SUCCESS":
+				if !sr.Accept() {
+					return
+				}
+				response, zhipuUsage := streamMetaResponseZhipu2OpenAI(&zhipuResponse)
+				response.Model = info.UpstreamModelName
+				if err := helper.ObjectData(c, response); err != nil {
+					sr.Stop(fmt.Errorf("write Zhipu terminal response: %w", err))
+					return
+				}
+				usage = zhipuUsage
+				sr.Done()
+
+			case "FAIL", "FAILED", "ERROR", "CANCELED", "CANCELLED", "REJECTED", "TIMEOUT":
+				sr.Stop(fmt.Errorf("Zhipu stream failed with task status %s", status))
+
+			case "PROCESSING", "RUNNING", "PENDING":
+				// A valid progress meta frame extends the idle budget, but it does
+				// not make an EOF successful without a later SUCCESS frame.
+				sr.Accept()
+
+			case "":
+				sr.Error(fmt.Errorf("Zhipu meta frame is missing task_status"))
+
+			default:
+				sr.Error(fmt.Errorf("unsupported Zhipu task status %s", status))
 			}
-			usage = zhipuUsage
-			c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonResponse)})
-			return true
-		case <-stopChan:
-			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
 		}
 	})
 	service.CloseResponseBodyGracefully(resp)
+
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
+	}
+	if usage == nil {
+		usage = service.ResponseText2Usage(c, responseText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+	if helper.ShouldFinalizeStream(info) {
+		helper.Done(c)
+	}
 	return usage, nil
 }
+
+// zhipuV3LineDecoder preserves the legacy v3 wire types while delegating all
+// cancellation, timeout, and goroutine lifecycle handling to the shared stream
+// state machine.
+type zhipuV3LineDecoder struct{}
+
+func (zhipuV3LineDecoder) Feed(line string) ([]helper.StreamFrame, error) {
+	switch {
+	case strings.HasPrefix(line, "data:"):
+		return []helper.StreamFrame{{Kind: "data", Data: line[len("data:"):]}}, nil
+	case strings.HasPrefix(line, "meta:"):
+		return []helper.StreamFrame{{Kind: "meta", Data: line[len("meta:"):]}}, nil
+	default:
+		return nil, nil
+	}
+}
+
+func (zhipuV3LineDecoder) Flush() ([]helper.StreamFrame, error) { return nil, nil }
 
 func zhipuHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
 	var zhipuResponse ZhipuResponse

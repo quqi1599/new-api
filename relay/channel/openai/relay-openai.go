@@ -129,11 +129,42 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	isAudioModel := strings.Contains(strings.ToLower(model), "audio")
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if data == "[DONE]" {
+			sr.Done()
+			return
+		}
+
+		var parsedEvent map[string]any
+		if err := common.UnmarshalJsonStr(data, &parsedEvent); err != nil || len(parsedEvent) == 0 {
+			if err == nil {
+				err = fmt.Errorf("empty OpenAI stream event")
+			}
+			common.SysLog("error validating stream response: " + err.Error())
+			sr.Error(err)
+			return
+		}
+		if upstreamErr, exists := parsedEvent["error"]; exists && upstreamErr != nil {
+			// A syntactically valid error envelope is not a chat chunk. Accepting it
+			// as the first event would let a following [DONE] turn an upstream failure
+			// into a false success and a normal settlement.
+			sr.Stop(fmt.Errorf("upstream OpenAI stream returned an error event"))
+			return
+		}
+		if _, hasChoices := parsedEvent["choices"]; !hasChoices {
+			if _, hasUsage := parsedEvent["usage"]; !hasUsage {
+				sr.Stop(fmt.Errorf("invalid OpenAI chat stream event"))
+				return
+			}
+		}
 		if lastStreamData != "" {
 			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
 				common.SysLog("error handling stream format: " + err.Error())
-				sr.Error(err)
+				sr.Stop(err)
+				return
 			}
+		}
+		if !sr.Accept() {
+			return
 		}
 		if len(data) > 0 {
 			// 对音频模型，保存倒数第二个stream data
@@ -145,6 +176,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			streamItems = append(streamItems, data)
 		}
 	})
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
+	}
 
 	// 对音频模型，从倒数第二个stream data中提取usage信息
 	if isAudioModel && secondLastStreamData != "" {
@@ -199,7 +233,9 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(lastStreamPayload))
 
-	HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+	if helper.ShouldFinalizeStream(info) {
+		HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+	}
 
 	return usage, nil
 }

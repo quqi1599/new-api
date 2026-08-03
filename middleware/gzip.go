@@ -30,7 +30,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 		}
 		maxMB := constant.MaxRequestBodyMB
 		if maxMB <= 0 {
-			maxMB = 32
+			maxMB = 128
 		}
 		maxBytes := int64(maxMB) << 20
 
@@ -56,6 +56,9 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 				},
 			})
 			c.Request.Header.Del("Content-Encoding")
+			// ContentLength describes the compressed wire body and must not be
+			// compared with bytes read from the decompressed replacement body.
+			c.Request.ContentLength = -1
 		case "br":
 			reader := brotli.NewReader(origBody)
 			c.Request.Body = wrapMaxBytes(&readCloser{
@@ -65,6 +68,7 @@ func DecompressRequestMiddleware() gin.HandlerFunc {
 				},
 			})
 			c.Request.Header.Del("Content-Encoding")
+			c.Request.ContentLength = -1
 		default:
 			// Even for uncompressed bodies, enforce a max size to avoid huge request allocations.
 			c.Request.Body = wrapMaxBytes(origBody)

@@ -301,11 +301,23 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			sr.Stop(streamErr)
 			return
 		}
+		if data == "[DONE]" {
+			streamErr = types.NewOpenAIError(fmt.Errorf("unexpected [DONE] marker in Responses stream"), types.ErrorCodeBadResponse, http.StatusBadGateway)
+			sr.Stop(streamErr)
+			return
+		}
 
 		var streamResp dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResp); err != nil {
 			logger.LogError(c, "failed to unmarshal responses stream event: "+err.Error())
 			sr.Error(err)
+			return
+		}
+		if streamResp.Type == "" {
+			sr.Error(fmt.Errorf("responses stream event is missing type"))
+			return
+		}
+		if !sr.Accept() {
 			return
 		}
 
@@ -494,8 +506,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 				}
 				sentStop = true
 			}
+			sr.Done()
 
-		case "response.error", "response.failed":
+		case "error", "response.error", "response.failed", "response.incomplete":
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
 					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
@@ -510,6 +523,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		default:
 		}
 	})
+	if firstEventErr := helper.PreOutputStreamError(c, info); firstEventErr != nil {
+		return nil, firstEventErr
+	}
 
 	if streamErr != nil {
 		return nil, streamErr
@@ -517,6 +533,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, usageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+	if !helper.ShouldFinalizeStream(info) {
+		return usage, nil
 	}
 
 	if !sentStart {

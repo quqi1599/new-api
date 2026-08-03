@@ -60,28 +60,29 @@ func SetEventStreamHeaders(c *gin.Context) {
 
 func ClaudeData(c *gin.Context, resp dto.ClaudeResponse) error {
 	if requestContextDone(c) {
-		return nil
+		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
 	jsonData, err := common.Marshal(resp)
 	if err != nil {
-		common.SysError("error marshalling stream response: " + err.Error())
-	} else {
-		c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-		c.Render(-1, common.CustomEvent{Data: "data: " + string(jsonData)})
+		return fmt.Errorf("error marshalling stream response: %w", err)
 	}
-	_ = FlushWriter(c)
-	return nil
+	return ClaudeChunkData(c, resp, string(jsonData))
 }
 
-func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) {
+func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) error {
+	if c == nil || c.Writer == nil {
+		return errors.New("context or writer is nil")
+	}
 	if requestContextDone(c) {
-		return
+		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s\n", data)})
-	_ = FlushWriter(c)
+	SetEventStreamHeaders(c)
+	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", resp.Type, data); err != nil {
+		return fmt.Errorf("write claude stream data failed: %w", err)
+	}
+	return FlushWriter(c)
 }
 
 func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data string) error {
@@ -89,8 +90,10 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("event: %s\n", resp.Type)})
-	c.Render(-1, common.CustomEvent{Data: fmt.Sprintf("data: %s", data)})
+	SetEventStreamHeaders(c)
+	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", resp.Type, data); err != nil {
+		return fmt.Errorf("write responses stream data failed: %w", err)
+	}
 	return FlushWriter(c)
 }
 
@@ -103,7 +106,10 @@ func StringData(c *gin.Context, str string) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
-	c.Render(-1, common.CustomEvent{Data: "data: " + str})
+	SetEventStreamHeaders(c)
+	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", str); err != nil {
+		return fmt.Errorf("write stream data failed: %w", err)
+	}
 	return FlushWriter(c)
 }
 
@@ -116,6 +122,7 @@ func PingData(c *gin.Context) error {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
 	}
 
+	SetEventStreamHeaders(c)
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
 		return fmt.Errorf("write ping data failed: %w", err)
 	}

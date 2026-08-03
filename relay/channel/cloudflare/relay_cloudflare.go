@@ -1,13 +1,12 @@
 package cloudflare
 
 import (
-	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"strings"
-	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -30,62 +29,64 @@ func convertCf2CompletionsRequest(textRequest dto.GeneralOpenAIRequest) *CfReque
 }
 
 func cfStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
-	scanner := helper.NewStreamScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
+	defer service.CloseResponseBodyGracefully(resp)
 
-	helper.SetEventStreamHeaders(c)
 	id := helper.GetResponseID(c)
 	var responseText string
-	isFirst := true
 
-	for scanner.Scan() {
-		data := scanner.Text()
-		if len(data) < len("data: ") {
-			continue
-		}
-		data = strings.TrimPrefix(data, "data: ")
-		data = strings.TrimSuffix(data, "\r")
-
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if data == "[DONE]" {
-			break
+			if !sr.Accept() {
+				return
+			}
+			sr.Done()
+			return
 		}
 
 		var response dto.ChatCompletionsStreamResponse
-		err := json.Unmarshal([]byte(data), &response)
-		if err != nil {
+		if err := common.Unmarshal([]byte(data), &response); err != nil {
 			logger.LogError(c, "error_unmarshalling_stream_response: "+err.Error())
-			continue
+			sr.Stop(err)
+			return
 		}
-		for _, choice := range response.Choices {
-			choice.Delta.Role = "assistant"
-			responseText += choice.Delta.GetContentString()
+		if len(response.Choices) == 0 && response.Usage == nil {
+			err := fmt.Errorf("invalid Cloudflare stream event: missing choices and usage")
+			logger.LogError(c, err.Error())
+			sr.Stop(err)
+			return
+		}
+		if !sr.Accept() {
+			return
+		}
+		for i := range response.Choices {
+			response.Choices[i].Delta.Role = "assistant"
+			responseText += response.Choices[i].Delta.GetContentString()
 		}
 		response.Id = id
 		response.Model = info.UpstreamModelName
-		err = helper.ObjectData(c, response)
-		if isFirst {
-			isFirst = false
-			info.FirstResponseTime = time.Now()
-		}
-		if err != nil {
+		if err := helper.ObjectData(c, response); err != nil {
 			logger.LogError(c, "error_rendering_stream_response: "+err.Error())
+			sr.Stop(err)
 		}
+	})
+
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return streamErr, nil
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.LogError(c, "error_scanning_stream_response: "+err.Error())
-	}
 	usage := service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	if !helper.ShouldFinalizeStream(info) {
+		return nil, usage
+	}
+
 	if info.ShouldIncludeUsage {
 		response := helper.GenerateFinalUsageResponse(id, info.StartTime.Unix(), info.UpstreamModelName, *usage)
-		err := helper.ObjectData(c, response)
-		if err != nil {
+		if err := helper.ObjectData(c, response); err != nil {
 			logger.LogError(c, "error_rendering_final_usage_response: "+err.Error())
+			return types.NewError(err, types.ErrorCodeBadResponseBody), usage
 		}
 	}
 	helper.Done(c)
-
-	service.CloseResponseBodyGracefully(resp)
 
 	return nil, usage
 }

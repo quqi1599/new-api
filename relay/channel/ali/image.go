@@ -1,6 +1,7 @@
 package ali
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -192,12 +194,12 @@ func oaiFormEdit2AliImageEdit(c *gin.Context, info *relaycommon.RelayInfo, reque
 	return &imageRequest, nil
 }
 
-func updateTask(info *relaycommon.RelayInfo, taskID string) (*AliResponse, error, []byte) {
+func updateTask(ctx context.Context, info *relaycommon.RelayInfo, taskID string) (*AliResponse, error, []byte) {
 	url := fmt.Sprintf("%s/api/v1/tasks/%s", info.ChannelBaseUrl, taskID)
 
 	var aliResponse AliResponse
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return &aliResponse, err, nil
 	}
@@ -224,6 +226,18 @@ func updateTask(info *relaycommon.RelayInfo, taskID string) (*AliResponse, error
 	return &response, nil, responseBody
 }
 
+func waitForAliTaskPoll(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func asyncTaskWait(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (*AliResponse, []byte, error) {
 	waitSeconds := 10
 	step := 0
@@ -232,16 +246,24 @@ func asyncTaskWait(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (
 	var taskResponse AliResponse
 	var responseBody []byte
 
-	time.Sleep(time.Duration(5) * time.Second)
+	ctx := c.Request.Context()
+	if err := waitForAliTaskPoll(ctx, 5*time.Second); err != nil {
+		return nil, nil, err
+	}
 
 	for {
 		logger.LogDebug(c, fmt.Sprintf("asyncTaskWait step %d/%d, wait %d seconds", step, maxStep, waitSeconds))
 		step++
-		rsp, err, body := updateTask(info, taskID)
+		rsp, err, body := updateTask(ctx, info, taskID)
 		responseBody = body
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, responseBody, channel.ClassifyDoRequestError(c, err)
+			}
 			logger.LogWarn(c, "asyncTaskWait UpdateTask err: "+err.Error())
-			time.Sleep(time.Duration(waitSeconds) * time.Second)
+			if waitErr := waitForAliTaskPoll(ctx, time.Duration(waitSeconds)*time.Second); waitErr != nil {
+				return nil, responseBody, waitErr
+			}
 			continue
 		}
 
@@ -262,7 +284,9 @@ func asyncTaskWait(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (
 		if step >= maxStep {
 			break
 		}
-		time.Sleep(time.Duration(waitSeconds) * time.Second)
+		if err := waitForAliTaskPoll(ctx, time.Duration(waitSeconds)*time.Second); err != nil {
+			return nil, responseBody, err
+		}
 	}
 
 	return nil, nil, fmt.Errorf("aliAsyncTaskWait timeout")
@@ -314,6 +338,9 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 		// 异步图片模型需要轮询任务结果
 		aliResponse, originRespBody, err = asyncTaskWait(c, info, aliTaskResponse.Output.TaskId)
 		if err != nil {
+			if c.Request.Context().Err() != nil {
+				return channel.ClassifyDoRequestError(c, err), nil
+			}
 			return types.NewError(err, types.ErrorCodeBadResponse), nil
 		}
 		if aliResponse.Output.TaskStatus != "SUCCEEDED" {

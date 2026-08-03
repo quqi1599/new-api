@@ -2,10 +2,28 @@ package common
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRelayInfoBoundsFirstEventWaitBySharedDeadline(t *testing.T) {
+	info := &RelayInfo{}
+	info.SetFirstValidEventDeadline(time.Now().Add(100 * time.Millisecond))
+
+	remaining, limited := info.RemainingFirstValidEventBudget()
+	require.True(t, limited)
+	require.Positive(t, remaining)
+	require.LessOrEqual(t, remaining, 100*time.Millisecond)
+	require.LessOrEqual(t, info.BoundFirstValidEventWait(time.Second), 100*time.Millisecond)
+	require.Equal(t, 25*time.Millisecond, info.BoundFirstValidEventWait(25*time.Millisecond))
+}
+
+func TestRelayInfoWithoutSharedDeadlineKeepsPhaseTimeout(t *testing.T) {
+	info := &RelayInfo{}
+	require.Equal(t, 3*time.Second, info.BoundFirstValidEventWait(3*time.Second))
+}
 
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {
 	info := &RelayInfo{

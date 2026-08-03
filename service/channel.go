@@ -52,7 +52,7 @@ func ShouldDisableChannel(err *types.NewAPIError) bool {
 	if types.IsChannelError(err) {
 		return true
 	}
-	if types.IsSkipRetryError(err) {
+	if types.IsSkipRetryError(err) && !types.IsChannelPenaltyAllowed(err) {
 		return false
 	}
 	if operation_setting.ShouldDisableByStatusCode(err.StatusCode) {

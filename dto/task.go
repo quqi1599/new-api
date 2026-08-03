@@ -10,6 +10,7 @@ type TaskError struct {
 	Data       any    `json:"data"`
 	StatusCode int    `json:"-"`
 	LocalError bool   `json:"-"`
+	SkipRetry  bool   `json:"-"`
 	Error      error  `json:"-"`
 }
 

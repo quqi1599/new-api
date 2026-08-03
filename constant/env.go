@@ -1,6 +1,7 @@
 package constant
 
 var StreamingTimeout int
+var RelayFirstEventTimeout int
 var DifyDebug bool
 var MaxFileDownloadMB int
 var StreamScannerMaxBufferMB int
@@ -10,6 +11,7 @@ var GetMediaToken bool
 var GetMediaTokenNotStream bool
 var UpdateTask bool
 var MaxRequestBodyMB int
+var MaxConcurrentLargeRequestBodies int
 var AnonymousRequestBodyLimitKB int
 var AzureDefaultAPIVersion string
 var NotifyLimitCount int

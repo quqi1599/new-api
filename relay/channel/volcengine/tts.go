@@ -3,15 +3,19 @@ package volcengine
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -154,7 +158,7 @@ func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.Re
 	defer resp.Body.Close()
 
 	var volcResp VolcengineTTSResponse
-	if unmarshalErr := json.Unmarshal(body, &volcResp); unmarshalErr != nil {
+	if unmarshalErr := common.Unmarshal(body, &volcResp); unmarshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			errors.New("failed to parse volcengine response"),
 			types.ErrorCodeBadResponseBody,
@@ -197,6 +201,10 @@ func generateRequestID() string {
 }
 
 func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest VolcengineTTSRequest, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
+	previousStreamStatus := info.StreamStatus
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.CopyErrorsFrom(previousStreamStatus)
+
 	_, token, parseErr := parseVolcengineAuth(info.ApiKey)
 	if parseErr != nil {
 		return nil, types.NewErrorWithStatusCode(
@@ -209,8 +217,11 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	header := http.Header{}
 	header.Set("Authorization", fmt.Sprintf("Bearer;%s", token))
 
-	conn, resp, dialErr := websocket.DefaultDialer.DialContext(context.Background(), requestURL, header)
+	conn, resp, dialErr := channel.DialWebSocketContext(c.Request.Context(), requestURL, header)
 	if dialErr != nil {
+		if c.Request.Context().Err() != nil {
+			return nil, channel.ClassifyDoRequestError(c, dialErr)
+		}
 		if resp != nil {
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("failed to connect to websocket: %w, status: %d", dialErr, resp.StatusCode),
@@ -225,8 +236,12 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 		)
 	}
 	defer conn.Close()
+	stopClientCancel := context.AfterFunc(c.Request.Context(), func() {
+		_ = conn.Close()
+	})
+	defer stopClientCancel()
 
-	payload, marshalErr := json.Marshal(volcRequest)
+	payload, marshalErr := common.Marshal(volcRequest)
 	if marshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
 			fmt.Errorf("failed to marshal request: %w", marshalErr),
@@ -235,43 +250,85 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 		)
 	}
 
+	writeWait := info.BoundFirstValidEventWait(helper.StreamFirstEventTimeout())
+	if writeWait <= 0 {
+		writeWait = time.Nanosecond
+	}
+	if deadlineErr := conn.SetWriteDeadline(time.Now().Add(writeWait)); deadlineErr != nil {
+		return nil, volcengineTTSTransportError(deadlineErr, true)
+	}
+
+	// FullClientRequest starts a non-idempotent synthesis. Mark the request as
+	// possibly accepted before writing because a partial/failed websocket frame
+	// cannot prove the provider did not receive it.
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
 	if sendErr := FullClientRequest(conn, payload); sendErr != nil {
-		return nil, types.NewErrorWithStatusCode(
-			fmt.Errorf("failed to send request: %w", sendErr),
-			types.ErrorCodeBadRequestBody,
-			http.StatusInternalServerError,
-		)
+		if c.Request.Context().Err() != nil {
+			return nil, channel.ClassifyDoRequestError(c, sendErr)
+		}
+		return nil, volcengineTTSTransportError(fmt.Errorf("failed to send request: %w", sendErr), true)
 	}
 
 	contentType := getContentTypeByEncoding(encoding)
 	c.Header("Content-Type", contentType)
 	c.Header("Transfer-Encoding", "chunked")
 
+	firstAudio := true
 	for {
+		readWait := helper.StreamIdleTimeout()
+		if firstAudio {
+			readWait = info.BoundFirstValidEventWait(helper.StreamFirstEventTimeout())
+		}
+		if readWait <= 0 {
+			readWait = time.Nanosecond
+		}
+		if deadlineErr := conn.SetReadDeadline(time.Now().Add(readWait)); deadlineErr != nil {
+			return nil, volcengineTTSTransportError(deadlineErr, firstAudio)
+		}
 		msg, recvErr := ReceiveMessage(conn)
 		if recvErr != nil {
-			if websocket.IsCloseError(recvErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				break
+			if c.Request.Context().Err() != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+				return nil, channel.ClassifyDoRequestError(c, recvErr)
 			}
-			return nil, types.NewErrorWithStatusCode(
-				fmt.Errorf("failed to receive message: %w", recvErr),
-				types.ErrorCodeBadResponse,
-				http.StatusInternalServerError,
-			)
+			var netErr net.Error
+			if errors.As(recvErr, &netErr) && netErr.Timeout() {
+				if firstAudio {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstEventTimeout, recvErr)
+				} else {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, recvErr)
+				}
+			} else if websocket.IsCloseError(recvErr, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) || errors.Is(recvErr, io.EOF) {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, recvErr)
+			} else {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, recvErr)
+			}
+			return nil, volcengineTTSTransportError(fmt.Errorf("failed to receive message: %w", recvErr), firstAudio)
 		}
 
 		switch msg.MsgType {
 		case MsgTypeError:
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, errors.New("volcengine upstream returned an error message"))
 			return nil, types.NewErrorWithStatusCode(
 				fmt.Errorf("received error from server: code=%d, %s", msg.ErrorCode, string(msg.Payload)),
 				types.ErrorCodeBadResponse,
 				http.StatusBadRequest,
+				types.ErrOptionWithSkipRetry(),
 			)
 		case MsgTypeFrontEndResultServer:
 			continue
 		case MsgTypeAudioOnlyServer:
+			if firstAudio {
+				firstAudio = false
+				info.SetFirstResponseTime()
+			}
+			info.ReceivedResponseCount++
 			if len(msg.Payload) > 0 {
+				helper.ExtendWriteDeadline(c)
 				if _, writeErr := c.Writer.Write(msg.Payload); writeErr != nil {
+					if c.Request.Context().Err() != nil {
+						return nil, channel.ClassifyDoRequestError(c, writeErr)
+					}
 					return nil, types.NewErrorWithStatusCode(
 						fmt.Errorf("failed to write audio data: %w", writeErr),
 						types.ErrorCodeBadResponse,
@@ -282,6 +339,7 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 			}
 
 			if msg.Sequence < 0 {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
 				c.Status(http.StatusOK)
 				usage = &dto.Usage{
 					PromptTokens:     info.GetEstimatePromptTokens(),
@@ -294,12 +352,23 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 			continue
 		}
 	}
+}
 
-	c.Status(http.StatusOK)
-	usage = &dto.Usage{
-		PromptTokens:     info.GetEstimatePromptTokens(),
-		CompletionTokens: 0,
-		TotalTokens:      info.GetEstimatePromptTokens(),
+func volcengineTTSTransportError(err error, firstEvent bool) *types.NewAPIError {
+	statusCode := http.StatusBadGateway
+	errorCode := types.ErrorCodeUpstreamStreamIncomplete
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		statusCode = http.StatusGatewayTimeout
+		if firstEvent {
+			errorCode = types.ErrorCodeUpstreamFirstEventTimeout
+		}
 	}
-	return usage, nil
+	return types.NewErrorWithStatusCode(
+		err,
+		errorCode,
+		statusCode,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithChannelPenalty(),
+	)
 }

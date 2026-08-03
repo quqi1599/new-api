@@ -26,6 +26,12 @@ func TestGPTChannelFallbackStopsAfterOutputOrOneFallback(t *testing.T) {
 	if canRetryGPTChannelFallback(info, 1) {
 		t.Fatal("must not retry after output starts")
 	}
+
+	info.SendResponseCount = 0
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
+	if canRetryGPTChannelFallback(info, 1) {
+		t.Fatal("must not retry after a non-idempotent upstream request may have been accepted")
+	}
 }
 
 func TestGPT524GetsOneForcedFallback(t *testing.T) {
@@ -91,6 +97,70 @@ func TestExplicitSkipRetryOverridesChannelError(t *testing.T) {
 	)
 	if shouldRetry(c, err, 10) {
 		t.Fatal("explicit skip retry must override the channel error classification")
+	}
+}
+
+func TestRelayRetryStopsAfterAnyStreamProgress(t *testing.T) {
+	err := types.NewErrorWithStatusCode(
+		errors.New("upstream stream failed"),
+		types.ErrorCodeBadResponse,
+		http.StatusInternalServerError,
+	)
+
+	t.Run("downstream already written", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		_, writeErr := c.Writer.Write([]byte("data: partial\n\n"))
+		if writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		if shouldRetry(c, err, 1) {
+			t.Fatal("must not retry after downstream bytes were committed")
+		}
+	})
+
+	t.Run("upstream event already received", func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{ReceivedResponseCount: 1}
+		if !relayProgressStarted(c, info) {
+			t.Fatal("a valid upstream event must close the retry gate")
+		}
+	})
+
+	t.Run("unsafe upstream request already sent", func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{}
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		if !relayProgressStarted(c, info) {
+			t.Fatal("a possibly accepted POST must close the retry gate")
+		}
+	})
+}
+
+func TestTaskRelayDoesNotRetryLocalCancellationOrDeadline(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	for _, statusCode := range []int{499, http.StatusGatewayTimeout, http.StatusInternalServerError} {
+		taskErr := &dto.TaskError{
+			StatusCode: statusCode,
+			LocalError: true,
+		}
+		if shouldRetryTaskRelay(c, nil, 1, taskErr, 1) {
+			t.Fatalf("local task error with status %d must not retry", statusCode)
+		}
+	}
+
+	upstreamErr := &dto.TaskError{StatusCode: http.StatusInternalServerError}
+	if !shouldRetryTaskRelay(c, nil, 1, upstreamErr, 1) {
+		t.Fatal("ordinary upstream 500 should preserve existing retry behavior")
+	}
+
+	for _, statusCode := range []int{http.StatusTemporaryRedirect, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		info := &relaycommon.RelayInfo{}
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		if shouldRetryTaskRelay(c, info, 1, &dto.TaskError{StatusCode: statusCode}, 1) {
+			t.Fatalf("possibly accepted task submission with status %d must not retry", statusCode)
+		}
 	}
 }
 

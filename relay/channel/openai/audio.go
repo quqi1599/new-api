@@ -18,7 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) *dto.Usage {
+func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	// the status code has been judged before, if there is a body reading failure,
 	// it should be regarded as a non-recoverable error, so it should not return err for external retry.
 	// Analogous to nginx's load balancing, it will only retry if it can't be requested or
@@ -29,16 +29,25 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	usage := &dto.Usage{}
 	usage.PromptTokens = info.GetEstimatePromptTokens()
 	usage.TotalTokens = info.GetEstimatePromptTokens()
-	for k, v := range resp.Header {
-		if !service.ShouldCopyUpstreamHeader(c, k, v) {
-			continue
-		}
-		c.Writer.Header().Set(k, v[0])
-	}
-	c.Writer.WriteHeader(resp.StatusCode)
 
 	if info.IsStream {
 		helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+			if data == "[DONE]" {
+				sr.Done()
+				return
+			}
+
+			var event struct {
+				Type string `json:"type"`
+			}
+			if err := common.Unmarshal([]byte(data), &event); err != nil {
+				logger.LogError(c, "failed to parse TTS stream event: "+err.Error())
+				sr.Error(err)
+				return
+			}
+			if !sr.Accept() {
+				return
+			}
 			if service.SundaySearch(data, "usage") {
 				var simpleResponse dto.SimpleResponse
 				if err := common.Unmarshal([]byte(data), &simpleResponse); err != nil {
@@ -53,15 +62,31 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			if err := helper.StringData(c, data); err != nil {
 				sr.Error(err)
 			}
+			switch event.Type {
+			case "speech.audio.done":
+				sr.Done()
+			case "error", "speech.audio.error":
+				sr.Stop(fmt.Errorf("TTS stream error event: %s", event.Type))
+			}
 		})
+		if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+			return nil, streamErr
+		}
 	} else {
+		for k, v := range resp.Header {
+			if !service.ShouldCopyUpstreamHeader(c, k, v) {
+				continue
+			}
+			c.Writer.Header().Set(k, v[0])
+		}
+		c.Writer.WriteHeader(resp.StatusCode)
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
 		// 读取响应体到缓冲区
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			logger.LogError(c, fmt.Sprintf("failed to read TTS response body: %v", err))
 			c.Writer.WriteHeaderNow()
-			return usage
+			return usage, nil
 		}
 
 		// 写入响应到客户端
@@ -112,7 +137,7 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 	}
 
-	return usage
+	return usage, nil
 }
 
 func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, responseFormat string) (*types.NewAPIError, *dto.Usage) {

@@ -156,6 +156,7 @@ func TestFormatClaudeResponseInfo_NilClaudeInfo(t *testing.T) {
 
 func TestFormatClaudeResponseInfo_ContentBlockDelta(t *testing.T) {
 	text := "hello"
+	partialJSON := `{"city":"Shen`
 	claudeInfo := &ClaudeResponseInfo{
 		Usage:        &dto.Usage{},
 		ResponseText: strings.Builder{},
@@ -163,7 +164,8 @@ func TestFormatClaudeResponseInfo_ContentBlockDelta(t *testing.T) {
 	claudeResponse := &dto.ClaudeResponse{
 		Type: "content_block_delta",
 		Delta: &dto.ClaudeMediaMessage{
-			Text: &text,
+			Text:        &text,
+			PartialJson: &partialJSON,
 		},
 	}
 
@@ -171,8 +173,8 @@ func TestFormatClaudeResponseInfo_ContentBlockDelta(t *testing.T) {
 	if !ok {
 		t.Fatal("expected true")
 	}
-	if claudeInfo.ResponseText.String() != "hello" {
-		t.Errorf("ResponseText = %q, want %q", claudeInfo.ResponseText.String(), "hello")
+	if claudeInfo.ResponseText.String() != "hello"+partialJSON {
+		t.Errorf("ResponseText = %q, want %q", claudeInfo.ResponseText.String(), "hello"+partialJSON)
 	}
 }
 

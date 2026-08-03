@@ -78,8 +78,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 
 	var usage = &dto.Usage{}
 	var responseTextBuilder strings.Builder
+	var terminalFailure *types.NewAPIError
 
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if data == "[DONE]" {
+			sr.Stop(fmt.Errorf("unexpected [DONE] marker in Responses stream"))
+			return
+		}
 
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
@@ -88,7 +93,39 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(err)
 			return
 		}
+		if streamResponse.Type == "" {
+			sr.Error(fmt.Errorf("responses stream event is missing type"))
+			return
+		}
+		if !sr.Accept() {
+			return
+		}
 		sendResponsesStreamData(c, streamResponse, data)
+
+		// Adapted from official PR #6549: Responses error events are valid SSE
+		// payloads, so transport-level success must not erase their business error.
+		switch streamResponse.Type {
+		case "error", "response.error", "response.failed", "response.incomplete":
+			streamError := streamResponse.Error
+			if (len(streamError) == 0 || string(streamError) == "null") && streamResponse.Response != nil && streamResponse.Response.Error != nil {
+				if errorBytes, err := common.Marshal(streamResponse.Response.Error); err == nil {
+					streamError = errorBytes
+				}
+			}
+			streamFailure := fmt.Errorf("responses stream ended with %s", streamResponse.Type)
+			if len(streamError) > 0 && string(streamError) != "null" {
+				streamFailure = fmt.Errorf("%s: %s", streamResponse.Type, streamError)
+			}
+			terminalFailure = types.NewErrorWithStatusCode(
+				streamFailure,
+				types.ErrorCodeBadResponse,
+				http.StatusBadGateway,
+				types.ErrOptionWithSkipRetry(),
+				types.ErrOptionWithChannelPenalty(),
+			)
+			sr.Stop(streamFailure)
+			return
+		}
 		switch streamResponse.Type {
 		case "response.completed":
 			if streamResponse.Response != nil {
@@ -112,6 +149,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					c.Set("image_generation_call_size", streamResponse.Response.GetSize())
 				}
 			}
+			sr.Done()
 		case "response.output_text.delta":
 			// 处理输出文本
 			responseTextBuilder.WriteString(streamResponse.Delta)
@@ -129,6 +167,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 	})
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
+	}
+	if terminalFailure != nil {
+		// Protocol-native error frames may already have committed an SSE 200. The
+		// controller suppresses a trailing JSON error in that case, but it still
+		// needs a non-nil result to avoid success settlement and success logging.
+		return usage, terminalFailure
+	}
 
 	if usage.CompletionTokens == 0 {
 		// 计算输出文本的 token 数量

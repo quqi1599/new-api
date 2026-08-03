@@ -1,6 +1,7 @@
 package baidu
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +46,14 @@ func (a *Adaptor) Init(info *relaycommon.RelayInfo) {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
+	return a.getRequestURL(context.Background(), info)
+}
+
+func (a *Adaptor) GetRequestURLWithContext(ctx context.Context, info *relaycommon.RelayInfo) (string, error) {
+	return a.getRequestURL(ctx, info)
+}
+
+func (a *Adaptor) getRequestURL(ctx context.Context, info *relaycommon.RelayInfo) (string, error) {
 	// https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
 	suffix := "chat/"
 	if strings.HasPrefix(info.UpstreamModelName, "Embedding") {
@@ -105,7 +114,7 @@ func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
 	fullRequestURL := fmt.Sprintf("%s/rpc/2.0/ai_custom/v1/wenxinworkshop/%s", info.ChannelBaseUrl, suffix)
 	var accessToken string
 	var err error
-	if accessToken, err = getBaiduAccessToken(info.ApiKey); err != nil {
+	if accessToken, err = getBaiduAccessToken(ctx, info.ApiKey); err != nil {
 		return "", err
 	}
 	fullRequestURL += "?access_token=" + accessToken

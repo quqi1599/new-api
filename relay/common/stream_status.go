@@ -10,15 +10,16 @@ import (
 type StreamEndReason string
 
 const (
-	StreamEndReasonNone        StreamEndReason = ""
-	StreamEndReasonDone        StreamEndReason = "done"
-	StreamEndReasonTimeout     StreamEndReason = "timeout"
-	StreamEndReasonClientGone  StreamEndReason = "client_gone"
-	StreamEndReasonScannerErr  StreamEndReason = "scanner_error"
-	StreamEndReasonHandlerStop StreamEndReason = "handler_stop"
-	StreamEndReasonEOF         StreamEndReason = "eof"
-	StreamEndReasonPanic       StreamEndReason = "panic"
-	StreamEndReasonPingFail    StreamEndReason = "ping_fail"
+	StreamEndReasonNone              StreamEndReason = ""
+	StreamEndReasonDone              StreamEndReason = "done"
+	StreamEndReasonFirstEventTimeout StreamEndReason = "first_event_timeout"
+	StreamEndReasonTimeout           StreamEndReason = "timeout"
+	StreamEndReasonClientGone        StreamEndReason = "client_gone"
+	StreamEndReasonScannerErr        StreamEndReason = "scanner_error"
+	StreamEndReasonHandlerStop       StreamEndReason = "handler_stop"
+	StreamEndReasonEOF               StreamEndReason = "eof"
+	StreamEndReasonPanic             StreamEndReason = "panic"
+	StreamEndReasonPingFail          StreamEndReason = "ping_fail"
 )
 
 const maxStreamErrorEntries = 20
@@ -109,9 +110,7 @@ func (s *StreamStatus) IsNormalEnd() bool {
 	if s == nil {
 		return true
 	}
-	return s.EndReason == StreamEndReasonDone ||
-		s.EndReason == StreamEndReasonEOF ||
-		s.EndReason == StreamEndReasonHandlerStop
+	return s.EndReason == StreamEndReasonDone
 }
 
 func (s *StreamStatus) IsAbortLikeEnd() bool {
@@ -119,6 +118,7 @@ func (s *StreamStatus) IsAbortLikeEnd() bool {
 		return false
 	}
 	return s.EndReason == StreamEndReasonClientGone ||
+		s.EndReason == StreamEndReasonFirstEventTimeout ||
 		s.EndReason == StreamEndReasonTimeout ||
 		s.EndReason == StreamEndReasonHandlerStop ||
 		s.EndReason == StreamEndReasonPingFail

@@ -22,6 +22,7 @@ type CohereResponse struct {
 	Text         string                `json:"text,omitempty"`
 	FinishReason string                `json:"finish_reason,omitempty"`
 	Response     *CohereResponseResult `json:"response"`
+	Error        any                   `json:"error,omitempty"`
 }
 
 type CohereResponseResult struct {

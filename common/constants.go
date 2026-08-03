@@ -134,9 +134,19 @@ var SyncFrequency int // unit is second
 var BatchUpdateEnabled = false
 var BatchUpdateInterval int
 
-var RelayTimeout int // unit is second
+// RelayTimeout is the legacy relay timeout in seconds. Relay HTTP clients no
+// longer apply it as http.Client.Timeout because that would also cap response
+// body reads and terminate otherwise healthy long-lived streams. When the
+// phase-specific response-header timeout is not configured, a positive legacy
+// value is used as its compatibility fallback.
+var RelayTimeout int
 
-var RelayIdleConnTimeout int // unit is second
+var RelayIdleConnTimeout int        // unit is second
+var RelayDialTimeout int            // unit is second
+var RelayTLSHandshakeTimeout int    // unit is second
+var RelayResponseHeaderTimeout int  // unit is second
+var RelayExpectContinueTimeout int  // unit is second
+var RelayFirstEventTotalTimeout int // unit is second; shared across all channel attempts
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 
@@ -147,6 +157,7 @@ var CohereSafetySetting string
 
 const (
 	RequestIdKey         = "X-Oneapi-Request-Id"
+	InternalRequestIdKey = "X-Oneapi-Internal-Request-Id"
 	UpstreamRequestIdKey = "X-Upstream-Request-Id"
 )
 

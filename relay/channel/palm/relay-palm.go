@@ -1,9 +1,12 @@
 package palm
 
 import (
-	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -50,55 +53,78 @@ func streamResponsePaLM2OpenAI(palmResponse *PaLMChatResponse) *dto.ChatCompleti
 	return &response
 }
 
-func palmStreamHandler(c *gin.Context, resp *http.Response) (*types.NewAPIError, string) {
-	responseText := ""
+func palmStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, string) {
+	defer service.CloseResponseBodyGracefully(resp)
+	// PaLM's legacy "stream" endpoint returns one complete JSON document rather
+	// than line-oriented SSE. Keep that read inside the same request-wide
+	// first-valid-event budget used by the shared stream scanner. Closing the body
+	// is required here because the response-header timer has already been
+	// disarmed by doRequest.
+	var budgetState atomic.Uint32 // 0=armed, 1=disarmed, 2=expired
+	var budgetTimer *time.Timer
+	if remaining, limited := info.RemainingFirstValidEventBudget(); limited {
+		if remaining <= 0 {
+			return palmFirstEventBudgetError(), ""
+		}
+		budgetTimer = time.AfterFunc(remaining, func() {
+			if budgetState.CompareAndSwap(0, 2) {
+				_ = resp.Body.Close()
+			}
+		})
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if budgetTimer != nil {
+		budgetState.CompareAndSwap(0, 1)
+		budgetTimer.Stop()
+	}
+	if budgetState.Load() == 2 && (c == nil || c.Request == nil || c.Request.Context().Err() == nil) {
+		return palmFirstEventBudgetError(), ""
+	}
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeReadResponseBodyFailed), ""
+	}
+	var palmResponse PaLMChatResponse
+	if err := common.Unmarshal(responseBody, &palmResponse); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), ""
+	}
+	if palmResponse.Error.Code != 0 {
+		return types.WithOpenAIError(types.OpenAIError{
+			Message: palmResponse.Error.Message,
+			Type:    palmResponse.Error.Status,
+			Code:    palmResponse.Error.Code,
+		}, resp.StatusCode), ""
+	}
+	if len(palmResponse.Candidates) == 0 {
+		return types.NewError(fmt.Errorf("PaLM stream response contained no candidates"), types.ErrorCodeBadResponseBody), ""
+	}
+
 	responseId := helper.GetResponseID(c)
 	createdTime := common.GetTimestamp()
-	dataChan := make(chan string)
-	stopChan := make(chan bool)
-	go func() {
-		responseBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			common.SysLog("error reading stream response: " + err.Error())
-			stopChan <- true
-			return
-		}
-		service.CloseResponseBodyGracefully(resp)
-		var palmResponse PaLMChatResponse
-		err = json.Unmarshal(responseBody, &palmResponse)
-		if err != nil {
-			common.SysLog("error unmarshalling stream response: " + err.Error())
-			stopChan <- true
-			return
-		}
-		fullTextResponse := streamResponsePaLM2OpenAI(&palmResponse)
-		fullTextResponse.Id = responseId
-		fullTextResponse.Created = createdTime
-		if len(palmResponse.Candidates) > 0 {
-			responseText = palmResponse.Candidates[0].Content
-		}
-		jsonResponse, err := json.Marshal(fullTextResponse)
-		if err != nil {
-			common.SysLog("error marshalling stream response: " + err.Error())
-			stopChan <- true
-			return
-		}
-		dataChan <- string(jsonResponse)
-		stopChan <- true
-	}()
-	helper.SetEventStreamHeaders(c)
-	c.Stream(func(w io.Writer) bool {
-		select {
-		case data := <-dataChan:
-			c.Render(-1, common.CustomEvent{Data: "data: " + data})
-			return true
-		case <-stopChan:
-			c.Render(-1, common.CustomEvent{Data: "data: [DONE]"})
-			return false
-		}
-	})
-	service.CloseResponseBodyGracefully(resp)
-	return nil, responseText
+	fullTextResponse := streamResponsePaLM2OpenAI(&palmResponse)
+	fullTextResponse.Id = responseId
+	fullTextResponse.Created = createdTime
+	jsonResponse, err := common.Marshal(fullTextResponse)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody), ""
+	}
+
+	info.SetFirstResponseTime()
+	info.ReceivedResponseCount++
+	if err := helper.StringData(c, string(jsonResponse)); err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry()), ""
+	}
+	helper.Done(c)
+	return nil, palmResponse.Candidates[0].Content
+}
+
+func palmFirstEventBudgetError() *types.NewAPIError {
+	return types.NewErrorWithStatusCode(
+		errors.New("request-wide first valid event budget exhausted"),
+		types.ErrorCodeUpstreamFirstEventTimeout,
+		http.StatusGatewayTimeout,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithChannelPenalty(),
+	)
 }
 
 func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
@@ -108,7 +134,7 @@ func palmHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respons
 	}
 	service.CloseResponseBodyGracefully(resp)
 	var palmResponse PaLMChatResponse
-	err = json.Unmarshal(responseBody, &palmResponse)
+	err = common.Unmarshal(responseBody, &palmResponse)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}

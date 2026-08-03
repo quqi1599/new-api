@@ -62,6 +62,10 @@ const (
 
 	// client request error
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
+	ErrorCodeRequestBodyIncomplete ErrorCode = "request_body_incomplete"
+	ErrorCodeRequestBodyTooLarge   ErrorCode = "request_body_too_large"
+	ErrorCodeRequestBodyCapacity   ErrorCode = "request_body_capacity_exceeded"
+	ErrorCodeInternalStorageError  ErrorCode = "internal_storage_error"
 	ErrorCodeConvertRequestFailed  ErrorCode = "convert_request_failed"
 	ErrorCodeAccessDenied          ErrorCode = "access_denied"
 
@@ -69,14 +73,16 @@ const (
 	ErrorCodeBadRequestBody ErrorCode = "bad_request_body"
 
 	// response error
-	ErrorCodeReadResponseBodyFailed ErrorCode = "read_response_body_failed"
-	ErrorCodeBadResponseStatusCode  ErrorCode = "bad_response_status_code"
-	ErrorCodeBadResponse            ErrorCode = "bad_response"
-	ErrorCodeBadResponseBody        ErrorCode = "bad_response_body"
-	ErrorCodeEmptyResponse          ErrorCode = "empty_response"
-	ErrorCodeAwsInvokeError         ErrorCode = "aws_invoke_error"
-	ErrorCodeModelNotFound          ErrorCode = "model_not_found"
-	ErrorCodePromptBlocked          ErrorCode = "prompt_blocked"
+	ErrorCodeReadResponseBodyFailed    ErrorCode = "read_response_body_failed"
+	ErrorCodeBadResponseStatusCode     ErrorCode = "bad_response_status_code"
+	ErrorCodeBadResponse               ErrorCode = "bad_response"
+	ErrorCodeBadResponseBody           ErrorCode = "bad_response_body"
+	ErrorCodeEmptyResponse             ErrorCode = "empty_response"
+	ErrorCodeUpstreamFirstEventTimeout ErrorCode = "upstream_first_event_timeout"
+	ErrorCodeUpstreamStreamIncomplete  ErrorCode = "upstream_stream_incomplete"
+	ErrorCodeAwsInvokeError            ErrorCode = "aws_invoke_error"
+	ErrorCodeModelNotFound             ErrorCode = "model_not_found"
+	ErrorCodePromptBlocked             ErrorCode = "prompt_blocked"
 
 	// sql error
 	ErrorCodeQueryDataError  ErrorCode = "query_data_error"
@@ -88,14 +94,15 @@ const (
 )
 
 type NewAPIError struct {
-	Err            error
-	RelayError     any
-	skipRetry      bool
-	recordErrorLog *bool
-	errorType      ErrorType
-	errorCode      ErrorCode
-	StatusCode     int
-	Metadata       json.RawMessage
+	Err                 error
+	RelayError          any
+	skipRetry           bool
+	allowChannelPenalty bool
+	recordErrorLog      *bool
+	errorType           ErrorType
+	errorCode           ErrorCode
+	StatusCode          int
+	Metadata            json.RawMessage
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -378,9 +385,26 @@ func IsSkipRetryError(err *NewAPIError) bool {
 	return err.skipRetry
 }
 
+// IsChannelPenaltyAllowed separates replay safety from channel health. Most
+// local/non-retryable errors keep the historical no-penalty behavior, while an
+// upstream failure that may have been accepted can disable replay yet still be
+// counted by channel health policy.
+func IsChannelPenaltyAllowed(err *NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	return !err.skipRetry || err.allowChannelPenalty
+}
+
 func ErrOptionWithSkipRetry() NewAPIErrorOptions {
 	return func(e *NewAPIError) {
 		e.skipRetry = true
+	}
+}
+
+func ErrOptionWithChannelPenalty() NewAPIErrorOptions {
+	return func(e *NewAPIError) {
+		e.allowChannelPenalty = true
 	}
 }
 

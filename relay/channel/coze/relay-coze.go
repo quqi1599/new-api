@@ -1,7 +1,6 @@
 package coze
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -98,65 +98,106 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 }
 
 func cozeChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	scanner := helper.NewStreamScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
-	helper.SetEventStreamHeaders(c)
 	id := helper.GetResponseID(c)
 	var responseText string
-
-	var currentEvent string
-	var currentData string
 	var usage = &dto.Usage{}
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	helper.StreamScannerHandlerWithDecoder(c, resp, info, &cozeEventStreamDecoder{}, func(frame helper.StreamFrame, sr *helper.StreamResult) {
+		handleCozeStreamFrame(c, frame, sr, &responseText, usage, id, info)
+	})
+	service.CloseResponseBodyGracefully(resp)
 
-		if line == "" {
-			if currentEvent != "" && currentData != "" {
-				// handle last event
-				handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info)
-				currentEvent = ""
-				currentData = ""
-			}
-			continue
-		}
-
-		if strings.HasPrefix(line, "event:") {
-			currentEvent = strings.TrimSpace(line[6:])
-			continue
-		}
-
-		if strings.HasPrefix(line, "data:") {
-			currentData = strings.TrimSpace(line[5:])
-			continue
-		}
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
 	}
-
-	// Last event
-	if currentEvent != "" && currentData != "" {
-		handleCozeEvent(c, currentEvent, currentData, &responseText, usage, id, info)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
-	}
-	helper.Done(c)
 
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, c.GetInt("coze_input_count"))
+	}
+	if helper.ShouldFinalizeStream(info) {
+		helper.Done(c)
 	}
 
 	return usage, nil
 }
 
-func handleCozeEvent(c *gin.Context, event string, data string, responseText *string, usage *dto.Usage, id string, info *relaycommon.RelayInfo) {
+// cozeEventStreamDecoder implements Coze's event-aware SSE framing. A Coze
+// event can contain multiple data lines and the final event is still valid
+// when the upstream closes without a trailing blank line.
+type cozeEventStreamDecoder struct {
+	event     string
+	dataLines []string
+}
+
+func (d *cozeEventStreamDecoder) Feed(line string) ([]helper.StreamFrame, error) {
+	if line == "" {
+		return d.dispatch(), nil
+	}
+	if strings.HasPrefix(line, ":") {
+		return nil, nil
+	}
+
+	field, value, hasColon := strings.Cut(line, ":")
+	if !hasColon {
+		value = ""
+	} else if strings.HasPrefix(value, " ") {
+		value = value[1:]
+	}
+
+	switch field {
+	case "event":
+		d.event = value
+	case "data":
+		d.dataLines = append(d.dataLines, value)
+	}
+	return nil, nil
+}
+
+func (d *cozeEventStreamDecoder) Flush() ([]helper.StreamFrame, error) {
+	return d.dispatch(), nil
+}
+
+func (d *cozeEventStreamDecoder) dispatch() []helper.StreamFrame {
+	event := d.event
+	dataLines := d.dataLines
+	d.event = ""
+	d.dataLines = nil
+
+	if len(dataLines) == 0 {
+		return nil
+	}
+	return []helper.StreamFrame{{
+		Kind:  "sse",
+		Event: event,
+		Data:  strings.Join(dataLines, "\n"),
+	}}
+}
+
+func handleCozeStreamFrame(c *gin.Context, frame helper.StreamFrame, sr *helper.StreamResult, responseText *string, usage *dto.Usage, id string, info *relaycommon.RelayInfo) {
+	event := strings.TrimSpace(frame.Event)
+	if strings.TrimSpace(frame.Data) == "[DONE]" {
+		// Coze's protocol is complete only after conversation.chat.completed.
+		// A generic SSE marker is not proof that the chat completed.
+		sr.Error(errors.New("coze stream received [DONE] without conversation.chat.completed"))
+		return
+	}
+
 	switch event {
 	case "conversation.chat.completed":
-		// 将 data 解析为 CozeChatResponseData
 		var chatData CozeChatResponseData
-		err := json.Unmarshal([]byte(data), &chatData)
-		if err != nil {
-			common.SysLog("error_unmarshalling_stream_response: " + err.Error())
+		if err := common.Unmarshal([]byte(frame.Data), &chatData); err != nil {
+			sr.Stop(fmt.Errorf("invalid Coze completed event: %w", err))
+			return
+		}
+		if chatData.Status != "" && !strings.EqualFold(chatData.Status, "completed") {
+			sr.Stop(fmt.Errorf("invalid Coze completed event status: %s", chatData.Status))
+			return
+		}
+		if chatData.LastError.Code != 0 || chatData.LastError.Message != "" {
+			sr.Stop(errors.New("Coze completed event contains an upstream error"))
+			return
+		}
+		if !sr.Accept() {
 			return
 		}
 
@@ -166,21 +207,25 @@ func handleCozeEvent(c *gin.Context, event string, data string, responseText *st
 
 		finishReason := "stop"
 		stopResponse := helper.GenerateStopResponse(id, common.GetTimestamp(), info.UpstreamModelName, finishReason)
-		helper.ObjectData(c, stopResponse)
+		if err := helper.ObjectData(c, stopResponse); err != nil {
+			sr.Stop(fmt.Errorf("write Coze stop response: %w", err))
+			return
+		}
+		sr.Done()
 
 	case "conversation.message.delta":
-		// 将 data 解析为 CozeChatV3MessageDetail
 		var messageData CozeChatV3MessageDetail
-		err := json.Unmarshal([]byte(data), &messageData)
-		if err != nil {
-			common.SysLog("error_unmarshalling_stream_response: " + err.Error())
+		if err := common.Unmarshal([]byte(frame.Data), &messageData); err != nil {
+			sr.Stop(fmt.Errorf("invalid Coze delta event: %w", err))
 			return
 		}
 
 		var content string
-		err = json.Unmarshal(messageData.Content, &content)
-		if err != nil {
-			common.SysLog("error_unmarshalling_stream_response: " + err.Error())
+		if err := common.Unmarshal(messageData.Content, &content); err != nil {
+			sr.Stop(fmt.Errorf("invalid Coze delta content: %w", err))
+			return
+		}
+		if !sr.Accept() {
 			return
 		}
 
@@ -199,17 +244,31 @@ func handleCozeEvent(c *gin.Context, event string, data string, responseText *st
 		choice.Delta.SetContentString(content)
 		openaiResponse.Choices = append(openaiResponse.Choices, choice)
 
-		helper.ObjectData(c, openaiResponse)
-
-	case "error":
-		var errorData CozeError
-		err := json.Unmarshal([]byte(data), &errorData)
-		if err != nil {
-			common.SysLog("error_unmarshalling_stream_response: " + err.Error())
-			return
+		if err := helper.ObjectData(c, openaiResponse); err != nil {
+			sr.Stop(fmt.Errorf("write Coze delta response: %w", err))
 		}
 
-		common.SysLog(fmt.Sprintf("stream event error: %v %v", errorData.Code, errorData.Message))
+	case "conversation.chat.created", "conversation.chat.in_progress", "conversation.message.created", "conversation.message.completed":
+		var eventData map[string]any
+		if err := common.Unmarshal([]byte(frame.Data), &eventData); err != nil || len(eventData) == 0 {
+			if err == nil {
+				err = errors.New("empty event payload")
+			}
+			sr.Stop(fmt.Errorf("invalid Coze %s event: %w", event, err))
+			return
+		}
+		sr.Accept()
+
+	case "conversation.chat.failed", "conversation.chat.requires_action", "conversation.chat.canceled", "conversation.chat.cancelled", "error":
+		sr.Stop(fmt.Errorf("Coze stream failure event: %s", event))
+
+	case "", "done":
+		sr.Error(fmt.Errorf("Coze stream event is missing a supported event type"))
+
+	default:
+		// Ignore forward-compatible event types, but do not let an unknown frame
+		// satisfy the first-valid-event deadline or complete the stream.
+		sr.Error(fmt.Errorf("unsupported Coze stream event: %s", event))
 	}
 }
 
@@ -218,7 +277,7 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 
 	requestURL = requestURL + "?conversation_id=" + c.GetString("coze_conversation_id") + "&chat_id=" + c.GetString("coze_chat_id")
 	// 将 conversationId和chatId作为参数发送get请求
-	req, err := http.NewRequest("GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", requestURL, nil)
 	if err != nil {
 		return err, false
 	}
@@ -227,7 +286,7 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 		return err, false
 	}
 
-	resp, err := doRequest(req, info) // 调用 doRequest
+	resp, err := doRequest(c, req, info) // 调用 doRequest
 	if err != nil {
 		return err, false
 	}
@@ -263,7 +322,7 @@ func getChatDetail(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (*ht
 	requestURL := fmt.Sprintf("%s/v3/chat/message/list", info.ChannelBaseUrl)
 
 	requestURL = requestURL + "?conversation_id=" + c.GetString("coze_conversation_id") + "&chat_id=" + c.GetString("coze_chat_id")
-	req, err := http.NewRequest("GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -271,14 +330,14 @@ func getChatDetail(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (*ht
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	resp, err := doRequest(req, info)
+	resp, err := doRequest(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
 	return resp, nil
 }
 
-func doRequest(req *http.Request, info *relaycommon.RelayInfo) (*http.Response, error) {
+func doRequest(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) (*http.Response, error) {
 	var client *http.Client
 	var err error // 声明 err 变量
 	if info.ChannelSetting.Proxy != "" {
@@ -291,6 +350,9 @@ func doRequest(req *http.Request, info *relaycommon.RelayInfo) (*http.Response, 
 	}
 	resp, err := client.Do(req)
 	if err != nil { // 增加对 client.Do(req) 返回错误的检查
+		if c.Request.Context().Err() != nil {
+			return nil, channel.ClassifyDoRequestError(c, err)
+		}
 		return nil, fmt.Errorf("client.Do failed: %w", err)
 	}
 	// _ = resp.Body.Close()

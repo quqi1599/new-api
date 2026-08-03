@@ -312,9 +312,19 @@ docker run --name new-api -d --restart always \
 | `CRYPTO_SECRET` | 加密密钥（Redis 必须）                                               | - |
 | `SQL_DSN` | 数据库连接字符串                                                     | - |
 | `REDIS_CONN_STRING` | Redis 连接字符串                                                  | - |
-| `STREAMING_TIMEOUT` | 流式超时时间（秒）                                                    | `300` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | 优雅退出等待时间（秒），容器的停止宽限时间必须更长 | `120` |
+| `RELAY_DIAL_TIMEOUT_SECONDS` | TCP/代理建连超时（秒），`0` 表示禁用该阶段超时 | `10` |
+| `RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | TLS 握手超时（秒），`0` 表示禁用该阶段超时 | `10` |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 单次尝试等待上游响应头超时（秒），不限制响应体的流式读取时长，并受跨尝试首事件总预算约束 | `480` |
+| `RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS` | `Expect: 100-continue` 等待超时（秒） | `1` |
+| `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | 响应头返回后等待首个有效 SSE 事件的单次尝试上限；请求级总截止时间可缩短它 | `540` |
+| `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | 从入站请求开始、跨所有渠道尝试共享的首个有效事件总预算；首事件后解除，不截断健康长流；应早于海外 Caddy 首包超时至少 60 秒，`0` 表示禁用 | `540` |
+| `RELAY_TIMEOUT` | 旧版 Relay/供应商兼容值，新响应头超时未设置时作为回退（不超过安全的 480 秒阶段默认值）；用户控制 URL 的 SSRF 保护下载仍将其作为整体超时 | `0` |
+| `RELAY_IDLE_CONN_TIMEOUT` | Relay HTTP 客户端空闲保活连接超时（秒），`0` 表示禁用 | `90` |
+| `STREAMING_TIMEOUT` | 首个有效事件后，相邻有效 SSE data 事件的空闲超时；注释/心跳不重置 | `300` |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | 流式扫描器单行最大缓冲（MB），图像生成等超大 `data:` 片段（如 4K 图片 base64）需适当调大 | `64` |
-| `MAX_REQUEST_BODY_MB` | 请求体最大大小（MB，**解压后**计；防止超大请求/zip bomb 导致内存暴涨），超过将返回 `413` | `32` |
+| `MAX_REQUEST_BODY_MB` | 请求体最大大小（MB，**解压后**计；防止超大请求/zip bomb 导致内存暴涨），超过将返回 `413` | `128` |
+| `MAX_CONCURRENT_LARGE_REQUEST_BODIES` | 同时处理的 >=1 MiB 请求体上限（包含磁盘暂存请求），容量耗尽时返回 `503` 而不是在解析/转换阶段继续分配内存 | `4` |
 | `AZURE_DEFAULT_API_VERSION` | Azure API 版本                                                 | `2025-04-01-preview` |
 | `ERROR_LOG_ENABLED` | 错误日志开关                                                       | `false` |
 | `PYROSCOPE_URL` | Pyroscope 服务地址                                            | - |

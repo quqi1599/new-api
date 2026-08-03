@@ -834,6 +834,12 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 			if claudeResponse.Delta.Thinking != nil {
 				claudeInfo.ResponseText.WriteString(*claudeResponse.Delta.Thinking)
 			}
+			if claudeResponse.Delta.PartialJson != nil {
+				// Tool-call arguments are output tokens too. Keep their partial JSON
+				// for usage estimation when the client cancels or the stream ends
+				// before Anthropic's final message_delta usage arrives.
+				claudeInfo.ResponseText.WriteString(*claudeResponse.Delta.PartialJson)
+			}
 		}
 	} else if claudeResponse.Type == "message_delta" {
 		// 最终的usage获取
@@ -875,15 +881,26 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	return true
 }
 
-func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string) *types.NewAPIError {
+func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, data string, streamResult *helper.StreamResult) (string, *types.NewAPIError) {
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
 		common.SysLog("error unmarshalling stream response: " + err.Error())
-		return types.NewError(err, types.ErrorCodeBadResponseBody)
+		return "", types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		return claudeResponse.Type, types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+	}
+	if claudeResponse.Type == "" {
+		return "", types.NewError(fmt.Errorf("claude stream event is missing type"), types.ErrorCodeBadResponseBody)
+	}
+	// Anthropic ping is transport keepalive, not a model event. It must not
+	// satisfy the first-business-event deadline or commit downstream headers.
+	if claudeResponse.Type == "ping" {
+		return claudeResponse.Type, nil
+	}
+	if streamResult != nil && !streamResult.Accept() {
+		return claudeResponse.Type, nil
 	}
 	if claudeResponse.StopReason != "" {
 		maybeMarkClaudeRefusal(c, claudeResponse.StopReason)
@@ -906,23 +923,37 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 				data = patchClaudeMessageDeltaUsageData(data, buildMessageDeltaPatchUsage(&claudeResponse, claudeInfo))
 			}
 		}
-		helper.ClaudeChunkData(c, claudeResponse, data)
+		helper.ExtendWriteDeadline(c)
+		if err := helper.ClaudeChunkData(c, claudeResponse, data); err != nil {
+			return claudeResponse.Type, types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+		}
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
 		response := StreamResponseClaude2OpenAI(&claudeResponse)
 
 		if !FormatClaudeResponseInfo(&claudeResponse, response, claudeInfo) {
-			return nil
+			return claudeResponse.Type, nil
 		}
 
+		helper.ExtendWriteDeadline(c)
 		err = helper.ObjectData(c, response)
 		if err != nil {
 			logger.LogError(c, "send_stream_response_failed: "+err.Error())
+			return claudeResponse.Type, types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
 	}
-	return nil
+	return claudeResponse.Type, nil
 }
 
-func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+// FinalizeClaudeUsage estimates only missing usage fields. It deliberately does
+// not write a terminal frame, so interrupted streams can be settled without
+// being mislabeled as successful to the downstream client.
+func FinalizeClaudeUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+	if claudeInfo == nil {
+		return
+	}
+	if claudeInfo.Usage == nil {
+		claudeInfo.Usage = &dto.Usage{}
+	}
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
@@ -943,6 +974,13 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 	}
 	if claudeInfo.Usage != nil {
 		claudeInfo.Usage.UsageSemantic = "anthropic"
+	}
+}
+
+func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
+	FinalizeClaudeUsage(c, info, claudeInfo)
+	if claudeInfo == nil || claudeInfo.Usage == nil {
+		return
 	}
 
 	if info.RelayFormat == types.RelayFormatClaude {
@@ -970,16 +1008,28 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 	var err *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
-		err = HandleStreamResponseData(c, info, claudeInfo, data)
+		var eventType string
+		eventType, err = HandleStreamResponseData(c, info, claudeInfo, data, sr)
 		if err != nil {
 			sr.Stop(err)
+			return
+		}
+		if eventType == "message_stop" {
+			sr.Done()
 		}
 	})
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	HandleStreamFinalResponse(c, info, claudeInfo)
+	if helper.ShouldFinalizeStream(info) {
+		HandleStreamFinalResponse(c, info, claudeInfo)
+	} else {
+		FinalizeClaudeUsage(c, info, claudeInfo)
+	}
 	return claudeInfo.Usage, nil
 }
 

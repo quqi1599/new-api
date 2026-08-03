@@ -36,6 +36,56 @@ const statusCodeCloudflareTimeout = 524
 
 var moderationReviewIdPattern = regexp.MustCompile(`(?i)\bmoderation(?:[\s_-]+review)?[\s_-]+id\s*[:=]\s*([a-z0-9][a-z0-9_-]{7,127})\b`)
 
+func requestBodyFailureClassification(err error) (statusCode int, errorCode types.ErrorCode, classified bool) {
+	switch {
+	case common.IsRequestBodyTooLargeError(err), errors.Is(err, common.ErrRequestBodyTooLarge):
+		return http.StatusRequestEntityTooLarge, types.ErrorCodeRequestBodyTooLarge, true
+	case common.IsIncompleteBodyError(err):
+		return http.StatusBadRequest, types.ErrorCodeRequestBodyIncomplete, true
+	case common.IsBodyReadError(err):
+		return http.StatusBadRequest, types.ErrorCodeReadRequestBodyFailed, true
+	case common.IsBodyAdmissionError(err):
+		return http.StatusServiceUnavailable, types.ErrorCodeRequestBodyCapacity, true
+	case common.IsInternalBodyStorageError(err):
+		return http.StatusInternalServerError, types.ErrorCodeInternalStorageError, true
+	default:
+		return http.StatusBadRequest, types.ErrorCodeReadRequestBodyFailed, false
+	}
+}
+
+func requestBodyFailureStatus(err error) (statusCode int, classified bool) {
+	statusCode, _, classified = requestBodyFailureClassification(err)
+	return statusCode, classified
+}
+
+func publicRequestBodyError(c *gin.Context, err error) error {
+	if common.IsBodyReadError(err) {
+		return errors.New("failed to read request body")
+	}
+	if common.IsBodyAdmissionError(err) {
+		return errors.New("request body capacity is temporarily exhausted")
+	}
+	if !common.IsInternalBodyStorageError(err) {
+		return err
+	}
+	if c != nil {
+		logger.LogError(c, "internal request body storage failure: "+err.Error())
+	} else {
+		common.SysError("internal request body storage failure: " + err.Error())
+	}
+	return errors.New("internal request body storage error")
+}
+
+func newRequestBodyFailure(c *gin.Context, err error) *types.NewAPIError {
+	statusCode, errorCode, _ := requestBodyFailureClassification(err)
+	return types.NewErrorWithStatusCode(
+		publicRequestBodyError(c, err),
+		errorCode,
+		statusCode,
+		types.ErrOptionWithSkipRetry(),
+	)
+}
+
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
 	switch info.RelayMode {
@@ -94,27 +144,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
-			switch relayFormat {
-			case types.RelayFormatOpenAIRealtime:
-				helper.WssError(c, ws, newAPIError.ToOpenAIError())
-			case types.RelayFormatClaude:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"type":  "error",
-					"error": newAPIError.ToClaudeError(),
-				})
-			default:
-				c.JSON(newAPIError.StatusCode, gin.H{
-					"error": newAPIError.ToOpenAIError(),
-				})
-			}
+			writeRelayError(c, ws, relayFormat, newAPIError)
 		}
 	}()
 
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
 	if err != nil {
-		// Map "request body too large" to 413 so clients can handle it correctly
-		if common.IsRequestBodyTooLargeError(err) || errors.Is(err, common.ErrRequestBodyTooLarge) {
-			newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
+		if _, isBodyReadFailure := requestBodyFailureStatus(err); isBodyReadFailure {
+			newAPIError = newRequestBodyFailure(c, err)
 		} else {
 			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest)
 		}
@@ -207,12 +244,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
-			// Ensure consistent 413 for oversized bodies even when error occurs later (e.g., retry path)
-			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusRequestEntityTooLarge, types.ErrOptionWithSkipRetry())
-			} else {
-				newAPIError = types.NewErrorWithStatusCode(bodyErr, types.ErrorCodeReadRequestBodyFailed, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
-			}
+			newAPIError = newRequestBodyFailure(c, bodyErr)
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
@@ -278,12 +310,55 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if forceGPTFallback {
 			retryAllowed = canGPTFallback
 		}
+		if relayProgressStarted(c, relayInfo) {
+			// A valid upstream event or any downstream byte proves this stream has
+			// started. Replaying the POST could duplicate generation, tools, or
+			// billing and could splice a second stream into an already committed one.
+			retryAllowed = false
+		}
 		if !canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback, wasForcedFallbackAttempt) {
 			break
 		}
 	}
 
 	logRelayRetryRoute(c)
+}
+
+func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.RelayFormat, relayErr *types.NewAPIError) {
+	if relayErr == nil {
+		return
+	}
+	if relayFormat == types.RelayFormatOpenAIRealtime {
+		helper.WssError(c, ws, relayErr.ToOpenAIError())
+		return
+	}
+	if c == nil || c.Writer == nil {
+		return
+	}
+	if c.Writer.Written() {
+		// HTTP status and framing are immutable after the first SSE byte. Appending
+		// a plain JSON error would corrupt the event stream and confuse clients.
+		logger.LogError(c, "relay failed after downstream output; suppressing trailing JSON error")
+		return
+	}
+
+	// An adapter may have prepared SSE headers before discovering a pre-output
+	// protocol error. Restore a normal JSON response before committing it.
+	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
+		c.Writer.Header().Del(header)
+	}
+
+	switch relayFormat {
+	case types.RelayFormatClaude:
+		c.JSON(relayErr.StatusCode, gin.H{
+			"type":  "error",
+			"error": relayErr.ToClaudeError(),
+		})
+	default:
+		c.JSON(relayErr.StatusCode, gin.H{
+			"error": relayErr.ToOpenAIError(),
+		})
+	}
 }
 
 var upgrader = websocket.Upgrader{
@@ -373,6 +448,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if openaiErr == nil {
 		return false
 	}
+	if c != nil && c.Writer != nil && c.Writer.Written() {
+		return false
+	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
@@ -399,6 +477,19 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		return false
 	}
 	return operation_setting.ShouldRetryByStatusCode(code)
+}
+
+func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
+	if c != nil && c.Writer != nil && c.Writer.Written() {
+		return true
+	}
+	if info == nil {
+		return false
+	}
+	return info.ReceivedResponseCount > 0 ||
+		info.SendResponseCount > 0 ||
+		info.HasSendResponse() ||
+		info.UpstreamRequestMayHaveBeenAccepted()
 }
 
 func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
@@ -445,7 +536,8 @@ func shouldBanTokenFromProtectedChannels(info *relaycommon.RelayInfo, openaiErr 
 
 func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels int) bool {
 	return info != nil && attemptedChannels < 2 &&
-		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0
+		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 &&
+		!info.UpstreamRequestMayHaveBeenAccepted()
 }
 
 func extendRetryLimitForForcedGPTFallback(retryLimit int, currentRetry int) int {
@@ -643,11 +735,8 @@ func RelayTask(c *gin.Context) {
 		addUsedChannel(c, channel.Id)
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
-			if common.IsRequestBodyTooLargeError(bodyErr) || errors.Is(bodyErr, common.ErrRequestBodyTooLarge) {
-				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusRequestEntityTooLarge)
-			} else {
-				taskErr = service.TaskErrorWrapperLocal(bodyErr, "read_request_body_failed", http.StatusBadRequest)
-			}
+			statusCode, errorCode, _ := requestBodyFailureClassification(bodyErr)
+			taskErr = service.TaskErrorWrapperLocal(publicRequestBodyError(c, bodyErr), string(errorCode), statusCode)
 			break
 		}
 		c.Request.Body = io.NopCloser(bodyStorage)
@@ -655,6 +744,12 @@ func RelayTask(c *gin.Context) {
 		result, taskErr = relay.RelayTaskSubmit(c, relayInfo)
 		if taskErr == nil {
 			break
+		}
+		if relayInfo.UpstreamRequestMayHaveBeenAccepted() {
+			// The upstream may already have created the non-idempotent task even
+			// when it returned a retryable-looking status. Cross-channel replay
+			// could create and bill a second task.
+			taskErr.SkipRetry = true
 		}
 
 		if !taskErr.LocalError {
@@ -665,7 +760,7 @@ func RelayTask(c *gin.Context) {
 				false)
 		}
 
-		if !shouldRetryTaskRelay(c, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
+		if !shouldRetryTaskRelay(c, relayInfo, channel.Id, taskErr, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
 	}
@@ -717,8 +812,17 @@ func respondTaskError(c *gin.Context, taskErr *dto.TaskError) {
 	c.JSON(taskErr.StatusCode, taskErr)
 }
 
-func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
+func shouldRetryTaskRelay(c *gin.Context, info *relaycommon.RelayInfo, channelId int, taskErr *dto.TaskError, retryTimes int) bool {
 	if taskErr == nil {
+		return false
+	}
+	if info != nil && info.UpstreamRequestMayHaveBeenAccepted() {
+		return false
+	}
+	if taskErr.LocalError {
+		return false
+	}
+	if taskErr.SkipRetry {
 		return false
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
@@ -748,9 +852,6 @@ func shouldRetryTaskRelay(c *gin.Context, channelId int, taskErr *dto.TaskError,
 	}
 	if taskErr.StatusCode == 408 {
 		// azure处理超时不重试
-		return false
-	}
-	if taskErr.LocalError {
 		return false
 	}
 	if taskErr.StatusCode/100 == 2 {

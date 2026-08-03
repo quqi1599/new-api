@@ -38,7 +38,11 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 	if storage, exists := c.Get(KeyBodyStorage); exists && storage != nil {
 		if bs, ok := storage.(BodyStorage); ok {
 			if _, err := bs.Seek(0, io.SeekStart); err != nil {
-				return nil, fmt.Errorf("failed to seek body storage: %w", err)
+				storageType := bodyStorageMemory
+				if bs.IsDisk() {
+					storageType = bodyStorageDisk
+				}
+				return nil, &InternalBodyStorageError{Storage: storageType, Operation: "seek", Cause: err}
 			}
 			return bs, nil
 		}
@@ -59,7 +63,7 @@ func GetRequestBody(c *gin.Context) (io.Seeker, error) {
 
 	maxMB := constant.MaxRequestBodyMB
 	if maxMB <= 0 {
-		maxMB = 128 // 默认 128MB
+		maxMB = 128 // 保留原有公开请求大小契约
 	}
 	maxBytes := int64(maxMB) << 20
 

@@ -5,22 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 
-	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -296,15 +296,29 @@ func applyHeaderOverrideToRequest(req *http.Request, headerOverride map[string]s
 	}
 }
 
+type contextualRequestURLBuilder interface {
+	GetRequestURLWithContext(ctx context.Context, info *common.RelayInfo) (string, error)
+}
+
+func getRequestURL(a Adaptor, c *gin.Context, info *common.RelayInfo) (string, error) {
+	if contextual, ok := a.(contextualRequestURLBuilder); ok && c != nil && c.Request != nil {
+		return contextual.GetRequestURLWithContext(c.Request.Context(), info)
+	}
+	return a.GetRequestURL(info)
+}
+
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
-	fullRequestURL, err := a.GetRequestURL(info)
+	fullRequestURL, err := getRequestURL(a, c, info)
 	if err != nil {
+		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, ClassifyDoRequestError(c, err)
+		}
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	if common2.DebugEnabled {
 		println("fullRequestURL:", fullRequestURL)
 	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -329,14 +343,17 @@ func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 }
 
 func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
-	fullRequestURL, err := a.GetRequestURL(info)
+	fullRequestURL, err := getRequestURL(a, c, info)
 	if err != nil {
+		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, ClassifyDoRequestError(c, err)
+		}
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	if common2.DebugEnabled {
 		println("fullRequestURL:", fullRequestURL)
 	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -363,8 +380,11 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 }
 
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
-	fullRequestURL, err := a.GetRequestURL(info)
+	fullRequestURL, err := getRequestURL(a, c, info)
 	if err != nil {
+		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, ClassifyDoRequestError(c, err)
+		}
 		return nil, fmt.Errorf("get request url failed: %w", err)
 	}
 	targetHeader := http.Header{}
@@ -382,8 +402,11 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
-	targetConn, _, err := websocket.DefaultDialer.Dial(fullRequestURL, targetHeader)
+	targetConn, _, err := DialWebSocketContext(c.Request.Context(), fullRequestURL, targetHeader)
 	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return nil, ClassifyDoRequestError(c, err)
+		}
 		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
 	}
 	// send request body
@@ -392,97 +415,149 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	return targetConn, nil
 }
 
-func startPingKeepAlive(c *gin.Context, pingInterval time.Duration) (context.CancelFunc, <-chan struct{}) {
-	pingerCtx, stopPinger := context.WithCancel(context.Background())
-	done := make(chan struct{})
-
-	gopool.Go(func() {
-		defer close(done)
-		defer func() {
-			// 增加panic恢复处理
-			if r := recover(); r != nil {
-				if common2.DebugEnabled {
-					println("SSE ping goroutine panic recovered:", fmt.Sprintf("%v", r))
-				}
-			}
-			if common2.DebugEnabled {
-				println("SSE ping goroutine stopped.")
-			}
-		}()
-
-		if pingInterval <= 0 {
-			pingInterval = helper.DefaultPingInterval
-		}
-
-		ticker := time.NewTicker(pingInterval)
-		// 确保在任何情况下都清理ticker
-		defer func() {
-			ticker.Stop()
-			if common2.DebugEnabled {
-				println("SSE ping ticker stopped")
-			}
-		}()
-
-		var pingMutex sync.Mutex
-		if common2.DebugEnabled {
-			println("SSE ping goroutine started")
-		}
-
-		// 增加超时控制，防止goroutine长时间运行
-		maxPingDuration := 120 * time.Minute // 最大ping持续时间
-		pingTimeout := time.NewTimer(maxPingDuration)
-		defer pingTimeout.Stop()
-
-		for {
-			select {
-			// 发送 ping 数据
-			case <-ticker.C:
-				if err := sendPingData(c, &pingMutex); err != nil {
-					if common2.DebugEnabled {
-						println("SSE ping error, stopping goroutine:", err.Error())
-					}
-					return
-				}
-			// 收到退出信号
-			case <-pingerCtx.Done():
-				return
-			// request 结束
-			case <-c.Request.Context().Done():
-				return
-			// 超时保护，防止goroutine无限运行
-			case <-pingTimeout.C:
-				if common2.DebugEnabled {
-					println("SSE ping goroutine timeout, stopping")
-				}
-				return
-			}
-		}
-	})
-
-	return stopPinger, done
-}
-
-func sendPingData(c *gin.Context, mutex *sync.Mutex) error {
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	// Bound the write so a slow client cannot block this goroutine forever;
-	// doRequest's defer waits for the pinger to exit before returning.
-	helper.ExtendWriteDeadline(c)
-	err := helper.PingData(c)
-	if err != nil {
-		logger.LogError(c, "SSE ping error: "+err.Error())
-		return err
+// DialWebSocketContext binds an established socket to the original request
+// context in addition to using that context for DNS, TCP, and the HTTP upgrade.
+// The close watcher must use the original ctx rather than NetDialContext's
+// argument: gorilla derives a handshake-only child context and cancels it after
+// a successful upgrade, which would immediately close the healthy websocket.
+func DialWebSocketContext(ctx context.Context, requestURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	websocketDialer := *websocket.DefaultDialer
+	baseDialContext := websocketDialer.NetDialContext
+	if baseDialContext == nil {
+		baseDialContext = (&net.Dialer{}).DialContext
 	}
-
-	logger.LogDebug(c, "SSE ping data sent")
-	return nil
+	requestContext := ctx
+	websocketDialer.NetDialContext = func(dialContext context.Context, network, address string) (net.Conn, error) {
+		conn, dialErr := baseDialContext(dialContext, network, address)
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		// Bind to the original request context, not gorilla's temporary
+		// handshake child context. This interrupts a stalled upgrade and keeps a
+		// successfully upgraded connection alive until the request is canceled.
+		context.AfterFunc(requestContext, func() {
+			_ = conn.Close()
+		})
+		return conn, nil
+	}
+	conn, resp, err := websocketDialer.DialContext(ctx, requestURL, header)
+	return conn, resp, err
 }
 
 func DoRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	return doRequest(c, req, info)
 }
+
+const statusClientClosedRequest = 499
+
+// ClassifyDoRequestError distinguishes an inbound cancellation/deadline from
+// an upstream transport failure. Client-owned cancellation must never be
+// retried or used to disable a healthy channel.
+func ClassifyDoRequestError(c *gin.Context, err error) *types.NewAPIError {
+	return classifyDoRequestError(c, err, false)
+}
+
+type contextCancelReadCloser struct {
+	io.ReadCloser
+	cancel      context.CancelFunc
+	stopInbound func() bool
+	once        sync.Once
+	closeErr    error
+}
+
+func (r *contextCancelReadCloser) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.once.Do(func() {
+		if r.stopInbound != nil {
+			r.stopInbound()
+		}
+		if r.cancel != nil {
+			r.cancel()
+		}
+		if r.ReadCloser != nil {
+			r.closeErr = r.ReadCloser.Close()
+		}
+	})
+	return r.closeErr
+}
+
+func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bool) *types.NewAPIError {
+	if c != nil && c.Request != nil {
+		switch requestErr := c.Request.Context().Err(); {
+		case errors.Is(requestErr, context.Canceled):
+			return types.NewErrorWithStatusCode(
+				errors.New("request canceled by client"),
+				types.ErrorCodeDoRequestFailed,
+				statusClientClosedRequest,
+				types.ErrOptionWithSkipRetry(),
+			)
+		case errors.Is(requestErr, context.DeadlineExceeded):
+			return types.NewErrorWithStatusCode(
+				errors.New("request deadline exceeded"),
+				types.ErrorCodeDoRequestFailed,
+				http.StatusGatewayTimeout,
+				types.ErrOptionWithSkipRetry(),
+			)
+		}
+	}
+
+	options := []types.NewAPIErrorOptions{
+		types.ErrOptionWithHideErrMsg("upstream error: do request failed"),
+	}
+	if requestMayHaveBeenSent {
+		// Once any request write has completed or failed part-way through, a
+		// timeout or connection error cannot prove that the provider rejected the
+		// request. Retrying could duplicate a generation, task, tool call, or bill.
+		options = append(options, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+			return types.NewErrorWithStatusCode(
+				errors.New("upstream response headers timed out before the first valid event"),
+				types.ErrorCodeUpstreamFirstEventTimeout,
+				http.StatusGatewayTimeout,
+				options...,
+			)
+		}
+	}
+	return types.NewError(err, types.ErrorCodeDoRequestFailed, options...)
+}
+
+func firstValidEventBudgetError(requestMayHaveBeenSent bool) *types.NewAPIError {
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if requestMayHaveBeenSent {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("request-wide first valid event budget exhausted"),
+		types.ErrorCodeUpstreamFirstEventTimeout,
+		http.StatusGatewayTimeout,
+		options...,
+	)
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	// Some provider adaptors build requests with their own timeout context before
+	// delegating here. Preserve that deadline/value context while also binding it
+	// to the inbound client lifetime. The combined context stays alive until the
+	// response body is closed; canceling it on return from client.Do would truncate
+	// every stream immediately after response headers.
+	var combinedCancel context.CancelFunc
+	var stopInbound func() bool
+	if req != nil && c != nil && c.Request != nil {
+		// Carry the validated edge request ID through NewAPI and compatible
+		// upstream relays (notably CPA) without overwriting an adaptor-provided
+		// value. Providers that do not use this private X- header ignore it.
+		if requestID := c.GetString(common2.RequestIdKey); requestID != "" && req.Header.Get(common2.RequestIdKey) == "" {
+			req.Header.Set(common2.RequestIdKey, requestID)
+		}
+		combinedCtx, cancel := context.WithCancel(req.Context())
+		combinedCancel = cancel
+		stopInbound = context.AfterFunc(c.Request.Context(), cancel)
+		req = req.WithContext(combinedCtx)
+	}
+
 	var client *http.Client
 	var err error
 	if info.ChannelSetting.Proxy != "" {
@@ -494,45 +569,130 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		client = service.GetHttpClient()
 	}
 
-	var stopPinger context.CancelFunc
-	var pingerDone <-chan struct{}
-	if info.IsStream {
-		helper.SetEventStreamHeaders(c)
-		// 处理流式请求的 ping 保活
-		generalSettings := operation_setting.GetGeneralSetting()
-		if generalSettings.PingIntervalEnabled && !info.DisablePing {
-			pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
-			stopPinger, pingerDone = startPingKeepAlive(c, pingInterval)
-			// 使用defer确保在任何情况下都能停止ping goroutine
-			defer func() {
-				if stopPinger != nil {
-					stopPinger()
-					<-pingerDone
-					if common2.DebugEnabled {
-						println("SSE ping goroutine stopped by defer")
-					}
-					logger.LogDebug(c, "SSE ping goroutine stopped by defer")
+	// Do not set downstream SSE headers or write heartbeat bytes before the
+	// upstream produces a valid event. Either action can commit a downstream 200
+	// and hide an upstream first-event timeout from the controller.
+
+	var requestMayHaveBeenSent atomic.Bool
+	unsafeToReplay := !isReplaySafeMethod(req.Method)
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			requestMayHaveBeenSent.Store(true)
+			if unsafeToReplay {
+				info.MarkUpstreamRequestMayHaveBeenAccepted()
+			}
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
+	// The absolute pre-output budget is implemented with a stoppable cancel
+	// timer rather than a Context deadline. Once response headers arrive the
+	// timer is disarmed, allowing a healthy SSE body to continue indefinitely;
+	// the scanner then uses the same deadline only until its first valid event.
+	var budgetState atomic.Uint32 // 0=armed, 1=disarmed, 2=expired
+	var budgetTimer *time.Timer
+	if combinedCancel != nil {
+		if remaining, limited := info.RemainingFirstValidEventBudget(); limited {
+			if remaining <= 0 {
+				if stopInbound != nil {
+					stopInbound()
 				}
-			}()
+				combinedCancel()
+				return nil, firstValidEventBudgetError(false)
+			}
+			budgetTimer = time.AfterFunc(remaining, func() {
+				if budgetState.CompareAndSwap(0, 2) {
+					combinedCancel()
+				}
+			})
 		}
 	}
 
 	resp, err := client.Do(req)
+	if budgetTimer != nil {
+		budgetState.CompareAndSwap(0, 1)
+		budgetTimer.Stop()
+	}
+	requestReachedUpstream := requestMayHaveBeenSent.Load() || resp != nil
+	unsafeRequestReachedUpstream := unsafeToReplay && requestReachedUpstream
+	if unsafeRequestReachedUpstream {
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+	}
 	if err != nil {
-		logger.LogError(c, "do request failed: "+err.Error())
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed, types.ErrOptionWithHideErrMsg("upstream error: do request failed"))
+		if stopInbound != nil {
+			stopInbound()
+		}
+		if combinedCancel != nil {
+			combinedCancel()
+		}
+		if budgetState.Load() == 2 && (c == nil || c.Request == nil || c.Request.Context().Err() == nil) {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, firstValidEventBudgetError(unsafeRequestReachedUpstream)
+		}
+		classifiedErr := classifyDoRequestError(c, err, unsafeRequestReachedUpstream)
+		if !types.IsSkipRetryError(classifiedErr) {
+			logger.LogError(c, "do request failed: "+err.Error())
+		}
+		return nil, classifiedErr
 	}
 	if resp == nil {
+		if stopInbound != nil {
+			stopInbound()
+		}
+		if combinedCancel != nil {
+			combinedCancel()
+		}
 		return nil, errors.New("resp is nil")
+	}
+	if budgetState.Load() == 2 {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if stopInbound != nil {
+			stopInbound()
+		}
+		if combinedCancel != nil {
+			combinedCancel()
+		}
+		return nil, firstValidEventBudgetError(unsafeRequestReachedUpstream)
+	}
+	if combinedCancel != nil {
+		if resp.Body == nil {
+			if stopInbound != nil {
+				stopInbound()
+			}
+			combinedCancel()
+		} else {
+			resp.Body = &contextCancelReadCloser{
+				ReadCloser:  resp.Body,
+				cancel:      combinedCancel,
+				stopInbound: stopInbound,
+			}
+		}
 	}
 
 	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
 		c.Set(common2.UpstreamRequestIdKey, upID)
 	}
 
-	_ = req.Body.Close()
-	_ = c.Request.Body.Close()
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	if c != nil && c.Request != nil && c.Request.Body != nil {
+		_ = c.Request.Body.Close()
+	}
 	return resp, nil
+}
+
+func isReplaySafeMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
@@ -540,14 +700,10 @@ func DoTaskApiRequest(a TaskAdaptor, c *gin.Context, info *common.RelayInfo, req
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(c.Request.Method, fullRequestURL, requestBody)
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, fullRequestURL, requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
-	req.GetBody = func() (io.ReadCloser, error) {
-		return io.NopCloser(requestBody), nil
-	}
-
 	err = a.BuildRequestHeader(c, req, info)
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)

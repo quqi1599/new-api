@@ -1,7 +1,6 @@
 package tencent
 
 import (
-	"bufio"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -82,8 +81,18 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 	if len(TencentResponse.Choices) > 0 {
 		var choice dto.ChatCompletionsStreamResponseChoice
 		choice.Delta.SetContentString(TencentResponse.Choices[0].Delta.Content)
-		if TencentResponse.Choices[0].FinishReason == "stop" {
+		switch TencentResponse.Choices[0].FinishReason {
+		case "stop":
 			choice.FinishReason = &constant.FinishReasonStop
+		case "tool_calls":
+			choice.FinishReason = &constant.FinishReasonToolCalls
+		case "sensitive":
+			choice.FinishReason = &constant.FinishReasonContentFilter
+		case "":
+			// A non-terminal incremental frame has no finish reason.
+		default:
+			finishReason := TencentResponse.Choices[0].FinishReason
+			choice.FinishReason = &finishReason
 		}
 		response.Choices = append(response.Choices, choice)
 	}
@@ -91,24 +100,32 @@ func streamResponseTencent2OpenAI(TencentResponse *TencentChatResponse) *dto.Cha
 }
 
 func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
+
 	var responseText string
-	scanner := helper.NewStreamScanner(resp.Body)
-	scanner.Split(bufio.ScanLines)
+	usage := &dto.Usage{}
 
-	helper.SetEventStreamHeaders(c)
-
-	for scanner.Scan() {
-		data := scanner.Text()
-		if len(data) < 5 || !strings.HasPrefix(data, "data:") {
-			continue
-		}
-		data = strings.TrimPrefix(data, "data:")
-
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		var tencentResponse TencentChatResponse
-		err := common.Unmarshal([]byte(data), &tencentResponse)
-		if err != nil {
+		if err := common.Unmarshal([]byte(data), &tencentResponse); err != nil {
 			common.SysLog("error unmarshalling stream response: " + err.Error())
-			continue
+			sr.Stop(err)
+			return
+		}
+		if tencentResponse.Error.Code != 0 {
+			err := fmt.Errorf("tencent stream error %d: %s", tencentResponse.Error.Code, tencentResponse.Error.Message)
+			common.SysLog(err.Error())
+			sr.Stop(err)
+			return
+		}
+		if len(tencentResponse.Choices) == 0 {
+			err := errors.New("invalid Tencent stream event: missing choices")
+			common.SysLog(err.Error())
+			sr.Stop(err)
+			return
+		}
+		if !sr.Accept() {
+			return
 		}
 
 		response := streamResponseTencent2OpenAI(&tencentResponse)
@@ -116,21 +133,35 @@ func tencentStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *htt
 			responseText += response.Choices[0].Delta.GetContentString()
 		}
 
-		err = helper.ObjectData(c, response)
-		if err != nil {
-			common.SysLog(err.Error())
+		if tencentResponse.Usage.TotalTokens != 0 || tencentResponse.Usage.PromptTokens != 0 || tencentResponse.Usage.CompletionTokens != 0 {
+			usage.PromptTokens = tencentResponse.Usage.PromptTokens
+			usage.CompletionTokens = tencentResponse.Usage.CompletionTokens
+			usage.TotalTokens = tencentResponse.Usage.TotalTokens
 		}
+
+		if err := helper.ObjectData(c, response); err != nil {
+			common.SysLog(err.Error())
+			sr.Stop(err)
+			return
+		}
+
+		if len(tencentResponse.Choices) > 0 && tencentResponse.Choices[0].FinishReason != "" {
+			sr.Done()
+		}
+	})
+
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
 	}
 
-	if err := scanner.Err(); err != nil {
-		common.SysLog("error reading stream: " + err.Error())
+	if usage.TotalTokens == 0 && usage.PromptTokens == 0 && usage.CompletionTokens == 0 {
+		usage = service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens())
+	}
+	if helper.ShouldFinalizeStream(info) {
+		helper.Done(c)
 	}
 
-	helper.Done(c)
-
-	service.CloseResponseBodyGracefully(resp)
-
-	return service.ResponseText2Usage(c, responseText, info.UpstreamModelName, info.GetEstimatePromptTokens()), nil
+	return usage, nil
 }
 
 func tencentHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {

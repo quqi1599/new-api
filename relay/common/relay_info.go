@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -157,6 +158,16 @@ type RelayInfo struct {
 	// in a type-erased reader, so net/http can still send Content-Length.
 	UpstreamRequestBodySize int64
 
+	// upstreamRequestMayHaveBeenAccepted closes the replay gate for unsafe
+	// requests. net/http can invoke ClientTrace callbacks from transport
+	// goroutines, so the marker must be concurrency-safe.
+	upstreamRequestMayHaveBeenAccepted atomic.Bool
+
+	// firstValidEventDeadline is the request-scoped pre-output budget shared by
+	// every channel attempt. It is deliberately not a request Context deadline:
+	// after the first valid event a healthy SSE body may outlive this instant.
+	firstValidEventDeadline time.Time
+
 	PriceData types.PriceData
 
 	// QuotaClamp is set (non-nil) when a quota conversion saturated at the
@@ -187,6 +198,51 @@ type RelayInfo struct {
 	*ResponsesUsageInfo
 	*ChannelMeta
 	*TaskRelayInfo
+}
+
+// MarkUpstreamRequestMayHaveBeenAccepted records that a non-idempotent
+// upstream operation crossed the point where NewAPI can no longer prove it was
+// rejected. Retrying could duplicate generation, tools, tasks, or billing.
+func (info *RelayInfo) MarkUpstreamRequestMayHaveBeenAccepted() {
+	if info != nil {
+		info.upstreamRequestMayHaveBeenAccepted.Store(true)
+	}
+}
+
+func (info *RelayInfo) UpstreamRequestMayHaveBeenAccepted() bool {
+	return info != nil && info.upstreamRequestMayHaveBeenAccepted.Load()
+}
+
+func (info *RelayInfo) SetFirstValidEventDeadline(deadline time.Time) {
+	if info != nil {
+		info.firstValidEventDeadline = deadline
+	}
+}
+
+// RemainingFirstValidEventBudget returns the request-wide time remaining until
+// the first valid upstream event. A false limited value keeps compatibility for
+// synthetic/test RelayInfo instances that have no deadline configured.
+func (info *RelayInfo) RemainingFirstValidEventBudget() (remaining time.Duration, limited bool) {
+	if info == nil || info.firstValidEventDeadline.IsZero() {
+		return 0, false
+	}
+	return time.Until(info.firstValidEventDeadline), true
+}
+
+// BoundFirstValidEventWait applies the smaller of a phase-local timeout and the
+// request-wide remaining budget. A non-positive result should fire immediately.
+func (info *RelayInfo) BoundFirstValidEventWait(phaseTimeout time.Duration) time.Duration {
+	remaining, limited := info.RemainingFirstValidEventBudget()
+	if !limited {
+		return phaseTimeout
+	}
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	if phaseTimeout <= 0 || remaining < phaseTimeout {
+		return remaining
+	}
+	return phaseTimeout
 }
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
@@ -494,6 +550,9 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 			//promptTokens: common.GetContextKeyInt(c, constant.ContextKeyPromptTokens),
 			estimatePromptTokens: common.GetContextKeyInt(c, constant.ContextKeyEstimatedTokens),
 		},
+	}
+	if isStream && common.RelayFirstEventTotalTimeout > 0 {
+		info.SetFirstValidEventDeadline(startTime.Add(time.Duration(common.RelayFirstEventTotalTimeout) * time.Second))
 	}
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {

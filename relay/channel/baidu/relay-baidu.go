@@ -1,6 +1,7 @@
 package baidu
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,6 +124,13 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			sr.Error(err)
 			return
 		}
+		if baiduResponse.ErrorCode != 0 || baiduResponse.ErrorMsg != "" {
+			sr.Stop(fmt.Errorf("baidu stream error: code=%d", baiduResponse.ErrorCode))
+			return
+		}
+		if !sr.Accept() {
+			return
+		}
 		if baiduResponse.Usage.TotalTokens != 0 {
 			usage.TotalTokens = baiduResponse.Usage.TotalTokens
 			usage.PromptTokens = baiduResponse.Usage.PromptTokens
@@ -133,8 +141,14 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 			common.SysLog("error sending stream response: " + err.Error())
 			sr.Error(err)
 		}
+		if baiduResponse.IsEnd {
+			sr.Done()
+		}
 	})
 	service.CloseResponseBodyGracefully(resp)
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return streamErr, nil
+	}
 	return nil, usage
 }
 
@@ -188,20 +202,20 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	return nil, &fullTextResponse.Usage
 }
 
-func getBaiduAccessToken(apiKey string) (string, error) {
+func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
 	if val, ok := baiduTokenStore.Load(apiKey); ok {
 		var accessToken BaiduAccessToken
 		if accessToken, ok = val.(BaiduAccessToken); ok {
 			// soon this will expire
 			if time.Now().Add(time.Hour).After(accessToken.ExpiresAt) {
 				go func() {
-					_, _ = getBaiduAccessTokenHelper(apiKey)
+					_, _ = getBaiduAccessTokenHelper(context.Background(), apiKey)
 				}()
 			}
 			return accessToken.AccessToken, nil
 		}
 	}
-	accessToken, err := getBaiduAccessTokenHelper(apiKey)
+	accessToken, err := getBaiduAccessTokenHelper(ctx, apiKey)
 	if err != nil {
 		return "", err
 	}
@@ -211,12 +225,12 @@ func getBaiduAccessToken(apiKey string) (string, error) {
 	return (*accessToken).AccessToken, nil
 }
 
-func getBaiduAccessTokenHelper(apiKey string) (*BaiduAccessToken, error) {
+func getBaiduAccessTokenHelper(ctx context.Context, apiKey string) (*BaiduAccessToken, error) {
 	parts := strings.Split(apiKey, "|")
 	if len(parts) != 2 {
 		return nil, errors.New("invalid baidu apikey")
 	}
-	req, err := http.NewRequest("POST", fmt.Sprintf("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s",
+	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s",
 		parts[0], parts[1]), nil)
 	if err != nil {
 		return nil, err

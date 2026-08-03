@@ -19,6 +19,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -28,6 +29,20 @@ type TaskSubmitResult struct {
 	Platform       constant.TaskPlatform
 	Quota          int
 	//PerCallPrice   types.PriceData
+}
+
+func taskErrorFromDoRequest(err error) *dto.TaskError {
+	var apiErr *types.NewAPIError
+	if errors.As(err, &apiErr) && types.IsSkipRetryError(apiErr) {
+		taskErr := service.TaskErrorFromAPIError(apiErr)
+		taskErr.SkipRetry = true
+		// Client cancellation/deadline is local and must not affect channel
+		// health. Post-write upstream failures also stop replay, but remain
+		// eligible for health accounting.
+		taskErr.LocalError = !types.IsChannelPenaltyAllowed(apiErr)
+		return taskErr
+	}
+	return service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
 }
 
 // ResolveOriginTask 处理基于已有任务的提交（remix / continuation）：
@@ -219,7 +234,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 	// 9. 发送请求
 	resp, err := adaptor.DoRequest(c, info, requestBody)
 	if err != nil {
-		return nil, service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
+		return nil, taskErrorFromDoRequest(err)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
 		responseBody, _ := io.ReadAll(resp.Body)

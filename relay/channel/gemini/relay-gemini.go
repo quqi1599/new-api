@@ -1281,9 +1281,18 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 			sr.Stop(fmt.Errorf("unmarshal: %w", err))
 			return
 		}
+		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback == nil && geminiResponse.UsageMetadata.TotalTokenCount == 0 {
+			sr.Error(fmt.Errorf("empty gemini stream event"))
+			return
+		}
 
 		if len(geminiResponse.Candidates) == 0 && geminiResponse.PromptFeedback != nil && geminiResponse.PromptFeedback.BlockReason != nil {
 			common.SetContextKey(c, constant.ContextKeyAdminRejectReason, fmt.Sprintf("gemini_block_reason=%s", *geminiResponse.PromptFeedback.BlockReason))
+			sr.Stop(fmt.Errorf("gemini prompt blocked: %s", *geminiResponse.PromptFeedback.BlockReason))
+			return
+		}
+		if !sr.Accept() {
+			return
 		}
 
 		// 统计图片数量
@@ -1306,8 +1315,18 @@ func geminiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 
 		if !callback(data, &geminiResponse) {
 			sr.Stop(fmt.Errorf("gemini callback stopped"))
+			return
+		}
+		for _, candidate := range geminiResponse.Candidates {
+			if candidate.FinishReason != nil && *candidate.FinishReason != "" {
+				sr.Done()
+				return
+			}
 		}
 	})
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
+	}
 
 	if imageCount != 0 {
 		if usage.CompletionTokens == 0 {
@@ -1416,6 +1435,9 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 
 	if err != nil {
 		return usage, err
+	}
+	if !helper.ShouldFinalizeStream(info) {
+		return usage, nil
 	}
 
 	response := helper.GenerateFinalUsageResponse(id, createAt, info.UpstreamModelName, *usage)

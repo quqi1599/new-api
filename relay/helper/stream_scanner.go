@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -15,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
 
@@ -38,7 +40,7 @@ func NormalizeSSEPayload(data string) (payload string, done bool) {
 	for strings.HasPrefix(payload, "data:") {
 		payload = strings.TrimSpace(payload[len("data:"):])
 	}
-	if strings.HasPrefix(payload, "[DONE]") {
+	if payload == "[DONE]" {
 		return "[DONE]", true
 	}
 	return payload, false
@@ -58,11 +60,135 @@ func getStreamingTimeout() time.Duration {
 	return DefaultStreamingTimeout
 }
 
+func getFirstEventTimeout() time.Duration {
+	if constant.RelayFirstEventTimeout > 0 {
+		return time.Duration(constant.RelayFirstEventTimeout) * time.Second
+	}
+	return getStreamingTimeout()
+}
+
+// StreamFirstEventTimeout exposes the shared first-valid-event budget to
+// streaming adapters that do not use the line-oriented SSE scanner (for
+// example AWS Bedrock's SDK event stream).
+func StreamFirstEventTimeout() time.Duration {
+	return getFirstEventTimeout()
+}
+
+// StreamIdleTimeout exposes the shared inter-event idle budget to non-SSE
+// streaming adapters.
+func StreamIdleTimeout() time.Duration {
+	return getStreamingTimeout()
+}
+
+// PreOutputStreamError converts a stream that failed before its first valid
+// event into a controller-visible error. Callers must check this immediately
+// after StreamScannerHandler and before synthesizing usage, stop chunks, or
+// [DONE]. It is non-retryable because upstream response headers prove the
+// request may already have been accepted and replay could duplicate work.
+func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil || info.StreamStatus == nil {
+		return nil
+	}
+	if info.ReceivedResponseCount != 0 && (c == nil || c.Writer == nil || c.Writer.Written() || info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone) {
+		return nil
+	}
+
+	statusCode := http.StatusBadGateway
+	errorCode := types.ErrorCodeUpstreamStreamIncomplete
+	message := "upstream stream ended before the first valid event"
+	allowChannelPenalty := true
+
+	switch info.StreamStatus.EndReason {
+	case relaycommon.StreamEndReasonFirstEventTimeout:
+		statusCode = http.StatusGatewayTimeout
+		errorCode = types.ErrorCodeUpstreamFirstEventTimeout
+		message = "upstream returned headers but no valid stream event before the first-event timeout"
+	case relaycommon.StreamEndReasonScannerErr:
+		message = "upstream stream failed before the first valid event"
+	case relaycommon.StreamEndReasonEOF:
+		message = "upstream stream closed without a valid event or terminal marker"
+	case relaycommon.StreamEndReasonPanic:
+		statusCode = http.StatusInternalServerError
+		message = "stream processing failed before the first valid event"
+	case relaycommon.StreamEndReasonHandlerStop:
+		message = "upstream stream was rejected before a valid response could be delivered"
+	case relaycommon.StreamEndReasonTimeout:
+		statusCode = http.StatusGatewayTimeout
+		message = "upstream stream became idle before a terminal event"
+	case relaycommon.StreamEndReasonPingFail:
+		message = "downstream stream heartbeat failed before a response could be delivered"
+	case relaycommon.StreamEndReasonClientGone:
+		statusCode = 499
+		message = "request canceled by client before the first valid event"
+		allowChannelPenalty = false
+	case relaycommon.StreamEndReasonDone:
+		// An intentionally empty response is valid only with an explicit marker.
+		return nil
+	default:
+		return nil
+	}
+
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if allowChannelPenalty {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(fmt.Errorf("%s", message), errorCode, statusCode, options...)
+}
+
+// ShouldFinalizeStream prevents adapters from manufacturing a successful
+// terminal chunk after a timeout, cancellation, scanner failure, ping failure,
+// panic, handler error, or clean EOF without the adapter's protocol-specific
+// terminal frame.
+func ShouldFinalizeStream(info *relaycommon.RelayInfo) bool {
+	if info == nil || info.StreamStatus == nil {
+		return true
+	}
+	switch info.StreamStatus.EndReason {
+	case relaycommon.StreamEndReasonDone:
+		return true
+	default:
+		return false
+	}
+}
+
 func NewStreamScanner(reader io.Reader) *bufio.Scanner {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, InitialScannerBufferSize), getScannerBufferSize())
 	return scanner
 }
+
+// StreamFrame is a protocol-neutral unit emitted by a line decoder. Data is
+// the payload consumed by the provider adapter; Kind/Event preserve protocol
+// metadata for NDJSON and event-aware SSE variants.
+type StreamFrame struct {
+	Kind  string
+	Event string
+	Data  string
+}
+
+// StreamLineDecoder turns physical lines into zero or more logical protocol
+// frames. Flush is called after a clean scanner EOF so event-aware decoders can
+// emit a final frame that is not followed by a blank line.
+type StreamLineDecoder interface {
+	Feed(line string) ([]StreamFrame, error)
+	Flush() ([]StreamFrame, error)
+}
+
+type sseDataLineDecoder struct{}
+
+func (sseDataLineDecoder) Feed(line string) ([]StreamFrame, error) {
+	trimmedLine := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmedLine, "data:") && !strings.HasPrefix(trimmedLine, "[DONE]") {
+		return nil, nil
+	}
+	payload, _ := NormalizeSSEPayload(trimmedLine)
+	if payload == "" {
+		return nil, nil
+	}
+	return []StreamFrame{{Kind: "data", Data: payload}}, nil
+}
+
+func (sseDataLineDecoder) Flush() ([]StreamFrame, error) { return nil, nil }
 
 // ExtendWriteDeadline pushes the connection write deadline forward before each
 // stream write. Best-effort: writers that don't support deadlines (e.g.
@@ -75,8 +201,20 @@ func ExtendWriteDeadline(c *gin.Context) {
 }
 
 func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, dataHandler func(data string, sr *StreamResult)) {
+	if dataHandler == nil {
+		return
+	}
+	StreamScannerHandlerWithDecoder(c, resp, info, sseDataLineDecoder{}, func(frame StreamFrame, sr *StreamResult) {
+		dataHandler(frame.Data, sr)
+	})
+}
 
-	if resp == nil || dataHandler == nil {
+// StreamScannerHandlerWithDecoder applies the same cancellation, first-event,
+// idle-timeout, heartbeat, write-serialization, and cleanup state machine to
+// protocols that are not plain data-only SSE (for example NDJSON or SSE event
+// records). Only frames explicitly accepted by the adapter advance timers.
+func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, decoder StreamLineDecoder, dataHandler func(frame StreamFrame, sr *StreamResult)) {
+	if resp == nil || decoder == nil || dataHandler == nil {
 		return
 	}
 	if resp.Body == nil {
@@ -87,19 +225,23 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	info.StreamStatus = relaycommon.NewStreamStatus()
 	info.StreamStatus.CopyErrorsFrom(previousStreamStatus)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(c.Request.Context())
 
 	streamingTimeout := getStreamingTimeout()
+	firstEventTimeout := info.BoundFirstValidEventWait(getFirstEventTimeout())
 
 	var (
-		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
-		scanner     = NewStreamScanner(resp.Body)
-		ticker      = time.NewTicker(streamingTimeout)
-		pingTicker  *time.Ticker
-		writeMutex  sync.Mutex     // Mutex to protect concurrent writes
-		wg          sync.WaitGroup // 用于等待所有 goroutine 退出
-		cleanupOnce sync.Once
-		stopOnce    sync.Once
+		stopChan            = make(chan bool, 3) // 增加缓冲区避免阻塞
+		scanner             = NewStreamScanner(resp.Body)
+		streamTimer         = time.NewTimer(firstEventTimeout)
+		writeMutex          sync.Mutex     // Mutex to protect concurrent writes
+		wg                  sync.WaitGroup // 用于等待所有 goroutine 退出
+		cleanupOnce         sync.Once
+		stopOnce            sync.Once
+		firstEventReady     = make(chan struct{})
+		firstEventReadyOnce sync.Once
+		firstEventSeen      atomic.Bool
+		acceptedEvent       = make(chan struct{}, 1)
 	)
 
 	stop := func() {
@@ -116,16 +258,13 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		pingInterval = DefaultPingInterval
 	}
 
-	if pingEnabled {
-		pingTicker = time.NewTicker(pingInterval)
-	}
-
 	if common.DebugEnabled {
 		// print timeout and ping interval for debugging
 		println("relay timeout seconds:", common.RelayTimeout)
 		println("relay max idle conns:", common.RelayMaxIdleConns)
 		println("relay max idle conns per host:", common.RelayMaxIdleConnsPerHost)
 		println("streaming timeout seconds:", int64(streamingTimeout.Seconds()))
+		println("first event timeout seconds:", int64(firstEventTimeout.Seconds()))
 		println("ping interval seconds:", int64(pingInterval.Seconds()))
 	}
 
@@ -137,11 +276,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				_ = resp.Body.Close()
 			}
 
-			ticker.Stop()
-			if pingTicker != nil {
-				pingTicker.Stop()
-			}
-
+			streamTimer.Stop()
 			wg.Wait()
 		})
 	}
@@ -149,10 +284,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	defer cleanup()
 
 	scanner.Split(bufio.ScanLines)
-	SetEventStreamHeaders(c)
 
 	// Handle ping data sending with improved error handling
-	if pingEnabled && pingTicker != nil {
+	if pingEnabled {
 		wg.Add(1)
 		gopool.Go(func() {
 			defer func() {
@@ -165,10 +299,22 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				wg.Done()
 			}()
 
-			// 添加超时保护，防止 goroutine 无限运行
-			maxPingDuration := 30 * time.Minute // 最大 ping 持续时间
-			pingTimeout := time.NewTimer(maxPingDuration)
-			defer pingTimeout.Stop()
+			// Do not emit a gateway-generated heartbeat before the first valid
+			// upstream data event. A pre-event ping would commit a downstream 200
+			// response and make a subsequent first-event timeout impossible to
+			// surface as a normal relay error/retry decision.
+			select {
+			case <-firstEventReady:
+			case <-ctx.Done():
+				return
+			case <-stopChan:
+				return
+			case <-c.Request.Context().Done():
+				return
+			}
+
+			pingTicker := time.NewTicker(pingInterval)
+			defer pingTicker.Stop()
 
 			for {
 				select {
@@ -183,6 +329,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					if err != nil {
 						logger.LogError(c, "ping data error: "+err.Error())
 						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPingFail, err)
+						stop()
 						return
 					}
 					logger.LogDebug(c, "ping data sent")
@@ -193,15 +340,37 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 				case <-c.Request.Context().Done():
 					// 监听客户端断开连接
 					return
-				case <-pingTimeout.C:
-					logger.LogError(c, "ping goroutine max duration reached")
-					return
 				}
 			}
 		})
 	}
 
-	dataChan := make(chan string, 10)
+	dataChan := make(chan StreamFrame, 10)
+	scannerEndReason := relaycommon.StreamEndReasonEOF
+	var scannerEndErr error
+
+	markAccepted := func() bool {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-stopChan:
+			return false
+		default:
+		}
+
+		if firstEventSeen.CompareAndSwap(false, true) {
+			info.SetFirstResponseTime()
+			firstEventReadyOnce.Do(func() {
+				close(firstEventReady)
+			})
+		}
+		info.ReceivedResponseCount++
+		select {
+		case acceptedEvent <- struct{}{}:
+		default:
+		}
+		return true
+	}
 
 	wg.Add(1)
 	gopool.Go(func() {
@@ -213,14 +382,25 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			stop()
 			wg.Done()
 		}()
-		sr := newStreamResult(info.StreamStatus)
-		for data := range dataChan {
+		sr := newStreamResult(info.StreamStatus, markAccepted)
+		for {
+			var frame StreamFrame
+			var ok bool
+			select {
+			case <-ctx.Done():
+				return
+			case frame, ok = <-dataChan:
+				if !ok {
+					info.StreamStatus.SetEndReason(scannerEndReason, scannerEndErr)
+					return
+				}
+			}
 			sr.reset()
 			func() {
 				writeMutex.Lock()
 				defer writeMutex.Unlock()
 				ExtendWriteDeadline(c)
-				dataHandler(data, sr)
+				dataHandler(frame, sr)
 			}()
 			if sr.IsStopped() {
 				return
@@ -232,15 +412,31 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	wg.Add(1)
 	common.RelayCtxGo(ctx, func() {
 		defer func() {
-			close(dataChan)
 			if r := recover(); r != nil {
 				logger.LogError(c, fmt.Sprintf("scanner goroutine panic: %v", r))
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("scanner panic: %v", r))
+				scannerEndReason = relaycommon.StreamEndReasonPanic
+				scannerEndErr = fmt.Errorf("scanner panic: %v", r)
 			}
-			stop()
+			close(dataChan)
 			logger.LogDebug(c, "scanner goroutine exited")
 			wg.Done()
 		}()
+
+		emitFrames := func(frames []StreamFrame) bool {
+			for _, frame := range frames {
+				select {
+				case dataChan <- frame:
+				case <-ctx.Done():
+					if err := c.Request.Context().Err(); err != nil {
+						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+					}
+					return false
+				case <-stopChan:
+					return false
+				}
+			}
+			return true
+		}
 
 		for scanner.Scan() {
 			// 检查是否需要停止
@@ -248,66 +444,101 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 			case <-stopChan:
 				return
 			case <-ctx.Done():
+				if err := c.Request.Context().Err(); err != nil {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+				}
 				return
 			default:
 			}
 
-			ticker.Reset(streamingTimeout)
-			data := scanner.Text()
+			line := scanner.Text()
 			if common.DebugEnabled {
-				println(data)
+				println(line)
 			}
-
-			trimmedLine := strings.TrimSpace(data)
-			if !strings.HasPrefix(trimmedLine, "data:") && !strings.HasPrefix(trimmedLine, "[DONE]") {
-				continue
-			}
-			data, done := NormalizeSSEPayload(trimmedLine)
-			if done {
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
-				if common.DebugEnabled {
-					println("received [DONE], stopping scanner")
-				}
+			frames, decodeErr := decoder.Feed(line)
+			if decodeErr != nil {
+				scannerEndReason = relaycommon.StreamEndReasonHandlerStop
+				scannerEndErr = decodeErr
 				return
 			}
-			if data == "" {
-				continue
-			}
-
-			info.SetFirstResponseTime()
-			info.ReceivedResponseCount++
-
-			select {
-			case dataChan <- data:
-			case <-ctx.Done():
-				return
-			case <-stopChan:
+			if !emitFrames(frames) {
 				return
 			}
 		}
 
 		if err := scanner.Err(); err != nil {
 			if err != io.EOF {
-				if isExpectedStreamCloseError(err) && (info.StreamStatus.IsAbortLikeEnd() || ctx.Err() != nil) {
+				if isExpectedStreamCloseError(err) && ctx.Err() != nil {
 					return
 				}
 				logger.LogError(c, "scanner error: "+err.Error())
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, err)
+				scannerEndReason = relaycommon.StreamEndReasonScannerErr
+				scannerEndErr = err
 			}
+			return
 		}
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+		frames, decodeErr := decoder.Flush()
+		if decodeErr != nil {
+			scannerEndReason = relaycommon.StreamEndReasonHandlerStop
+			scannerEndErr = decodeErr
+			return
+		}
+		_ = emitFrames(frames)
 	})
 
-	// 主循环等待完成或超时
-	select {
-	case <-ticker.C:
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
-	case <-stopChan:
-		// EndReason already set by the goroutine that triggered stopChan
-	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+	resetStreamTimer := func(timeout time.Duration) {
+		if !streamTimer.Stop() {
+			select {
+			case <-streamTimer.C:
+			default:
+			}
+		}
+		streamTimer.Reset(timeout)
+	}
+
+	finished := false
+	for !finished {
+		select {
+		case <-acceptedEvent:
+			resetStreamTimer(streamingTimeout)
+		case <-streamTimer.C:
+			// An accepted event and the old timer can become ready together. The
+			// coordinator owns the timer and gives the accepted event precedence,
+			// preventing a valid boundary event from being mislabeled as timeout.
+			select {
+			case <-acceptedEvent:
+				resetStreamTimer(streamingTimeout)
+				continue
+			default:
+			}
+
+			writeMutex.Lock()
+			select {
+			case <-acceptedEvent:
+				writeMutex.Unlock()
+				resetStreamTimer(streamingTimeout)
+				continue
+			default:
+			}
+			if firstEventSeen.Load() {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			} else {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstEventTimeout, nil)
+			}
+			stop()
+			writeMutex.Unlock()
+			finished = true
+		case <-stopChan:
+			if err := c.Request.Context().Err(); err != nil {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+			}
+			finished = true
+		case <-c.Request.Context().Done():
+			// 客户端断开：立即关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成。
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			stop()
+			finished = true
+		}
 	}
 
 	cleanup()

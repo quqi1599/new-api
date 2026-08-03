@@ -28,6 +28,39 @@ func printHelp() {
 	fmt.Println("Usage: newapi [--port <port>] [--log-dir <log directory>] [--version] [--help]")
 }
 
+const (
+	defaultRelayDialTimeoutSeconds            = 10
+	defaultRelayTLSHandshakeTimeoutSeconds    = 10
+	defaultRelayResponseHeaderTimeoutSeconds  = 480
+	defaultRelayExpectContinueTimeoutSeconds  = 1
+	defaultRelayFirstEventTimeoutSeconds      = 540
+	defaultRelayFirstEventTotalTimeoutSeconds = 540
+)
+
+func getNonNegativeEnvOrDefault(name string, defaultValue int) int {
+	value := GetEnvOrDefault(name, defaultValue)
+	if value >= 0 {
+		return value
+	}
+	SysError(fmt.Sprintf("%s must be greater than or equal to 0, using default value: %d", name, defaultValue))
+	return defaultValue
+}
+
+func getRelayResponseHeaderTimeoutSeconds(legacyTimeout int) int {
+	fallback := defaultRelayResponseHeaderTimeoutSeconds
+	// Preserve smaller legacy limits, but do not let an old whole-request value
+	// (commonly 600s) consume the outer proxy's entire deadline. Operators that
+	// intentionally need a larger header phase can set the new variable explicitly.
+	if legacyTimeout > 0 && legacyTimeout < fallback {
+		fallback = legacyTimeout
+	}
+	return getNonNegativeEnvOrDefault("RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS", fallback)
+}
+
+func getRelayFirstEventTimeoutSeconds() int {
+	return getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TIMEOUT_SECONDS", defaultRelayFirstEventTimeoutSeconds)
+}
+
 func InitEnv() {
 	flag.Parse()
 
@@ -108,8 +141,13 @@ func InitEnv() {
 	// Initialize variables with GetEnvOrDefault
 	SyncFrequency = GetEnvOrDefault("SYNC_FREQUENCY", 60)
 	BatchUpdateInterval = GetEnvOrDefault("BATCH_UPDATE_INTERVAL", 5)
-	RelayTimeout = GetEnvOrDefault("RELAY_TIMEOUT", 0)
-	RelayIdleConnTimeout = GetEnvOrDefault("RELAY_IDLE_CONN_TIMEOUT", 90)
+	RelayTimeout = getNonNegativeEnvOrDefault("RELAY_TIMEOUT", 0)
+	RelayIdleConnTimeout = getNonNegativeEnvOrDefault("RELAY_IDLE_CONN_TIMEOUT", 90)
+	RelayDialTimeout = getNonNegativeEnvOrDefault("RELAY_DIAL_TIMEOUT_SECONDS", defaultRelayDialTimeoutSeconds)
+	RelayTLSHandshakeTimeout = getNonNegativeEnvOrDefault("RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS", defaultRelayTLSHandshakeTimeoutSeconds)
+	RelayResponseHeaderTimeout = getRelayResponseHeaderTimeoutSeconds(RelayTimeout)
+	RelayExpectContinueTimeout = getNonNegativeEnvOrDefault("RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS", defaultRelayExpectContinueTimeoutSeconds)
+	RelayFirstEventTotalTimeout = getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS", defaultRelayFirstEventTotalTimeoutSeconds)
 	RelayMaxIdleConns = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS", 500)
 	RelayMaxIdleConnsPerHost = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS_PER_HOST", 100)
 
@@ -143,11 +181,13 @@ func InitEnv() {
 
 func initConstantEnv() {
 	constant.StreamingTimeout = GetEnvOrDefault("STREAMING_TIMEOUT", 300)
+	constant.RelayFirstEventTimeout = getRelayFirstEventTimeoutSeconds()
 	constant.DifyDebug = GetEnvOrDefaultBool("DIFY_DEBUG", true)
 	constant.MaxFileDownloadMB = GetEnvOrDefault("MAX_FILE_DOWNLOAD_MB", 64)
-	constant.StreamScannerMaxBufferMB = GetEnvOrDefault("STREAM_SCANNER_MAX_BUFFER_MB", 128)
+	constant.StreamScannerMaxBufferMB = GetEnvOrDefault("STREAM_SCANNER_MAX_BUFFER_MB", 64)
 	// MaxRequestBodyMB 请求体最大大小（解压后），用于防止超大请求/zip bomb导致内存暴涨
 	constant.MaxRequestBodyMB = GetEnvOrDefault("MAX_REQUEST_BODY_MB", 128)
+	constant.MaxConcurrentLargeRequestBodies = GetEnvOrDefault("MAX_CONCURRENT_LARGE_REQUEST_BODIES", 4)
 	constant.AnonymousRequestBodyLimitKB = GetEnvOrDefault("ANONYMOUS_REQUEST_BODY_LIMIT_KB", 512)
 	// ForceStreamOption 覆盖请求参数，强制返回usage信息
 	constant.ForceStreamOption = GetEnvOrDefaultBool("FORCE_STREAM_OPTION", true)

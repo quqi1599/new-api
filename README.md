@@ -312,10 +312,19 @@ docker run --name new-api -d --restart always \
 | `CRYPTO_SECRET` | Encryption secret (required for Redis) | - |
 | `SQL_DSN` | Database connection string | - |
 | `REDIS_CONN_STRING` | Redis connection string | - |
+| `SHUTDOWN_TIMEOUT_SECONDS` | Graceful shutdown timeout; container stop grace must be longer | `120` |
+| `RELAY_DIAL_TIMEOUT_SECONDS` | TCP/proxy dial timeout in seconds; `0` disables the phase timeout | `10` |
+| `RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | TLS handshake timeout in seconds; `0` disables the phase timeout | `10` |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | Per-attempt upstream response-header timeout in seconds; does not limit response-body streaming and is also bounded by the cross-attempt first-event budget | `480` |
+| `RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS` | `Expect: 100-continue` wait timeout in seconds | `1` |
+| `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | Per-attempt cap for the first valid SSE event after response headers; the request-wide deadline can shorten it | `540` |
+| `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | Request-wide budget shared by all channel attempts until the first valid event; disarmed afterward so healthy long streams continue. Keep it at least 60 seconds below the transit Caddy first-byte timeout; `0` disables it | `540` |
+| `RELAY_TIMEOUT` | Legacy relay/provider compatibility fallback for the response-header timeout (capped at the safe 480s phase default); it remains a whole-fetch timeout for SSRF-protected user-controlled URL downloads | `0` |
 | `RELAY_IDLE_CONN_TIMEOUT` | Idle keep-alive timeout for relay HTTP clients, seconds. Defaults to Go standard library behavior; set `0` to disable | `90` |
-| `STREAMING_TIMEOUT` | Streaming timeout (seconds) | `300` |
+| `STREAMING_TIMEOUT` | Idle timeout between valid SSE data events; comments/heartbeats do not reset it | `300` |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | Max per-line buffer (MB) for the stream scanner; increase when upstream sends huge image/base64 payloads | `64` |
-| `MAX_REQUEST_BODY_MB` | Max request body size (MB, counted **after decompression**; prevents huge requests/zip bombs from exhausting memory). Exceeding it returns `413` | `32` |
+| `MAX_REQUEST_BODY_MB` | Max request body size (MB, counted **after decompression**; prevents huge requests/zip bombs from exhausting memory). Exceeding it returns `413` | `128` |
+| `MAX_CONCURRENT_LARGE_REQUEST_BODIES` | Max concurrently processed request bodies of at least 1 MiB, including disk-spooled bodies; saturation returns `503` instead of risking parse/conversion OOM | `4` |
 | `AZURE_DEFAULT_API_VERSION` | Azure API version | `2025-04-01-preview` |
 | `ERROR_LOG_ENABLED` | Error log switch | `false` |
 | `PYROSCOPE_URL` | Pyroscope server address | - |

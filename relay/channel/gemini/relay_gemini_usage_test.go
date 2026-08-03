@@ -67,6 +67,29 @@ func TestGeminiChatHandlerCompletionTokensExcludeToolUsePromptTokens(t *testing.
 	require.Equal(t, 1120, usage.CompletionTokenDetails.ReasoningTokens)
 }
 
+func TestNativeGeminiStreamZeroEventEOFDoesNotCommitSSEHeaders(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1beta/models/test:streamGenerateContent", nil)
+	info := &relaycommon.RelayInfo{
+		IsStream: true,
+		ChannelMeta: &relaycommon.ChannelMeta{
+			UpstreamModelName: "gemini-test",
+		},
+	}
+
+	usage, streamErr := GeminiTextGenerationStreamHandler(c, info, &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+	})
+
+	require.Nil(t, usage)
+	require.NotNil(t, streamErr)
+	require.Equal(t, http.StatusBadGateway, streamErr.StatusCode)
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("Content-Type"))
+}
+
 func TestGeminiStreamHandlerCompletionTokensExcludeToolUsePromptTokens(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -88,6 +111,7 @@ func TestGeminiStreamHandlerCompletionTokensExcludeToolUsePromptTokens(t *testin
 	chunk := dto.GeminiChatResponse{
 		Candidates: []dto.GeminiChatCandidate{
 			{
+				FinishReason: common.GetPointer("STOP"),
 				Content: dto.GeminiChatContent{
 					Role: "model",
 					Parts: []dto.GeminiPart{
@@ -108,7 +132,7 @@ func TestGeminiStreamHandlerCompletionTokensExcludeToolUsePromptTokens(t *testin
 	chunkData, err := common.Marshal(chunk)
 	require.NoError(t, err)
 
-	streamBody := []byte("data: " + string(chunkData) + "\n" + "data: [DONE]\n")
+	streamBody := []byte("data: " + string(chunkData) + "\n")
 	resp := &http.Response{
 		Body: io.NopCloser(bytes.NewReader(streamBody)),
 	}
@@ -247,6 +271,7 @@ func TestGeminiStreamHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *t
 	chunk := dto.GeminiChatResponse{
 		Candidates: []dto.GeminiChatCandidate{
 			{
+				FinishReason: common.GetPointer("STOP"),
 				Content: dto.GeminiChatContent{
 					Role: "model",
 					Parts: []dto.GeminiPart{
@@ -267,7 +292,7 @@ func TestGeminiStreamHandlerUsesEstimatedPromptTokensWhenUsagePromptMissing(t *t
 	chunkData, err := common.Marshal(chunk)
 	require.NoError(t, err)
 
-	streamBody := []byte("data: " + string(chunkData) + "\n" + "data: [DONE]\n")
+	streamBody := []byte("data: " + string(chunkData) + "\n")
 	resp := &http.Response{
 		Body: io.NopCloser(bytes.NewReader(streamBody)),
 	}

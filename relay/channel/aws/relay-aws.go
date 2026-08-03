@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -40,11 +41,61 @@ func getAwsErrorStatusCode(err error) int {
 	return http.StatusInternalServerError
 }
 
-func newAwsInvokeContext() (context.Context, context.CancelFunc) {
-	if common.RelayTimeout <= 0 {
-		return context.Background(), func() {}
+func newAwsInvokeContext(c *gin.Context) (context.Context, context.CancelFunc) {
+	parent := context.Background()
+	if c != nil && c.Request != nil {
+		parent = c.Request.Context()
 	}
-	return context.WithTimeout(context.Background(), time.Duration(common.RelayTimeout)*time.Second)
+	// RELAY_TIMEOUT is a legacy response-header fallback. Applying it as an SDK
+	// context deadline would once again turn it into a whole-response timeout and
+	// truncate healthy long-running Bedrock streams.
+	return context.WithCancel(parent)
+}
+
+type awsFirstEventBudgetGuard struct {
+	state atomic.Uint32 // 0=armed, 1=disarmed, 2=expired
+	timer *time.Timer
+}
+
+func startAwsFirstEventBudget(info *relaycommon.RelayInfo, cancel context.CancelFunc) (*awsFirstEventBudgetGuard, *types.NewAPIError) {
+	remaining, limited := info.RemainingFirstValidEventBudget()
+	if !limited || cancel == nil {
+		return nil, nil
+	}
+	if remaining <= 0 {
+		return nil, awsFirstEventBudgetError(false)
+	}
+	guard := &awsFirstEventBudgetGuard{}
+	guard.timer = time.AfterFunc(remaining, func() {
+		if guard.state.CompareAndSwap(0, 2) {
+			cancel()
+		}
+	})
+	return guard, nil
+}
+
+func (g *awsFirstEventBudgetGuard) Stop() bool {
+	if g == nil {
+		return false
+	}
+	g.state.CompareAndSwap(0, 1)
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	return g.state.Load() == 2
+}
+
+func awsFirstEventBudgetError(allowChannelPenalty bool) *types.NewAPIError {
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if allowChannelPenalty {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("request-wide first valid event budget exhausted"),
+		types.ErrorCodeUpstreamFirstEventTimeout,
+		http.StatusGatewayTimeout,
+		options...,
+	)
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
@@ -71,15 +122,17 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 			Region:                  region,
 			BearerAuthTokenProvider: bearer.StaticTokenProvider{Token: bearer.Token{Value: apiKey}},
 			HTTPClient:              httpClient,
+			RetryMaxAttempts:        1,
 		})
 	case 3:
 		ak := awsSecret[0]
 		sk := awsSecret[1]
 		region := awsSecret[2]
 		client = bedrockruntime.New(bedrockruntime.Options{
-			Region:      region,
-			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, "")),
-			HTTPClient:  httpClient,
+			Region:           region,
+			Credentials:      aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, "")),
+			HTTPClient:       httpClient,
+			RetryMaxAttempts: 1,
 		})
 	default:
 		return nil, errors.New("invalid aws secret key")
@@ -223,13 +276,28 @@ func getAwsModelID(requestModel string) string {
 
 func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContext(c)
 	defer cancel()
+	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	if budgetErr != nil {
+		return budgetErr, nil
+	}
 
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	budgetExpired := budgetGuard.Stop()
 	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return channel.ClassifyDoRequestError(c, err), nil
+		}
+		if budgetExpired {
+			return awsFirstEventBudgetError(true), nil
+		}
 		statusCode := getAwsErrorStatusCode(err)
 		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
+	}
+	if budgetExpired {
+		return awsFirstEventBudgetError(true), nil
 	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
@@ -253,16 +321,35 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 }
 
 func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
-	ctx, cancel := newAwsInvokeContext()
-	defer cancel()
+	previousStreamStatus := info.StreamStatus
+	info.StreamStatus = relaycommon.NewStreamStatus()
+	info.StreamStatus.CopyErrorsFrom(previousStreamStatus)
 
+	ctx, cancel := newAwsInvokeContext(c)
+	defer cancel()
+	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	if budgetErr != nil {
+		return budgetErr, nil
+	}
+
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
 	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
+	budgetExpired := budgetGuard.Stop()
 	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return channel.ClassifyDoRequestError(c, err), nil
+		}
+		if budgetExpired {
+			return awsFirstEventBudgetError(true), nil
+		}
 		statusCode := getAwsErrorStatusCode(err)
 		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode), nil
 	}
 	stream := awsResp.GetStream()
-	defer stream.Close()
+	if budgetExpired {
+		_ = stream.Close()
+		return awsFirstEventBudgetError(true), nil
+	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -272,37 +359,170 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 		Usage:        &dto.Usage{},
 	}
 
-	for event := range stream.Events() {
+	return consumeAwsResponseStream(c, info, ctx, stream, claudeInfo)
+}
+
+type awsResponseStream interface {
+	Events() <-chan bedrockruntimeTypes.ResponseStream
+	Err() error
+	Close() error
+}
+
+func consumeAwsResponseStream(c *gin.Context, info *relaycommon.RelayInfo, ctx context.Context, stream awsResponseStream, claudeInfo *claude.ClaudeResponseInfo) (*types.NewAPIError, *dto.Usage) {
+	defer stream.Close()
+	events := stream.Events()
+	streamTimer := time.NewTimer(info.BoundFirstValidEventWait(helper.StreamFirstEventTimeout()))
+	defer streamTimer.Stop()
+
+	firstEventSeen := false
+	resetTimer := func(timeout time.Duration) {
+		if !streamTimer.Stop() {
+			select {
+			case <-streamTimer.C:
+			default:
+			}
+		}
+		streamTimer.Reset(timeout)
+	}
+
+	processEvent := func(event bedrockruntimeTypes.ResponseStream) (bool, *types.NewAPIError) {
 		switch v := event.(type) {
 		case *bedrockruntimeTypes.ResponseStreamMemberChunk:
-			info.SetFirstResponseTime()
-			respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
+			eventType, respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes), nil)
 			if respErr != nil {
-				return respErr, nil
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, respErr)
+				if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
+					return true, preOutputErr
+				}
+				// Output may already have committed an SSE 200. Still return a
+				// non-nil result so the controller suppresses trailing JSON while
+				// avoiding success settlement/logging.
+				return true, respErr
 			}
+			if eventType == "" || eventType == "ping" {
+				return false, nil
+			}
+			if !firstEventSeen {
+				firstEventSeen = true
+				info.SetFirstResponseTime()
+			}
+			info.ReceivedResponseCount++
+			resetTimer(helper.StreamIdleTimeout())
+			if eventType == "message_stop" {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonDone, nil)
+				return true, nil
+			}
+			return false, nil
 		case *bedrockruntimeTypes.UnknownUnionMember:
-			fmt.Println("unknown tag:", v.Tag)
-			return types.NewError(errors.New("unknown response type"), types.ErrorCodeInvalidRequest), nil
+			streamErr := fmt.Errorf("unknown AWS response stream tag: %s", v.Tag)
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, streamErr)
+			return true, helper.PreOutputStreamError(c, info)
 		default:
-			fmt.Println("union is nil or unknown type")
-			return types.NewError(errors.New("nil or unknown response type"), types.ErrorCodeInvalidRequest), nil
+			streamErr := errors.New("nil or unknown AWS response stream event")
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonHandlerStop, streamErr)
+			return true, helper.PreOutputStreamError(c, info)
 		}
 	}
 
-	claude.HandleStreamFinalResponse(c, info, claudeInfo)
+streamLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			break streamLoop
+		case event, ok := <-events:
+			if !ok {
+				break streamLoop
+			}
+			done, eventErr := processEvent(event)
+			if eventErr != nil {
+				return eventErr, nil
+			}
+			if done {
+				break streamLoop
+			}
+		case <-streamTimer.C:
+			// Prefer an event that became ready at the timer boundary.
+			select {
+			case event, ok := <-events:
+				if !ok {
+					break streamLoop
+				}
+				done, eventErr := processEvent(event)
+				if eventErr != nil {
+					return eventErr, nil
+				}
+				if done {
+					break streamLoop
+				}
+				continue
+			default:
+			}
+			if firstEventSeen {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			} else {
+				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstEventTimeout, nil)
+			}
+			streamErr := helper.PreOutputStreamError(c, info)
+			if streamErr == nil {
+				claude.FinalizeClaudeUsage(c, info, claudeInfo)
+			}
+			return streamErr, claudeInfo.Usage
+		}
+	}
+
+	if requestErr := c.Request.Context().Err(); requestErr != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+		// Preserve partial usage for settlement without manufacturing a final chunk.
+		claude.FinalizeClaudeUsage(c, info, claudeInfo)
+		return nil, claudeInfo.Usage
+	}
+	if streamErr := stream.Err(); streamErr != nil {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonScannerErr, streamErr)
+		apiErr := helper.PreOutputStreamError(c, info)
+		if apiErr == nil {
+			claude.FinalizeClaudeUsage(c, info, claudeInfo)
+		}
+		return apiErr, claudeInfo.Usage
+	}
+	if info.StreamStatus.EndReason != relaycommon.StreamEndReasonDone {
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
+	}
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return streamErr, claudeInfo.Usage
+	}
+	if helper.ShouldFinalizeStream(info) {
+		claude.HandleStreamFinalResponse(c, info, claudeInfo)
+	} else {
+		claude.FinalizeClaudeUsage(c, info, claudeInfo)
+	}
 	return nil, claudeInfo.Usage
 }
 
 // Nova模型处理函数
 func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
-	ctx, cancel := newAwsInvokeContext()
+	ctx, cancel := newAwsInvokeContext(c)
 	defer cancel()
+	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	if budgetErr != nil {
+		return budgetErr, nil
+	}
 
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
+	budgetExpired := budgetGuard.Stop()
 	if err != nil {
+		if c.Request.Context().Err() != nil {
+			return channel.ClassifyDoRequestError(c, err), nil
+		}
+		if budgetExpired {
+			return awsFirstEventBudgetError(true), nil
+		}
 		statusCode := getAwsErrorStatusCode(err)
 		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
+	}
+	if budgetExpired {
+		return awsFirstEventBudgetError(true), nil
 	}
 
 	// 解析Nova响应
