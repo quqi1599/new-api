@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -538,6 +539,48 @@ func firstValidEventBudgetError(requestMayHaveBeenSent bool) *types.NewAPIError 
 	)
 }
 
+// startPreResponseHeartbeat keeps streaming clients and transit proxies alive
+// while the upstream is still waiting to return response headers. It starts
+// only after a short compatibility delay so fast upstream failures can still
+// be returned with their original HTTP status. Stopping waits for the writer
+// goroutine, preventing it from racing the downstream stream handler.
+func startPreResponseHeartbeat(c *gin.Context, info *common.RelayInfo) func() {
+	interval := common2.RelayPreFirstEventHeartbeatInterval
+	if c == nil || c.Request == nil || c.Writer == nil || info == nil || !info.IsStream || info.DisablePing || interval <= 0 {
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.LogError(c, fmt.Sprintf("pre-response heartbeat panic: %v", r))
+			}
+			close(done)
+		}()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				helper.ExtendWriteDeadline(c)
+				if err := helper.PingData(c); err != nil {
+					logger.LogDebug(c, "pre-response heartbeat stopped: "+err.Error())
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
 	// Some provider adaptors build requests with their own timeout context before
 	// delegating here. Preserve that deadline/value context while also binding it
@@ -614,7 +657,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// boundary as an idempotent fallback, before waiting on response headers or
 	// a potentially long-lived stream.
 	common2.ReleaseBodyAdmission(c)
+	stopPreResponseHeartbeat := startPreResponseHeartbeat(c, info)
 	resp, err := client.Do(req)
+	stopPreResponseHeartbeat()
 	if budgetTimer != nil {
 		budgetState.CompareAndSwap(0, 1)
 		budgetTimer.Stop()

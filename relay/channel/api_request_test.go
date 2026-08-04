@@ -13,7 +13,6 @@ import (
 	common2 "github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -80,18 +79,14 @@ func requireClientCanceledRequestError(t *testing.T, err error) *types.NewAPIErr
 	return apiErr
 }
 
-func TestDoApiRequestClientCancelBeforeResponseHeadersDoesNotCommitHeartbeat(t *testing.T) {
+func TestDoApiRequestClientCancelBeforeResponseHeadersKeepsAliveAndCancelsUpstream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	service.InitHttpClient()
 
-	generalSetting := operation_setting.GetGeneralSetting()
-	previousPingEnabled := generalSetting.PingIntervalEnabled
-	previousPingSeconds := generalSetting.PingIntervalSeconds
-	generalSetting.PingIntervalEnabled = true
-	generalSetting.PingIntervalSeconds = 1
+	previousInterval := common2.RelayPreFirstEventHeartbeatInterval
+	common2.RelayPreFirstEventHeartbeatInterval = 20 * time.Millisecond
 	t.Cleanup(func() {
-		generalSetting.PingIntervalEnabled = previousPingEnabled
-		generalSetting.PingIntervalSeconds = previousPingSeconds
+		common2.RelayPreFirstEventHeartbeatInterval = previousInterval
 	})
 
 	requestStarted := make(chan struct{})
@@ -125,8 +120,7 @@ func TestDoApiRequestClientCancelBeforeResponseHeadersDoesNotCommitHeartbeat(t *
 		t.Fatal("upstream request did not start")
 	}
 
-	// The former pre-header pinger fired after one second and committed a 200.
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
 	cancelStarted := time.Now()
 	cancel()
 
@@ -141,8 +135,8 @@ func TestDoApiRequestClientCancelBeforeResponseHeadersDoesNotCommitHeartbeat(t *
 	}
 	require.Less(t, time.Since(cancelStarted), time.Second)
 	requireClientCanceledRequestError(t, result.err)
-	require.Empty(t, recorder.Body.String())
-	require.False(t, recorder.Flushed)
+	require.Contains(t, recorder.Body.String(), ": PING")
+	require.True(t, recorder.Flushed)
 }
 
 func TestFormAndTaskRequestsCancelBeforeResponseHeaders(t *testing.T) {

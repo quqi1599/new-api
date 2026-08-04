@@ -35,6 +35,7 @@ const (
 	defaultRelayExpectContinueTimeoutSeconds  = 1
 	defaultRelayFirstEventTimeoutSeconds      = 540
 	defaultRelayFirstEventTotalTimeoutSeconds = 540
+	defaultRelayPreFirstEventHeartbeatSeconds = 15
 )
 
 func getNonNegativeEnvOrDefault(name string, defaultValue int) int {
@@ -148,6 +149,7 @@ func InitEnv() {
 	RelayResponseHeaderTimeout = getRelayResponseHeaderTimeoutSeconds(RelayTimeout)
 	RelayExpectContinueTimeout = getNonNegativeEnvOrDefault("RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS", defaultRelayExpectContinueTimeoutSeconds)
 	RelayFirstEventTotalTimeout = getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS", defaultRelayFirstEventTotalTimeoutSeconds)
+	RelayPreFirstEventHeartbeatInterval = time.Duration(getNonNegativeEnvOrDefault("RELAY_PRE_FIRST_EVENT_HEARTBEAT_SECONDS", defaultRelayPreFirstEventHeartbeatSeconds)) * time.Second
 	RelayMaxIdleConns = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS", 500)
 	RelayMaxIdleConnsPerHost = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS_PER_HOST", 100)
 

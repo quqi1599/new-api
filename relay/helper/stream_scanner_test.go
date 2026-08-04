@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -519,7 +520,7 @@ func TestStreamScannerHandler_UsesRemainingRequestWideFirstEventBudget(t *testin
 		"a retry must use the request-wide remaining budget, not restart the full per-attempt timeout")
 }
 
-func TestStreamScannerHandler_DoesNotPingBeforeFirstValidEvent(t *testing.T) {
+func TestStreamScannerHandler_PingsBeforeFirstValidEvent(t *testing.T) {
 	setting := operation_setting.GetGeneralSetting()
 	oldEnabled := setting.PingIntervalEnabled
 	oldSeconds := setting.PingIntervalSeconds
@@ -532,11 +533,14 @@ func TestStreamScannerHandler_DoesNotPingBeforeFirstValidEvent(t *testing.T) {
 
 	oldTimeout := constant.StreamingTimeout
 	oldFirstEventTimeout := constant.RelayFirstEventTimeout
+	oldHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
 	constant.StreamingTimeout = 5
 	constant.RelayFirstEventTimeout = 2
+	common.RelayPreFirstEventHeartbeatInterval = 20 * time.Millisecond
 	t.Cleanup(func() {
 		constant.StreamingTimeout = oldTimeout
 		constant.RelayFirstEventTimeout = oldFirstEventTimeout
+		common.RelayPreFirstEventHeartbeatInterval = oldHeartbeatInterval
 	})
 
 	pr, pw := io.Pipe()
@@ -560,7 +564,7 @@ func TestStreamScannerHandler_DoesNotPingBeforeFirstValidEvent(t *testing.T) {
 
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonFirstEventTimeout, info.StreamStatus.EndReason)
-	assert.Empty(t, recorder.Body.String(), "gateway heartbeat must not commit the response before upstream data")
+	assert.Contains(t, recorder.Body.String(), ": PING", "gateway heartbeat should keep slow-first-event streams alive")
 }
 
 func TestStreamScannerHandler_InvalidFramesDoNotSatisfyFirstEventDeadline(t *testing.T) {
