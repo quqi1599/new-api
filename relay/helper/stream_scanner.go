@@ -252,8 +252,13 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
 	generalSettings := operation_setting.GetGeneralSetting()
-	pingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
-	pingInterval := time.Duration(generalSettings.PingIntervalSeconds) * time.Second
+	preFirstEventHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	generalPingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
+	pingEnabled := generalPingEnabled || (!info.DisablePing && preFirstEventHeartbeatInterval > 0)
+	pingInterval := preFirstEventHeartbeatInterval
+	if generalPingEnabled {
+		pingInterval = time.Duration(generalSettings.PingIntervalSeconds) * time.Second
+	}
 	if pingInterval <= 0 {
 		pingInterval = DefaultPingInterval
 	}
@@ -349,7 +354,8 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 	// but the provider has not produced its first valid protocol event yet. The
 	// pre-response phase uses the same interval in relay/channel; this goroutine
 	// takes over after client.Do returns and exits before the first data write.
-	preFirstEventHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	// After that event, the regular serialized ping goroutine above continues at
+	// this interval even when the dashboard's optional ping switch is disabled.
 	if !info.DisablePing && preFirstEventHeartbeatInterval > 0 {
 		wg.Add(1)
 		gopool.Go(func() {

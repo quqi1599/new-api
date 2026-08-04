@@ -567,6 +567,42 @@ func TestStreamScannerHandler_PingsBeforeFirstValidEvent(t *testing.T) {
 	assert.Contains(t, recorder.Body.String(), ": PING", "gateway heartbeat should keep slow-first-event streams alive")
 }
 
+func TestStreamScannerHandler_HeartbeatContinuesAfterFirstStatusEvent(t *testing.T) {
+	setting := operation_setting.GetGeneralSetting()
+	oldEnabled := setting.PingIntervalEnabled
+	oldSeconds := setting.PingIntervalSeconds
+	setting.PingIntervalEnabled = false
+	t.Cleanup(func() {
+		setting.PingIntervalEnabled = oldEnabled
+		setting.PingIntervalSeconds = oldSeconds
+	})
+
+	oldHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	common.RelayPreFirstEventHeartbeatInterval = 20 * time.Millisecond
+	t.Cleanup(func() {
+		common.RelayPreFirstEventHeartbeatInterval = oldHeartbeatInterval
+	})
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		_, _ = fmt.Fprint(pw, "data: {\"type\":\"response.in_progress\"}\n")
+		time.Sleep(90 * time.Millisecond)
+		_, _ = fmt.Fprint(pw, "data: [DONE]\n")
+	}()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{Body: pr}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	StreamScannerHandler(c, resp, info, acceptStreamHandler(func(string, *StreamResult) {}))
+
+	assert.GreaterOrEqual(t, strings.Count(recorder.Body.String(), ": PING"), 2,
+		"heartbeat must continue while an accepted status event is followed by a long output stall")
+}
+
 func TestStreamScannerHandler_InvalidFramesDoNotSatisfyFirstEventDeadline(t *testing.T) {
 	oldTimeout := constant.StreamingTimeout
 	oldFirstEventTimeout := constant.RelayFirstEventTimeout
