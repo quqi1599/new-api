@@ -345,6 +345,52 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 		})
 	}
 
+	// Keep the downstream connection alive while response headers have arrived
+	// but the provider has not produced its first valid protocol event yet. The
+	// pre-response phase uses the same interval in relay/channel; this goroutine
+	// takes over after client.Do returns and exits before the first data write.
+	preFirstEventHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	if !info.DisablePing && preFirstEventHeartbeatInterval > 0 {
+		wg.Add(1)
+		gopool.Go(func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.LogError(c, fmt.Sprintf("pre-first-event heartbeat panic: %v", r))
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("pre-first-event heartbeat panic: %v", r))
+					stop()
+				}
+				wg.Done()
+			}()
+
+			ticker := time.NewTicker(preFirstEventHeartbeatInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					var err error
+					func() {
+						writeMutex.Lock()
+						defer writeMutex.Unlock()
+						ExtendWriteDeadline(c)
+						err = PingData(c)
+					}()
+					if err != nil {
+						logger.LogDebug(c, "pre-first-event heartbeat stopped: "+err.Error())
+						return
+					}
+				case <-firstEventReady:
+					return
+				case <-ctx.Done():
+					return
+				case <-stopChan:
+					return
+				case <-c.Request.Context().Done():
+					return
+				}
+			}
+		})
+	}
+
 	dataChan := make(chan StreamFrame, 10)
 	scannerEndReason := relaycommon.StreamEndReasonEOF
 	var scannerEndErr error

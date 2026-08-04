@@ -147,6 +147,7 @@ var RelayTLSHandshakeTimeout int    // unit is second
 var RelayResponseHeaderTimeout int  // unit is second
 var RelayExpectContinueTimeout int  // unit is second
 var RelayFirstEventTotalTimeout int // unit is second; shared across all channel attempts
+var RelayPreFirstEventHeartbeatInterval time.Duration
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int
 
