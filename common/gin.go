@@ -99,6 +99,20 @@ func GetBodyStorage(c *gin.Context) (BodyStorage, error) {
 	return bs, nil
 }
 
+// ReleaseBodyAdmission marks the large-body read/parse phase complete without
+// closing the replayable body storage. Close remains the fallback for malformed
+// requests and controller paths that return before parsing reaches its boundary.
+func ReleaseBodyAdmission(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	if storage, exists := c.Get(KeyBodyStorage); exists && storage != nil {
+		if bs, ok := storage.(BodyStorage); ok {
+			bs.ReleaseAdmission()
+		}
+	}
+}
+
 // CleanupBodyStorage 清理请求体存储（应在请求结束时调用）
 func CleanupBodyStorage(c *gin.Context) {
 	if storage, exists := c.Get(KeyBodyStorage); exists && storage != nil {

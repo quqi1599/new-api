@@ -402,6 +402,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 		targetHeader.Set(key, value)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
+	common2.ReleaseBodyAdmission(c)
 	targetConn, _, err := DialWebSocketContext(c.Request.Context(), fullRequestURL, targetHeader)
 	if err != nil {
 		if c.Request.Context().Err() != nil {
@@ -608,6 +609,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
+	// Task and provider-specific paths may not pass through controller.Relay's
+	// validated DTO boundary. Release the parsing lease at the final outbound
+	// boundary as an idempotent fallback, before waiting on response headers or
+	// a potentially long-lived stream.
+	common2.ReleaseBodyAdmission(c)
 	resp, err := client.Do(req)
 	if budgetTimer != nil {
 		budgetState.CompareAndSwap(0, 1)

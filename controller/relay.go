@@ -149,6 +149,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}()
 
 	request, err := helper.GetAndValidateRequest(c, relayFormat)
+	// Large-body admission protects inbound reading and full request parsing.
+	// Keep the replayable storage for upstream transmission/retry, but do not
+	// occupy a scarce parsing slot while a long-lived model stream is running.
+	common.ReleaseBodyAdmission(c)
 	if err != nil {
 		if _, isBodyReadFailure := requestBodyFailureStatus(err); isBodyReadFailure {
 			newAPIError = newRequestBodyFailure(c, err)

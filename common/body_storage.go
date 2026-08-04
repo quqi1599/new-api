@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/QuantumNous/new-api/constant"
 )
 
 // BodyStorage 请求体存储接口
@@ -23,6 +21,9 @@ type BodyStorage interface {
 	Size() int64
 	// IsDisk 是否是磁盘存储
 	IsDisk() bool
+	// ReleaseAdmission 在请求体读取和解析阶段结束后释放大请求准入槽。
+	// 存储本身仍保留到 Close，用于上游传输和安全重试。
+	ReleaseAdmission()
 }
 
 // ErrStorageClosed 存储已关闭错误
@@ -64,9 +65,9 @@ func IsBodyReadError(err error) bool {
 	return errors.As(err, &bodyReadErr)
 }
 
-// BodyAdmissionError means the process is already retaining the configured
-// number of large request bodies. Rejecting before another large allocation
-// protects the gateway from concurrent upload OOM.
+// BodyAdmissionError means the process is already reading or parsing the
+// configured number of large request bodies. Rejecting before another large
+// allocation protects the gateway from concurrent upload/parse OOM.
 type BodyAdmissionError struct{}
 
 func (e *BodyAdmissionError) Error() string {
@@ -151,30 +152,6 @@ func classifyIncompleteBodyRead(err error, declared, received int64, storage str
 	return nil
 }
 
-var activeLargeRequestBodies atomic.Int64
-
-func acquireLargeRequestBodySlot() bool {
-	limit := int64(constant.MaxConcurrentLargeRequestBodies)
-	if limit <= 0 {
-		limit = 4
-	}
-	for {
-		current := activeLargeRequestBodies.Load()
-		if current >= limit {
-			return false
-		}
-		if activeLargeRequestBodies.CompareAndSwap(current, current+1) {
-			return true
-		}
-	}
-}
-
-func releaseLargeRequestBodySlot() {
-	if activeLargeRequestBodies.Add(-1) < 0 {
-		activeLargeRequestBodies.Store(0)
-	}
-}
-
 type bodyStorageWriter struct {
 	writer io.Writer
 	err    error
@@ -193,22 +170,23 @@ func (w *bodyStorageWriter) Write(p []byte) (int, error) {
 
 // memoryStorage 内存存储实现
 type memoryStorage struct {
-	data   []byte
-	reader *bytes.Reader
-	size   int64
-	closed int32
-	large  bool
-	mu     sync.Mutex
+	data      []byte
+	reader    *bytes.Reader
+	size      int64
+	closed    int32
+	admission *bodyAdmissionLease
+	mu        sync.Mutex
 }
 
-func newMemoryStorage(data []byte, large bool) *memoryStorage {
+func newMemoryStorage(data []byte, admission *bodyAdmissionLease) *memoryStorage {
 	size := int64(len(data))
 	IncrementMemoryBuffers(size)
+	observeRequestBodySize(size)
 	return &memoryStorage{
-		data:   data,
-		reader: bytes.NewReader(data),
-		size:   size,
-		large:  large,
+		data:      data,
+		reader:    bytes.NewReader(data),
+		size:      size,
+		admission: admission,
 	}
 }
 
@@ -235,11 +213,15 @@ func (m *memoryStorage) Close() error {
 	defer m.mu.Unlock()
 	if atomic.CompareAndSwapInt32(&m.closed, 0, 1) {
 		DecrementMemoryBuffers(m.size)
-		if m.large {
-			releaseLargeRequestBodySlot()
-		}
+		m.ReleaseAdmission()
 	}
 	return nil
+}
+
+func (m *memoryStorage) ReleaseAdmission() {
+	if m != nil {
+		m.admission.Release()
+	}
 }
 
 func (m *memoryStorage) Bytes() ([]byte, error) {
@@ -261,24 +243,25 @@ func (m *memoryStorage) IsDisk() bool {
 
 // diskStorage 磁盘存储实现
 type diskStorage struct {
-	file     *os.File
-	filePath string
-	size     int64
-	closed   int32
-	large    bool
-	mu       sync.Mutex
+	file      *os.File
+	filePath  string
+	size      int64
+	closed    int32
+	admission *bodyAdmissionLease
+	mu        sync.Mutex
 }
 
 func newDiskStorage(data []byte, cachePath string) (*diskStorage, error) {
 	large := int64(len(data)) >= largeBodyAdmissionThresholdBytes
-	if large && !acquireLargeRequestBodySlot() {
-		return nil, &BodyAdmissionError{}
+	var admission *bodyAdmissionLease
+	if large {
+		admission = acquireLargeRequestBodySlot()
+		if admission == nil {
+			return nil, &BodyAdmissionError{}
+		}
 	}
 	releaseLargeSlot := func() {
-		if large {
-			releaseLargeRequestBodySlot()
-			large = false
-		}
+		admission.Release()
 	}
 	reserved := int64(len(data))
 	if !ReserveDiskCacheBytes(reserved) {
@@ -325,25 +308,26 @@ func newDiskStorage(data []byte, cachePath string) (*diskStorage, error) {
 	size := int64(n)
 	CommitReservedDiskFile(reserved, size)
 	reservationActive = false
+	observeRequestBodySize(size)
 
 	return &diskStorage{
-		file:     file,
-		filePath: filePath,
-		size:     size,
-		large:    large,
+		file:      file,
+		filePath:  filePath,
+		size:      size,
+		admission: admission,
 	}, nil
 }
 
-func newDiskStorageFromReader(reader io.Reader, contentLength int64, maxBytes int64, cachePath string, largeSlotHeld bool) (*diskStorage, error) {
-	large := largeSlotHeld || contentLength >= largeBodyAdmissionThresholdBytes
-	if large && !largeSlotHeld && !acquireLargeRequestBodySlot() {
-		return nil, &BodyAdmissionError{}
+func newDiskStorageFromReader(reader io.Reader, contentLength int64, maxBytes int64, cachePath string, admission *bodyAdmissionLease) (*diskStorage, error) {
+	large := admission != nil || contentLength >= largeBodyAdmissionThresholdBytes
+	if large && admission == nil {
+		admission = acquireLargeRequestBodySlot()
+		if admission == nil {
+			return nil, &BodyAdmissionError{}
+		}
 	}
 	releaseLargeSlot := func() {
-		if large {
-			releaseLargeRequestBodySlot()
-			large = false
-		}
+		admission.Release()
 	}
 	reserved := maxBytes
 	if contentLength > 0 && contentLength < reserved {
@@ -417,12 +401,13 @@ func newDiskStorageFromReader(reader io.Reader, contentLength int64, maxBytes in
 
 	CommitReservedDiskFile(reserved, written)
 	reservationActive = false
+	observeRequestBodySize(written)
 
 	return &diskStorage{
-		file:     file,
-		filePath: filePath,
-		size:     written,
-		large:    large,
+		file:      file,
+		filePath:  filePath,
+		size:      written,
+		admission: admission,
 	}, nil
 }
 
@@ -451,12 +436,15 @@ func (d *diskStorage) Close() error {
 		d.file.Close()
 		os.Remove(d.filePath)
 		DecrementDiskFiles(d.size)
-		if d.large {
-			releaseLargeRequestBodySlot()
-			d.large = false
-		}
+		d.ReleaseAdmission()
 	}
 	return nil
+}
+
+func (d *diskStorage) ReleaseAdmission() {
+	if d != nil {
+		d.admission.Release()
+	}
 }
 
 func (d *diskStorage) Bytes() ([]byte, error) {
@@ -514,19 +502,24 @@ func CreateBodyStorage(data []byte) (BodyStorage, error) {
 		if err != nil {
 			// 如果磁盘存储失败，回退到内存存储
 			SysError(fmt.Sprintf("failed to create disk storage, falling back to memory: %v", err))
-			if !acquireLargeRequestBodySlot() {
+			admission := acquireLargeRequestBodySlot()
+			if admission == nil {
 				return nil, &BodyAdmissionError{}
 			}
-			return newMemoryStorage(data, true), nil
+			return newMemoryStorage(data, admission), nil
 		}
 		return storage, nil
 	}
 
 	large := size >= largeBodyAdmissionThresholdBytes
-	if large && !acquireLargeRequestBodySlot() {
-		return nil, &BodyAdmissionError{}
+	var admission *bodyAdmissionLease
+	if large {
+		admission = acquireLargeRequestBodySlot()
+		if admission == nil {
+			return nil, &BodyAdmissionError{}
+		}
 	}
-	return newMemoryStorage(data, large), nil
+	return newMemoryStorage(data, admission), nil
 }
 
 // CreateBodyStorageFromReader 从 Reader 创建存储（用于大请求的流式处理）
@@ -541,7 +534,7 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 		contentLength > 0 &&
 		contentLength >= threshold &&
 		IsDiskCacheAvailable(contentLength) {
-		storage, err := newDiskStorageFromReader(reader, contentLength, maxBytes, GetDiskCachePath(), false)
+		storage, err := newDiskStorageFromReader(reader, contentLength, maxBytes, GetDiskCachePath(), nil)
 		if err != nil {
 			if IsRequestBodyTooLargeError(err) {
 				return nil, err
@@ -556,12 +549,9 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 	limitedReader := io.LimitReader(reader, maxBytes+1)
 	var data []byte
 	var err error
-	largeSlot := false
+	var admission *bodyAdmissionLease
 	releaseLargeSlot := func() {
-		if largeSlot {
-			releaseLargeRequestBodySlot()
-			largeSlot = false
-		}
+		admission.Release()
 	}
 
 	admissionThreshold := int64(largeBodyAdmissionThresholdBytes)
@@ -577,10 +567,10 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 	if contentLength <= 0 && admissionThreshold > 0 && admissionThreshold < maxBytes {
 		data, err = io.ReadAll(io.LimitReader(limitedReader, admissionThreshold+1))
 		if err == nil && int64(len(data)) > admissionThreshold {
-			if !acquireLargeRequestBodySlot() {
+			admission = acquireLargeRequestBodySlot()
+			if admission == nil {
 				return nil, &BodyAdmissionError{}
 			}
-			largeSlot = true
 
 			// Continue only as far as the configured disk threshold before
 			// deciding whether this body should remain in memory.
@@ -591,11 +581,10 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 			}
 			if err == nil && threshold > 0 && int64(len(data)) > threshold && IsDiskCacheEnabled() && IsDiskCacheAvailable(maxBytes) {
 				combinedReader := io.MultiReader(bytes.NewReader(data), limitedReader)
-				// Transfer ownership of the already-acquired large-body slot to
-				// diskStorage so parsing/conversion remains admission-controlled
-				// for the entire request, not just while the temporary file is written.
-				largeSlot = false
-				storage, diskErr := newDiskStorageFromReader(combinedReader, contentLength, maxBytes, GetDiskCachePath(), true)
+				// Transfer the already-acquired parsing lease to disk storage. The
+				// controller releases it once request parsing completes; Close remains
+				// an idempotent fallback for early failures.
+				storage, diskErr := newDiskStorageFromReader(combinedReader, contentLength, maxBytes, GetDiskCachePath(), admission)
 				if diskErr != nil {
 					return nil, diskErr
 				}
@@ -610,10 +599,10 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 		}
 	} else {
 		if contentLength > 0 && contentLength >= admissionThreshold {
-			if !acquireLargeRequestBodySlot() {
+			admission = acquireLargeRequestBodySlot()
+			if admission == nil {
 				return nil, &BodyAdmissionError{}
 			}
-			largeSlot = true
 		}
 		data, err = io.ReadAll(limitedReader)
 	}
@@ -638,7 +627,7 @@ func CreateBodyStorageFromReader(reader io.Reader, contentLength int64, maxBytes
 		return nil, err
 	}
 
-	storage := newMemoryStorage(data, largeSlot)
+	storage := newMemoryStorage(data, admission)
 	IncrementMemoryCacheHits()
 	return storage, nil
 }

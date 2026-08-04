@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/require"
@@ -127,6 +128,76 @@ func TestLargeMemoryBodyAdmissionCapsConcurrentRetainedBodies(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, third)
 	require.NoError(t, third.Close())
+}
+
+func TestLargeBodyAdmissionReleasesBeforeReplayStorageCloses(t *testing.T) {
+	setBodyStorageTestConfig(t, DiskCacheConfig{Enabled: false, ThresholdMB: 1})
+	oldLimit := constant.MaxConcurrentLargeRequestBodies
+	constant.MaxConcurrentLargeRequestBodies = 1
+	t.Cleanup(func() { constant.MaxConcurrentLargeRequestBodies = oldLimit })
+	ResetRequestBodyStats()
+	t.Cleanup(ResetRequestBodyStats)
+
+	body := bytes.Repeat([]byte("x"), 1<<20)
+	first, err := CreateBodyStorage(body)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), GetRequestBodyStats().ActiveLargeBodySlots)
+
+	// Parsing is complete, but the replayable body remains available for the
+	// outbound request and a safe retry.
+	time.Sleep(time.Millisecond)
+	first.ReleaseAdmission()
+	stats := GetRequestBodyStats()
+	require.Equal(t, int64(0), stats.ActiveLargeBodySlots)
+	require.Equal(t, int64(1), stats.AdmissionHoldsTotal)
+	require.Greater(t, stats.AdmissionHoldDurationSecondsTotal, float64(0))
+	require.Greater(t, stats.AdmissionHoldDurationSecondsMax, float64(0))
+	require.Equal(t, int64(1), stats.ObservedBodiesTotal)
+	require.Equal(t, int64(len(body)), stats.ObservedBodyBytesTotal)
+	require.Equal(t, int64(len(body)), stats.MaxObservedBodyBytes)
+	require.Equal(t, int64(1), stats.RequestBodySizeBuckets.LE1MiB)
+
+	storedBody, err := first.Bytes()
+	require.NoError(t, err)
+	require.Equal(t, body, storedBody)
+
+	second, err := CreateBodyStorage(body)
+	require.NoError(t, err, "a completed parse must not occupy the next request's parsing slot")
+	require.Equal(t, int64(1), GetRequestBodyStats().ActiveLargeBodySlots)
+
+	// Both operations are idempotent: Close must not decrement an already
+	// released lease, while the second body falls back to releasing on Close.
+	first.ReleaseAdmission()
+	require.NoError(t, first.Close())
+	require.NoError(t, second.Close())
+	stats = GetRequestBodyStats()
+	require.Equal(t, int64(0), stats.ActiveLargeBodySlots)
+	require.Equal(t, int64(2), stats.AdmissionHoldsTotal)
+	require.Equal(t, int64(2), stats.ObservedBodiesTotal)
+}
+
+func TestLargeBodyAdmissionMetricsCountRejections(t *testing.T) {
+	setBodyStorageTestConfig(t, DiskCacheConfig{Enabled: false, ThresholdMB: 1})
+	oldLimit := constant.MaxConcurrentLargeRequestBodies
+	constant.MaxConcurrentLargeRequestBodies = 1
+	t.Cleanup(func() { constant.MaxConcurrentLargeRequestBodies = oldLimit })
+	ResetRequestBodyStats()
+	t.Cleanup(ResetRequestBodyStats)
+
+	body := bytes.Repeat([]byte("x"), 1<<20)
+	first, err := CreateBodyStorage(body)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, first.Close()) })
+
+	second, err := CreateBodyStorage(body)
+	require.Nil(t, second)
+	require.True(t, IsBodyAdmissionError(err))
+
+	stats := GetRequestBodyStats()
+	require.Equal(t, int64(1), stats.ActiveLargeBodySlots)
+	require.Equal(t, int64(1), stats.LargeBodySlotLimit)
+	require.Equal(t, int64(1), stats.RejectedLargeBodyAdmissionsTotal)
+	require.Equal(t, int64(1), stats.ObservedBodiesTotal, "rejected bodies are not fully retained or double-counted")
 }
 
 func TestUnknownLengthBodyAcquiresAdmissionBeforeDiskThreshold(t *testing.T) {
