@@ -22,6 +22,8 @@ type PerformanceStats struct {
 	CacheStats common.DiskCacheStats `json:"cache_stats"`
 	// 请求体准入、大小与持有时长统计
 	RequestBodyStats common.RequestBodyStats `json:"request_body_stats"`
+	// 用户鉴权缓存与数据库回源统计
+	UserCacheStats common.UserCacheStats `json:"user_cache_stats"`
 	// 系统内存统计
 	MemoryStats MemoryStats `json:"memory_stats"`
 	// 磁盘缓存目录信息
@@ -87,6 +89,7 @@ func GetPerformanceStats(c *gin.Context) {
 	// 仅在系统启动或显式清理时同步
 	cacheStats := common.GetDiskCacheStats()
 	requestBodyStats := common.GetRequestBodyStats()
+	userCacheStats := common.GetUserCacheStats()
 
 	// 获取内存统计
 	var memStats runtime.MemStats
@@ -125,6 +128,7 @@ func GetPerformanceStats(c *gin.Context) {
 	stats := PerformanceStats{
 		CacheStats:       cacheStats,
 		RequestBodyStats: requestBodyStats,
+		UserCacheStats:   userCacheStats,
 		MemoryStats: MemoryStats{
 			Alloc:        memStats.Alloc,
 			TotalAlloc:   memStats.TotalAlloc,

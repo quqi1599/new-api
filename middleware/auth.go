@@ -261,7 +261,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		userCache, err := model.GetUserCache(token.UserId)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("TokenAuthReadOnly GetUserCache error for user %d: %v", token.UserId, err))
-			c.JSON(http.StatusInternalServerError, gin.H{
+			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"success": false,
 				"message": common.TranslateMessage(c, i18n.MsgDatabaseError),
 			})
@@ -378,7 +378,7 @@ func TokenAuth() func(c *gin.Context) {
 		userCache, err := model.GetUserCache(token.UserId)
 		if err != nil {
 			common.SysLog(fmt.Sprintf("TokenAuth GetUserCache error for user %d: %v", token.UserId, err))
-			abortWithOpenAiMessage(c, http.StatusInternalServerError,
+			abortWithOpenAiMessage(c, http.StatusServiceUnavailable,
 				common.TranslateMessage(c, i18n.MsgDatabaseError))
 			return
 		}

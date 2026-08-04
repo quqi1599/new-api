@@ -428,11 +428,21 @@ func downgradeUserGroupForSubscriptionTx(tx *gorm.DB, sub *UserSubscription, now
 	if prevGroup == "" || prevGroup == currentGroup {
 		return "", nil
 	}
+	MarkUserCacheDirty(sub.UserId)
 	if err := tx.Model(&User{}).Where("id = ?", sub.UserId).
 		Update("group", prevGroup).Error; err != nil {
 		return "", err
 	}
 	return prevGroup, nil
+}
+
+func invalidateSubscriptionUserCache(userId int, group string) {
+	if err := UpdateUserGroupCache(userId, group); err != nil {
+		// The mutation path has already marked this user dirty. Keep DB-only auth
+		// active and surface the reconciliation failure instead of silently
+		// trusting the old permission snapshot.
+		common.SysLog(fmt.Sprintf("failed to invalidate subscription user cache for user %d: %v", userId, err))
+	}
 }
 
 func CreateUserSubscriptionFromPlanTx(tx *gorm.DB, userId int, plan *SubscriptionPlan, source string) (*UserSubscription, error) {
@@ -477,6 +487,7 @@ func CreateUserSubscriptionFromPlanTx(tx *gorm.DB, userId int, plan *Subscriptio
 		}
 		if currentGroup != upgradeGroup {
 			prevGroup = currentGroup
+			MarkUserCacheDirty(userId)
 			if err := tx.Model(&User{}).Where("id = ?", userId).
 				Update("group", upgradeGroup).Error; err != nil {
 				return nil, err
@@ -571,7 +582,7 @@ func CompleteSubscriptionOrder(tradeNo string, providerPayload string, expectedP
 		return err
 	}
 	if upgradeGroup != "" && logUserId > 0 {
-		_ = UpdateUserGroupCache(logUserId, upgradeGroup)
+		invalidateSubscriptionUserCache(logUserId, upgradeGroup)
 	}
 	if logUserId > 0 {
 		msg := fmt.Sprintf("订阅购买成功，套餐: %s，支付金额: %.2f，支付方式: %s", logPlanTitle, logMoney, logPaymentMethod)
@@ -658,7 +669,7 @@ func AdminBindSubscription(userId int, planId int, sourceNote string) (string, e
 		return "", err
 	}
 	if strings.TrimSpace(plan.UpgradeGroup) != "" {
-		_ = UpdateUserGroupCache(userId, plan.UpgradeGroup)
+		invalidateSubscriptionUserCache(userId, plan.UpgradeGroup)
 		return fmt.Sprintf("用户分组将升级到 %s", plan.UpgradeGroup), nil
 	}
 	return "", nil
@@ -762,7 +773,7 @@ func AdminInvalidateUserSubscription(userSubscriptionId int) (string, error) {
 		return "", err
 	}
 	if cacheGroup != "" && userId > 0 {
-		_ = UpdateUserGroupCache(userId, cacheGroup)
+		invalidateSubscriptionUserCache(userId, cacheGroup)
 	}
 	if downgradeGroup != "" {
 		return fmt.Sprintf("用户分组将回退到 %s", downgradeGroup), nil
@@ -803,7 +814,7 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
 		return "", err
 	}
 	if cacheGroup != "" && userId > 0 {
-		_ = UpdateUserGroupCache(userId, cacheGroup)
+		invalidateSubscriptionUserCache(userId, cacheGroup)
 	}
 	if downgradeGroup != "" {
 		return fmt.Sprintf("用户分组将回退到 %s", downgradeGroup), nil
@@ -889,6 +900,7 @@ func ExpireDueSubscriptions(limit int) (int, error) {
 			if currentGroup != upgradeGroup || currentGroup == prevGroup {
 				return nil
 			}
+			MarkUserCacheDirty(userId)
 			if err := tx.Model(&User{}).Where("id = ?", userId).
 				Update("group", prevGroup).Error; err != nil {
 				return err
@@ -900,7 +912,7 @@ func ExpireDueSubscriptions(limit int) (int, error) {
 			return expiredCount, err
 		}
 		if cacheGroup != "" {
-			_ = UpdateUserGroupCache(userId, cacheGroup)
+			invalidateSubscriptionUserCache(userId, cacheGroup)
 		}
 	}
 	return expiredCount, nil

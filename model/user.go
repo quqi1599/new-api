@@ -55,13 +55,14 @@ type User struct {
 
 func (user *User) ToBaseUser() *UserBase {
 	cache := &UserBase{
-		Id:       user.Id,
-		Group:    user.Group,
-		Quota:    user.Quota,
-		Status:   user.Status,
-		Username: user.Username,
-		Setting:  user.Setting,
-		Email:    user.Email,
+		Id:          user.Id,
+		Group:       user.Group,
+		Quota:       user.Quota,
+		Status:      user.Status,
+		Username:    user.Username,
+		Setting:     user.Setting,
+		Email:       user.Email,
+		CacheSchema: userCacheSchemaVersion,
 	}
 	return cache
 }
@@ -429,8 +430,11 @@ func HardDeleteUserById(id int) error {
 	if id == 0 {
 		return errors.New("id 为空！")
 	}
-	err := DB.Unscoped().Delete(&User{}, "id = ?", id).Error
-	return err
+	MarkUserCacheDirty(id)
+	if err := DB.Unscoped().Delete(&User{}, "id = ?", id).Error; err != nil {
+		return err
+	}
+	return invalidateUserCache(id)
 }
 
 func inviteUser(inviterId int) (err error) {
@@ -639,6 +643,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 }
 
 func (user *User) Update(updatePassword bool) error {
+	MarkUserCacheDirty(user.Id)
 	if err := user.UpdateWithTx(DB, updatePassword); err != nil {
 		return err
 	}
@@ -665,6 +670,7 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 }
 
 func (user *User) Edit(updatePassword bool) error {
+	MarkUserCacheDirty(user.Id)
 	if err := user.EditWithTx(DB, updatePassword); err != nil {
 		return err
 	}
@@ -736,6 +742,7 @@ func (user *User) Delete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
+	MarkUserCacheDirty(user.Id)
 	if err := DB.Delete(user).Error; err != nil {
 		return err
 	}
@@ -748,8 +755,11 @@ func (user *User) HardDelete() error {
 	if user.Id == 0 {
 		return errors.New("id 为空！")
 	}
-	err := DB.Unscoped().Delete(user).Error
-	return err
+	MarkUserCacheDirty(user.Id)
+	if err := DB.Unscoped().Delete(user).Error; err != nil {
+		return err
+	}
+	return invalidateUserCache(user.Id)
 }
 
 // ValidateAndFill check password & user status
@@ -976,16 +986,6 @@ func GetUserEmail(id int) (email string, err error) {
 
 // GetUserGroup gets group from Redis first, falls back to DB if needed
 func GetUserGroup(id int, fromDB bool) (group string, err error) {
-	defer func() {
-		// Update Redis cache asynchronously on successful DB read
-		if shouldUpdateRedis(fromDB, err) {
-			gopool.Go(func() {
-				if err := updateUserGroupCache(id, group); err != nil {
-					common.SysLog("failed to update user group cache: " + err.Error())
-				}
-			})
-		}
-	}()
 	if !fromDB && common.RedisEnabled {
 		group, err := getUserGroupCache(id)
 		if err == nil {
@@ -1092,12 +1092,11 @@ func ReserveUserQuota(id int, quota int) error {
 		return ErrInsufficientUserQuota
 	}
 
-	// Redis is derived state. Invalidate it only after the durable reservation
-	// succeeds so a stale cached balance can never authorize provider work.
-	// Cache failure must not turn a committed debit into a retryable error.
-	if err := invalidateUserCache(id); err != nil {
-		common.SysLog("failed to invalidate user cache after reserving quota: " + err.Error())
-	}
+	// Do not delete or mutate the shared authentication hash here. Without a
+	// quota version, a concurrent post-debit DB refill followed by this delta can
+	// double-decrement the cache and cause false insufficient-quota rejections.
+	// The conditional database update above remains the authoritative no-overdraw
+	// gate; the short-lived cached quota may be high, but cannot authorize spend.
 	return nil
 }
 
