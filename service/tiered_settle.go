@@ -1,9 +1,14 @@
 package service
 
 import (
+	"errors"
+	"net/http"
+
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 )
 
 // TieredResultWrapper wraps billingexpr.TieredResult for use at the service layer.
@@ -88,8 +93,70 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	}
 }
 
+func refreshTieredBillingGroup(relayInfo *relaycommon.RelayInfo) (*billingexpr.BillingSnapshot, error) {
+	if relayInfo == nil {
+		return nil, nil
+	}
+	snapshot := relayInfo.TieredBillingSnapshot
+	if snapshot == nil || snapshot.BillingMode != "tiered_expr" {
+		return nil, nil
+	}
+
+	groupRatio := relayInfo.PriceData.GroupRatioInfo.GroupRatio
+	if snapshot.GroupRatio == groupRatio {
+		return snapshot, nil
+	}
+
+	estimatedQuota, err := billingexpr.QuotaRoundStrict(snapshot.EstimatedQuotaBeforeGroup * groupRatio)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.GroupRatio = groupRatio
+	snapshot.EstimatedQuotaAfterGroup = estimatedQuota
+	return snapshot, nil
+}
+
+// PrepareTieredBillingForSelectedGroup refreshes the group-dependent estimate
+// before every upstream attempt. Moving to a more expensive group must reserve
+// the additional wallet/token quota first; insufficient quota is a hard stop.
+func PrepareTieredBillingForSelectedGroup(c *gin.Context, relayInfo *relaycommon.RelayInfo) *types.NewAPIError {
+	snapshot, err := refreshTieredBillingGroup(relayInfo)
+	if err != nil {
+		return types.NewErrorWithStatusCode(
+			err,
+			types.ErrorCodeModelPriceError,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
+	}
+	if snapshot == nil {
+		return nil
+	}
+	if snapshot.GroupRatio == 0 {
+		// A paid-to-free switch settles to zero through the existing session;
+		// FreeModel remains false because an initial reservation did occur.
+		return nil
+	}
+
+	// An initially free auto group may retry on a paid group. Keep PriceData in
+	// sync before creating the delayed billing session.
+	relayInfo.PriceData.FreeModel = false
+	if relayInfo.Billing == nil {
+		return PreConsumeBilling(c, snapshot.EstimatedQuotaAfterGroup, relayInfo)
+	}
+	if err := relayInfo.Billing.Reserve(snapshot.EstimatedQuotaAfterGroup); err != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			return apiErr
+		}
+		return types.NewError(err, types.ErrorCodeUpdateDataError, types.ErrOptionWithSkipRetry())
+	}
+	relayInfo.FinalPreConsumedQuota = relayInfo.Billing.GetPreConsumedQuota()
+	return nil
+}
+
 // TryTieredSettle checks if the request uses tiered_expr billing and, if so,
-// computes the actual quota using the frozen BillingSnapshot. Returns:
+// computes the actual quota using the captured BillingSnapshot. Returns:
 //   - ok=true, quota, result  when tiered billing applies
 //   - ok=false, 0, nil        when it doesn't (caller should fall through to existing logic)
 func TryTieredSettle(relayInfo *relaycommon.RelayInfo, params billingexpr.TokenParams) (ok bool, quota int, result *billingexpr.TieredResult) {

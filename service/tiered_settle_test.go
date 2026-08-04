@@ -1,15 +1,20 @@
 package service
 
 import (
+	"errors"
 	"math"
 	"math/rand"
+	"net/http"
 	"sync"
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/require"
 )
 
 // Claude Sonnet-style tiered expression: standard vs long-context
@@ -309,6 +314,100 @@ func TestTryTieredSettle_NoRequestInput_FallsBackToDefault(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Group ratio tests
 // ---------------------------------------------------------------------------
+
+type recordingTieredBilling struct {
+	preConsumedQuota int
+	reserveTargets   []int
+	reserveErr       error
+}
+
+func (*recordingTieredBilling) Settle(int) error    { return nil }
+func (*recordingTieredBilling) Refund(*gin.Context) {}
+func (*recordingTieredBilling) NeedsRefund() bool   { return false }
+func (b *recordingTieredBilling) GetPreConsumedQuota() int {
+	return b.preConsumedQuota
+}
+func (b *recordingTieredBilling) GetInitialPreConsumedQuota() int {
+	return b.preConsumedQuota
+}
+func (b *recordingTieredBilling) Reserve(targetQuota int) error {
+	b.reserveTargets = append(b.reserveTargets, targetQuota)
+	if b.reserveErr != nil {
+		return b.reserveErr
+	}
+	if targetQuota > b.preConsumedQuota {
+		b.preConsumedQuota = targetQuota
+	}
+	return nil
+}
+
+func TestPrepareTieredBillingForSelectedGroupUpdatesReservation(t *testing.T) {
+	billing := &recordingTieredBilling{preConsumedQuota: 50_000}
+	info := &relaycommon.RelayInfo{
+		Billing:               billing,
+		FinalPreConsumedQuota: 50_000,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			GroupRatio:                0.10,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  50_000,
+		},
+		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20}},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, info))
+	require.Equal(t, []int{100_000}, billing.reserveTargets)
+	require.Equal(t, 100_000, billing.preConsumedQuota)
+	require.Equal(t, 100_000, info.FinalPreConsumedQuota)
+	require.Equal(t, 0.20, info.TieredBillingSnapshot.GroupRatio)
+	require.Equal(t, 100_000, info.TieredBillingSnapshot.EstimatedQuotaAfterGroup)
+}
+
+func TestPrepareTieredBillingForSelectedGroupPreservesInsufficientQuotaError(t *testing.T) {
+	insufficient := types.NewErrorWithStatusCode(
+		errors.New("insufficient quota"),
+		types.ErrorCodeInsufficientUserQuota,
+		http.StatusForbidden,
+		types.ErrOptionWithSkipRetry(),
+	)
+	billing := &recordingTieredBilling{preConsumedQuota: 50_000, reserveErr: insufficient}
+	info := &relaycommon.RelayInfo{
+		Billing: billing,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			GroupRatio:                0.10,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  50_000,
+		},
+		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0.20}},
+	}
+
+	apiErr := PrepareTieredBillingForSelectedGroup(nil, info)
+	require.Same(t, insufficient, apiErr)
+	require.Equal(t, types.ErrorCodeInsufficientUserQuota, apiErr.GetErrorCode())
+	require.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+	require.Equal(t, 50_000, billing.preConsumedQuota)
+}
+
+func TestPrepareTieredBillingForSelectedGroupPaidToFreeSettlesAtFinalGroup(t *testing.T) {
+	billing := &recordingTieredBilling{preConsumedQuota: 50_000}
+	info := &relaycommon.RelayInfo{
+		Billing: billing,
+		TieredBillingSnapshot: &billingexpr.BillingSnapshot{
+			BillingMode:               "tiered_expr",
+			GroupRatio:                0.10,
+			EstimatedQuotaBeforeGroup: 500_000,
+			EstimatedQuotaAfterGroup:  50_000,
+		},
+		PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 0}},
+	}
+
+	require.Nil(t, PrepareTieredBillingForSelectedGroup(nil, info))
+	require.Empty(t, billing.reserveTargets)
+	ok, quota, _ := TryTieredSettle(info, billingexpr.TokenParams{P: 1_000_000})
+	require.True(t, ok)
+	require.Equal(t, 0, quota)
+}
 
 func TestTryTieredSettle_GroupRatioScaling(t *testing.T) {
 	info := makeRelayInfo(flatExpr, 1.5, 1000, 500)

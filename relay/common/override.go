@@ -657,18 +657,38 @@ func compareNumeric(jsonValue, targetValue gjson.Result, operator string) (bool,
 
 // applyOperationsLegacy 原参数覆盖方法
 func applyOperationsLegacy(jsonData []byte, paramOverride map[string]interface{}, auditRecorder *paramOverrideAuditRecorder) ([]byte, error) {
-	reqMap := make(map[string]interface{})
-	err := common.Unmarshal(jsonData, &reqMap)
-	if err != nil {
-		return nil, err
+	if len(paramOverride) == 0 {
+		return jsonData, nil
 	}
 
+	result := jsonData
 	for key, value := range paramOverride {
-		reqMap[key] = value
+		next, err := sjson.SetBytes(result, escapeSjsonLiteralKey(key), value)
+		if err != nil {
+			return nil, err
+		}
+		result = next
 		auditRecorder.recordOperation("set", key, "", "", value)
 	}
 
-	return common.Marshal(reqMap)
+	return result, nil
+}
+
+func escapeSjsonLiteralKey(key string) string {
+	if !strings.ContainsAny(key, ".*?\\") {
+		return key
+	}
+	var builder strings.Builder
+	builder.Grow(len(key) + 4)
+	for i := 0; i < len(key); i++ {
+		character := key[i]
+		switch character {
+		case '.', '*', '?', '\\':
+			builder.WriteByte('\\')
+		}
+		builder.WriteByte(character)
+	}
+	return builder.String()
 }
 
 func applyOperations(jsonStr string, operations []ParamOperation, conditionContext map[string]interface{}) (string, error) {

@@ -672,6 +672,13 @@ func AddChannel(c *gin.Context) {
 
 func DeleteChannel(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
+	channelProxy := ""
+	channelLookupFailed := false
+	if existing, lookupErr := model.GetChannelById(id, false); lookupErr == nil && existing != nil {
+		channelProxy = existing.GetSetting().Proxy
+	} else {
+		channelLookupFailed = true
+	}
 	channel := model.Channel{Id: id}
 	err := channel.Delete()
 	if err != nil {
@@ -679,6 +686,11 @@ func DeleteChannel(c *gin.Context) {
 		return
 	}
 	model.InitChannelCache()
+	if channelLookupFailed {
+		service.ResetProxyClientCache()
+	} else {
+		service.InvalidateProxyClient(channelProxy)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",

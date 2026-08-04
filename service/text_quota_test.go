@@ -490,3 +490,100 @@ func TestTryTieredSettleNoClampInRange(t *testing.T) {
 	require.NotNil(t, result)
 	require.Nil(t, relayInfo.QuotaClamp, "in-range settlement must not record a clamp")
 }
+
+func TestCalculateTextQuotaSummaryFixedPriceAppliesImageCountOnceAndAllowsOverride(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	priceData := types.PriceData{
+		ModelPrice: 0.12,
+		UsePrice:   true,
+		GroupRatioInfo: types.GroupRatioInfo{
+			GroupRatio: 1,
+		},
+	}
+	priceData.AddOtherRatio("n", 3)
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "dall-e-3",
+		PriceData:       priceData,
+		StartTime:       time.Now(),
+	}
+	usage := &dto.Usage{PromptTokens: 1, TotalTokens: 1}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, usage)
+	require.Equal(t, 180000, summary.Quota)
+
+	// An adaptor-reported actual count replaces the requested count rather
+	// than multiplying it a second time.
+	relayInfo.PriceData.AddOtherRatio("n", 2)
+	summary = calculateTextQuotaSummary(ctx, relayInfo, usage)
+	require.Equal(t, 120000, summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryBillsToolsWhenTokenUsageIsZero(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4.1",
+		PriceData: types.PriceData{
+			ModelRatio: 1, CompletionRatio: 1,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+			dto.BuildInToolWebSearch: {ToolName: dto.BuildInToolWebSearch, CallCount: 1},
+		}},
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+
+	require.Equal(t, 5000, summary.Quota)
+	require.True(t, summary.hasBillableUsage())
+}
+
+func TestCalculateTextQuotaSummaryDoesNotMultiplyToolFeeByRequestCount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	priceData := types.PriceData{
+		ModelRatio: 1, CompletionRatio: 1,
+		GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+	}
+	priceData.AddOtherRatio("n", 3)
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4.1",
+		PriceData:       priceData,
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{
+			dto.BuildInToolWebSearch: {ToolName: dto.BuildInToolWebSearch, CallCount: 1},
+		}},
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{PromptTokens: 100, TotalTokens: 100})
+
+	require.Equal(t, 5300, summary.Quota)
+}
+
+func TestCalculateTextQuotaSummaryBillsEachCompletedImageAtItsActualPrice(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayInfo := &relaycommon.RelayInfo{
+		OriginModelName: "gpt-4.1",
+		PriceData: types.PriceData{
+			ModelRatio: 1, CompletionRatio: 1,
+			GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1},
+		},
+		ResponsesUsageInfo: &relaycommon.ResponsesUsageInfo{
+			BuiltInTools: map[string]*relaycommon.BuildInToolInfo{},
+			ImageGenerationCalls: []relaycommon.ImageGenerationCallInfo{
+				{Quality: "low", Size: "1024x1024"},
+				{Quality: "high", Size: "1024x1536"},
+			},
+		},
+		StartTime: time.Now(),
+	}
+
+	summary := calculateTextQuotaSummary(ctx, relayInfo, &dto.Usage{})
+
+	// ($0.011 + $0.25) * 500,000 quota/$ = 130,500.
+	require.Equal(t, 130500, summary.Quota)
+	require.Len(t, summary.ToolSurchargeItems, 2)
+}

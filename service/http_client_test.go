@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,6 +96,53 @@ func TestExplicitProxyClientsShareRelayTransportPolicy(t *testing.T) {
 	assertRelayTransportPolicy(t, socksProxyTransport)
 	assert.Zero(t, socksProxyClient.Timeout)
 	assert.Nil(t, socksProxyTransport.Proxy)
+}
+
+func TestProxyClientCacheCanonicalizesAndInvalidates(t *testing.T) {
+	configureRelayTransportForTest(t)
+
+	first, err := GetHttpClientWithProxy("http://127.0.0.1:3128/")
+	require.NoError(t, err)
+	alias, err := GetHttpClientWithProxy("http://127.0.0.1:3128/legacy?ignored=1")
+	require.NoError(t, err)
+	require.Same(t, first, alias)
+
+	InvalidateProxyClient("http://127.0.0.1:3128")
+	after, err := GetHttpClientWithProxy("http://127.0.0.1:3128")
+	require.NoError(t, err)
+	require.NotSame(t, first, after)
+}
+
+func TestProxyClientCacheCreatesOneClientConcurrently(t *testing.T) {
+	configureRelayTransportForTest(t)
+
+	const workers = 32
+	clients := make(chan *http.Client, workers)
+	errorsCh := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			client, err := GetHttpClientWithProxy("socks5://127.0.0.1:1080")
+			clients <- client
+			errorsCh <- err
+		}()
+	}
+	wait.Wait()
+	close(clients)
+	close(errorsCh)
+	for err := range errorsCh {
+		require.NoError(t, err)
+	}
+	var first *http.Client
+	for client := range clients {
+		if first == nil {
+			first = client
+			continue
+		}
+		require.Same(t, first, client)
+	}
 }
 
 func TestRelayResponseHeaderTimeoutDoesNotBecomeBodyTimeout(t *testing.T) {
