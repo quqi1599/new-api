@@ -98,6 +98,7 @@ type NewAPIError struct {
 	RelayError          any
 	skipRetry           bool
 	allowChannelPenalty bool
+	upstreamResponded   bool
 	recordErrorLog      *bool
 	errorType           ErrorType
 	errorCode           ErrorCode
@@ -396,6 +397,14 @@ func IsChannelPenaltyAllowed(err *NewAPIError) bool {
 	return !err.skipRetry || err.allowChannelPenalty
 }
 
+// HasUpstreamResponse reports whether the error came from an explicit HTTP
+// response returned by the selected upstream. This is different from a local
+// transport failure where the request may have been accepted but no terminal
+// upstream result was observed.
+func (e *NewAPIError) HasUpstreamResponse() bool {
+	return e != nil && e.upstreamResponded
+}
+
 func ErrOptionWithSkipRetry() NewAPIErrorOptions {
 	return func(e *NewAPIError) {
 		e.skipRetry = true
@@ -405,6 +414,12 @@ func ErrOptionWithSkipRetry() NewAPIErrorOptions {
 func ErrOptionWithChannelPenalty() NewAPIErrorOptions {
 	return func(e *NewAPIError) {
 		e.allowChannelPenalty = true
+	}
+}
+
+func ErrOptionWithUpstreamResponse() NewAPIErrorOptions {
+	return func(e *NewAPIError) {
+		e.upstreamResponded = true
 	}
 }
 

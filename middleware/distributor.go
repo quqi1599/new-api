@@ -144,14 +144,22 @@ func Distribute() func(c *gin.Context) {
 									selectGroup = g
 									common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
 									channel = preferred
-									service.MarkChannelAffinityUsed(c, g, preferred.Id)
 									break
 								}
 							}
 						} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
 							channel = preferred
 							selectGroup = usingGroup
-							service.MarkChannelAffinityUsed(c, usingGroup, preferred.Id)
+						}
+					}
+					if channel != nil {
+						circuitDecision := service.ChannelCircuitAllowAttempt(c.Request.Context(), channel.Id, modelRequest.Model)
+						if !circuitDecision.Allowed {
+							service.ClearChannelAffinityForRequest(c)
+							channel = nil
+							common.SysLog(fmt.Sprintf("channel circuit skipped affinity channel #%d for model %s: state=%s retry_after=%s", preferredChannelID, modelRequest.Model, circuitDecision.State, circuitDecision.RetryAfter))
+						} else {
+							service.MarkChannelAffinityUsed(c, selectGroup, channel.Id)
 						}
 					}
 				}
@@ -186,10 +194,19 @@ func Distribute() func(c *gin.Context) {
 			}
 		}
 		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+			if channel != nil {
+				service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, modelRequest.Model)
+			}
+			abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.Error(), setupErr.GetErrorCode())
+			return
+		}
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest {
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && !c.GetBool("background_relay_submitted") {
 			service.RecordChannelAffinity(c, channel.Id)
+		}
+		if channel != nil && !c.GetBool("background_relay_submitted") {
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, modelRequest.Model)
 		}
 	}
 }
