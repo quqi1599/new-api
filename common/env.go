@@ -66,3 +66,24 @@ func ParseTokenRPMRateLimits(raw string) (map[int]int, error) {
 
 	return limits, nil
 }
+
+func ParsePositiveIDSet(raw string) (map[int]struct{}, error) {
+	ids := make(map[int]struct{})
+	if strings.TrimSpace(raw) == "" {
+		return ids, nil
+	}
+
+	for _, entry := range strings.Split(raw, ",") {
+		value := strings.TrimSpace(entry)
+		id, err := strconv.ParseInt(value, 10, 32)
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("invalid positive id %q", entry)
+		}
+		if _, exists := ids[int(id)]; exists {
+			return nil, fmt.Errorf("duplicate id %d", id)
+		}
+		ids[int(id)] = struct{}{}
+	}
+
+	return ids, nil
+}

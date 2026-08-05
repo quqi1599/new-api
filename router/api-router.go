@@ -256,6 +256,9 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			tokenAdminRoute.GET("/", controller.AdminGetAllTokens)
 			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
+			tokenAdminRoute.POST("/saas-topup/resolve", middleware.DisableCache(), controller.ResolveSaaSTopupToken)
+			tokenAdminRoute.POST("/saas-topup/validate", middleware.DisableCache(), controller.ValidateSaaSTopupTokenTarget)
+			tokenAdminRoute.POST("/saas-topup/grant-quota", middleware.DisableCache(), controller.GrantSaaSTopupTokenQuota)
 			tokenAdminRoute.GET("/protected_channel_bans", controller.AdminGetProtectedChannelBans)
 			tokenAdminRoute.DELETE("/protected_channel_bans/:token_id", middleware.RootAuth(), controller.AdminDeleteProtectedChannelBan)
 			tokenAdminRoute.POST("/batch/keys", middleware.RootAuth(), middleware.CriticalRateLimit(), middleware.DisableCache(), controller.AdminGetTokenKeysBatch)

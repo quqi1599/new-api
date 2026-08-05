@@ -3,6 +3,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -40,6 +41,14 @@ func formatTokenQuotaGrantLog(token *model.Token, amount int, note string) strin
 }
 
 func GrantTokenQuota(c *gin.Context) {
+	grantTokenQuota(c, false)
+}
+
+func GrantSaaSTopupTokenQuota(c *gin.Context) {
+	grantTokenQuota(c, true)
+}
+
+func grantTokenQuota(c *gin.Context, enforceSaaSTopupExclusion bool) {
 	var req GrantTokenQuotaRequest
 	if err := common.DecodeJson(c.Request.Body, &req); err != nil {
 		common.ApiErrorMsg(c, "invalid request body")
@@ -68,6 +77,20 @@ func GrantTokenQuota(c *gin.Context) {
 	if token.UserId != req.UserID {
 		common.ApiErrorMsg(c, "token user mismatch")
 		return
+	}
+	if enforceSaaSTopupExclusion {
+		eligible, err := isSaaSTopupTokenEligible(token)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		if !eligible {
+			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+				"success": false,
+				"message": "token not found",
+			})
+			return
+		}
 	}
 
 	beforeRemainQuota := token.RemainQuota

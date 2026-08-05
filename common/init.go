@@ -178,6 +178,11 @@ func InitEnv() {
 		log.Fatalf("invalid TOKEN_RPM_LIMITS: %v", err)
 	}
 	TokenRPMRateLimits = tokenRPMRateLimits
+	saasTopupExcludedUserIDs, err := ParsePositiveIDSet(os.Getenv("SAAS_TOPUP_EXCLUDED_USER_IDS"))
+	if err != nil {
+		log.Fatalf("invalid SAAS_TOPUP_EXCLUDED_USER_IDS: %v", err)
+	}
+	constant.SaaSTopupExcludedUserIDs = saasTopupExcludedUserIDs
 	initConstantEnv()
 }
 
