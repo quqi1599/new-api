@@ -142,6 +142,8 @@ func DispatchPlatformUpdate(platform constant.TaskPlatform, taskChannelM map[int
 	switch platform {
 	case constant.TaskPlatformMidjourney:
 		// MJ 轮询由其自身处理，这里预留入口
+	case constant.TaskPlatformBackgroundRelay:
+		// 通用后台 Relay Job 由提交它的工作协程推进；这里不能把它当成视频任务轮询。
 	case constant.TaskPlatformSuno:
 		_ = UpdateSunoTasks(context.Background(), taskChannelM, taskM)
 	default:

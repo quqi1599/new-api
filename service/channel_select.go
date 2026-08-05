@@ -1,8 +1,11 @@
 package service
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -20,6 +23,8 @@ type RetryParam struct {
 	resetNextTry          bool
 	PreferredChannelTypes []int // native channel types to prioritize based on request path
 	ExcludedChannelIds    []int // channels that have already failed in this request
+	CircuitRetryAfter     time.Duration
+	CircuitSkippedIds     []int
 }
 
 func (p *RetryParam) GetRetry() int {
@@ -101,6 +106,41 @@ func excludedChannelIdsForRequest(param *RetryParam) []int {
 //	Retry=3: GroupB, priority1 (startRetryIndex=2, priorityRetry=1)
 //	         分组B, 优先级1
 func CacheGetRandomSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
+	if param == nil {
+		return nil, "", errors.New("retry param is nil")
+	}
+	param.CircuitRetryAfter = 0
+	param.CircuitSkippedIds = nil
+	for {
+		channel, selectGroup, err := cacheGetRandomSatisfiedChannelOnce(param)
+		if err != nil || channel == nil {
+			return channel, selectGroup, err
+		}
+		requestCtx := context.Background()
+		if param.Ctx != nil && param.Ctx.Request != nil {
+			requestCtx = param.Ctx.Request.Context()
+		}
+		decision := ChannelCircuitAllowAttempt(requestCtx, channel.Id, param.ModelName)
+		if decision.Allowed {
+			return channel, selectGroup, nil
+		}
+		if !slices.Contains(param.ExcludedChannelIds, channel.Id) {
+			param.ExcludedChannelIds = append(param.ExcludedChannelIds, channel.Id)
+		}
+		param.CircuitSkippedIds = append(param.CircuitSkippedIds, channel.Id)
+		if decision.RetryAfter > 0 && (param.CircuitRetryAfter == 0 || decision.RetryAfter < param.CircuitRetryAfter) {
+			param.CircuitRetryAfter = decision.RetryAfter
+		}
+		message := fmt.Sprintf("channel circuit skipped channel #%d for model %s: state=%s retry_after=%s", channel.Id, param.ModelName, decision.State, decision.RetryAfter)
+		if param.Ctx != nil {
+			logger.LogInfo(param.Ctx, message)
+		} else {
+			common.SysLog(message)
+		}
+	}
+}
+
+func cacheGetRandomSatisfiedChannelOnce(param *RetryParam) (*model.Channel, string, error) {
 	var channel *model.Channel
 	var err error
 	selectGroup := param.TokenGroup

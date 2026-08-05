@@ -10,6 +10,15 @@ const (
 	ContextKeyOriginalModel    ContextKey = "original_model"
 	ContextKeyRequestStartTime ContextKey = "request_start_time"
 
+	/* relay observability keys */
+	ContextKeyRelayCancelOrigin      ContextKey = "relay_cancel_origin"
+	ContextKeyRelayBodyComplete      ContextKey = "relay_body_complete"
+	ContextKeyRelayConnectedUpstream ContextKey = "relay_connected_upstream"
+	ContextKeyRelayRequestWritten    ContextKey = "relay_request_written"
+	ContextKeyRelayResponseHeaders   ContextKey = "relay_response_headers_received"
+	ContextKeyRelayFirstValidEvent   ContextKey = "relay_first_valid_event_received"
+	ContextKeyRelayOutputStarted     ContextKey = "relay_output_started"
+
 	/* token related keys */
 	ContextKeyTokenUnlimited         ContextKey = "token_unlimited_quota"
 	ContextKeyTokenKey               ContextKey = "token_key"

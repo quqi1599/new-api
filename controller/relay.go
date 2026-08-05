@@ -232,29 +232,69 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
-	retryLimit := common.RetryTimes
-	forcedFallbackStarted := false
+	retryState := service.NewRelayRetryState(relayFormat, common.RetryTimes)
+	setRelayRetryDiagnostics(c, retryState)
+	lastRetryAllowed := false
 
-	for ; retryParam.GetRetry() <= retryLimit; retryParam.IncreaseRetry() {
-		wasForcedFallbackAttempt := forcedFallbackStarted
+	for retryState.CanAttempt(c.Request.Context()) {
 		relayInfo.RetryIndex = retryParam.GetRetry()
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			newAPIError = channelErr
+			canStartNextRound := (lastRetryAllowed || len(retryParam.CircuitSkippedIds) > 0) &&
+				retryState.CanStartNextRound(c.Request.Context())
+			if canStartNextRound {
+				delay := retryState.NextRoundDelay(retryParam.CircuitRetryAfter)
+				logger.LogInfo(c, fmt.Sprintf(
+					"relay retry round exhausted: round=%d attempts=%d distinct_channels=%d wait=%s",
+					retryState.Round,
+					retryState.Attempts,
+					retryState.DistinctChannelCount(),
+					delay,
+				))
+				if !service.WaitForRelayRetry(c.Request.Context(), delay) {
+					retryState.StopReason = service.RetryStopReasonClientGone
+					if relayInfo.LastError != nil {
+						newAPIError = relayInfo.LastError
+					} else {
+						newAPIError = channelErr
+					}
+					break
+				}
+				retryState.StartNextRound()
+				retryParam.ExcludedChannelIds = nil
+				retryParam.SetRetry(0)
+				common.SetContextKey(c, constant.ContextKeyAutoGroupIndex, 0)
+				common.SetContextKey(c, constant.ContextKeyAutoGroupRetryIndex, 0)
+				setRelayRetryDiagnostics(c, retryState)
+				continue
+			}
+			if relayInfo.LastError != nil {
+				newAPIError = relayInfo.LastError
+			} else {
+				newAPIError = channelErr
+			}
+			if retryState.StopReason == "" {
+				retryState.StopReason = service.RetryStopReasonNoChannel
+			}
 			break
 		}
 
+		retryState.RecordAttempt(channel.Id)
+		setRelayRetryDiagnostics(c, retryState)
 		addUsedChannel(c, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
 			newAPIError = billingErr
 			break
 		}
 		bodyStorage, bodyErr := common.GetBodyStorage(c)
 		if bodyErr != nil {
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
 			newAPIError = newRequestBodyFailure(c, bodyErr)
 			break
 		}
+		common.SetContextKey(c, constant.ContextKeyRelayBodyComplete, true)
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		switch relayFormat {
@@ -269,16 +309,21 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
+			service.RecordChannelCircuitSuccess(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
 			relayInfo.LastError = nil
+			retryState.StopReason = service.RetryStopReasonSuccess
+			setRelayRetryDiagnostics(c, retryState)
 			logRelayRetryRoute(c)
 			return
 		}
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
+		if service.RecordChannelCircuitFailure(c.Request.Context(), channel.Id, relayInfo.OriginModelName, newAPIError) {
+			logger.LogWarn(c, fmt.Sprintf("channel circuit opened for channel #%d model %s", channel.Id, relayInfo.OriginModelName))
+		}
 
 		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
-		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, sessionBlocked)
 
 		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
 
@@ -305,30 +350,52 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		gptFallback := isGPTChannelFallbackError(relayInfo, newAPIError) || sessionBlocked
 		canGPTFallback := gptFallback && policyProtectionReady &&
-			canRetryGPTChannelFallback(relayInfo, len(c.GetStringSlice("use_channel")))
+			canRetryGPTChannelFallback(relayInfo, relayFormat, newAPIError)
 		forceGPTFallback := sessionBlocked || gptFallback
 		if canGPTFallback {
 			service.ClearChannelAffinityForRequest(c)
 		}
-		if forceGPTFallback && canGPTFallback {
-			forcedFallbackStarted = true
-			retryLimit = extendRetryLimitForForcedGPTFallback(retryLimit, retryParam.GetRetry())
+		remainingAttempts := retryState.RemainingAttempts()
+		classificationBudget := remainingAttempts
+		if classificationBudget < 1 {
+			classificationBudget = 1
 		}
-		retryAllowed := shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		retryAllowed := shouldRetry(c, newAPIError, classificationBudget, relayFormat)
 		if forceGPTFallback {
 			retryAllowed = canGPTFallback
 		}
-		if relayProgressStarted(c, relayInfo) {
-			// A valid upstream event or any downstream byte proves this stream has
-			// started. Replaying the POST could duplicate generation, tools, or
-			// billing and could splice a second stream into an already committed one.
+		if relayRetryIsUnsafe(c, relayInfo, relayFormat, newAPIError) {
+			// Never splice a second attempt after output starts. A POST that only
+			// crossed the write boundary may retry when the upstream subsequently
+			// returned an explicit retryable HTTP failure; transport ambiguity still
+			// blocks replay to avoid duplicate generation, tools, tasks, or billing.
 			retryAllowed = false
+			if relayProgressStarted(c, relayInfo) {
+				retryState.StopReason = service.RetryStopReasonOutputStarted
+			}
 		}
-		if !canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback, wasForcedFallbackAttempt) {
+		lastRetryAllowed = canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback)
+		if lastRetryAllowed && remainingAttempts == 0 {
+			lastRetryAllowed = false
+			retryState.StopReason = service.RetryStopReasonAttemptsExhausted
+		}
+		if !lastRetryAllowed {
+			if retryState.StopReason == "" {
+				retryState.StopReason = service.RetryStopReasonNotRetryable
+			}
+			setRelayRetryDiagnostics(c, retryState)
+		}
+		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, sessionBlocked)
+		if !lastRetryAllowed {
 			break
 		}
+		retryParam.IncreaseRetry()
 	}
 
+	if retryState.StopReason == "" {
+		_ = retryState.CanAttempt(c.Request.Context())
+	}
+	setRelayRetryDiagnostics(c, retryState)
 	logRelayRetryRoute(c)
 }
 
@@ -382,12 +449,32 @@ func addUsedChannel(c *gin.Context, channelId int) {
 	c.Set("use_channel", useChannel)
 }
 
+func setRelayRetryDiagnostics(c *gin.Context, state *service.RelayRetryState) {
+	if c == nil || state == nil {
+		return
+	}
+	c.Set("retry_attempt_no", state.Attempts)
+	c.Set("retry_round_no", state.Round)
+	c.Set("retry_round_attempt_no", state.RoundAttempts)
+	c.Set("retry_distinct_channel_count", state.DistinctChannelCount())
+	if state.StopReason != "" {
+		c.Set("retry_stop_reason", state.StopReason)
+	}
+}
+
 func logRelayRetryRoute(c *gin.Context) {
 	useChannel := c.GetStringSlice("use_channel")
 	if len(useChannel) <= 1 {
 		return
 	}
-	retryLogStr := fmt.Sprintf("重试：%s", strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"))
+	retryLogStr := fmt.Sprintf(
+		"重试：%s attempts=%d rounds=%d distinct_channels=%d stop_reason=%s",
+		strings.Trim(strings.Join(strings.Fields(fmt.Sprint(useChannel)), "->"), "[]"),
+		c.GetInt("retry_attempt_no"),
+		c.GetInt("retry_round_no"),
+		c.GetInt("retry_distinct_channel_count"),
+		c.GetString("retry_stop_reason"),
+	)
 	logger.LogInfo(c, retryLogStr)
 }
 
@@ -446,12 +533,13 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 
 	newAPIError := middleware.SetupContextForSelectedChannel(c, channel, info.OriginModelName)
 	if newAPIError != nil {
+		service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, info.OriginModelName)
 		return nil, newAPIError
 	}
 	return channel, nil
 }
 
-func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) bool {
+func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, relayFormats ...types.RelayFormat) bool {
 	if openaiErr == nil {
 		return false
 	}
@@ -483,7 +571,18 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
 	}
+	if isRetryableExplicitUpstreamStatus(code) && len(relayFormats) > 0 && openaiErr.HasUpstreamResponse() {
+		return canRetryAfterExplicitUpstreamFailure(relayFormats[0], openaiErr)
+	}
 	return operation_setting.ShouldRetryByStatusCode(code)
+}
+
+func isRetryableExplicitUpstreamStatus(statusCode int) bool {
+	return statusCode == http.StatusNotFound ||
+		statusCode == http.StatusRequestTimeout ||
+		statusCode == http.StatusTooEarly ||
+		statusCode == http.StatusTooManyRequests ||
+		statusCode >= http.StatusInternalServerError
 }
 
 func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
@@ -495,8 +594,31 @@ func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
 	}
 	return info.ReceivedResponseCount > 0 ||
 		info.SendResponseCount > 0 ||
-		info.HasSendResponse() ||
-		info.UpstreamRequestMayHaveBeenAccepted()
+		info.HasSendResponse()
+}
+
+func relayRetryIsUnsafe(c *gin.Context, info *relaycommon.RelayInfo, relayFormat types.RelayFormat, relayErr *types.NewAPIError) bool {
+	if relayProgressStarted(c, info) {
+		return true
+	}
+	if info == nil || !info.UpstreamRequestMayHaveBeenAccepted() {
+		return false
+	}
+	return !canRetryAfterExplicitUpstreamFailure(relayFormat, relayErr)
+}
+
+func canRetryAfterExplicitUpstreamFailure(relayFormat types.RelayFormat, relayErr *types.NewAPIError) bool {
+	if relayErr == nil || !relayErr.HasUpstreamResponse() {
+		return false
+	}
+	// Realtime upgrades and asynchronous task submissions need protocol-level
+	// idempotency/job recovery rather than replaying a possibly accepted request.
+	switch relayFormat {
+	case types.RelayFormatOpenAIRealtime, types.RelayFormatTask, types.RelayFormatMjProxy:
+		return false
+	default:
+		return true
+	}
 }
 
 func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.NewAPIError) bool {
@@ -541,21 +663,14 @@ func shouldBanTokenFromProtectedChannels(info *relaycommon.RelayInfo, openaiErr 
 		isGatewaySessionBlockedError(openaiErr)
 }
 
-func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, attemptedChannels int) bool {
-	return info != nil && attemptedChannels < 2 &&
+func canRetryGPTChannelFallback(info *relaycommon.RelayInfo, relayFormat types.RelayFormat, relayErr *types.NewAPIError) bool {
+	return info != nil &&
 		!info.HasSendResponse() && info.SendResponseCount == 0 && info.ReceivedResponseCount == 0 &&
-		!info.UpstreamRequestMayHaveBeenAccepted()
+		(!info.UpstreamRequestMayHaveBeenAccepted() || canRetryAfterExplicitUpstreamFailure(relayFormat, relayErr))
 }
 
-func extendRetryLimitForForcedGPTFallback(retryLimit int, currentRetry int) int {
-	if currentRetry >= retryLimit {
-		return currentRetry + 1
-	}
-	return retryLimit
-}
-
-func canContinueRelayRetry(retryAllowed bool, fallbackError bool, canFallback bool, wasPolicyFallbackAttempt bool) bool {
-	return !wasPolicyFallbackAttempt && retryAllowed && (!fallbackError || canFallback)
+func canContinueRelayRetry(retryAllowed bool, fallbackError bool, canFallback bool) bool {
+	return retryAllowed && (!fallbackError || canFallback)
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, skipAutoDisable bool) {
@@ -588,6 +703,14 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		other["channel_type"] = c.GetInt("channel_type")
 		adminInfo := make(map[string]interface{})
 		adminInfo["use_channel"] = c.GetStringSlice("use_channel")
+		adminInfo["attempt_no"] = c.GetInt("retry_attempt_no")
+		adminInfo["attempt_round_no"] = c.GetInt("retry_round_no")
+		adminInfo["round_attempt_no"] = c.GetInt("retry_round_attempt_no")
+		adminInfo["distinct_channel_count"] = c.GetInt("retry_distinct_channel_count")
+		if stopReason := c.GetString("retry_stop_reason"); stopReason != "" {
+			adminInfo["retry_stop_reason"] = stopReason
+		}
+		service.AppendRelayObservabilityAdminInfo(c, nil, adminInfo)
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
 		if isMultiKey {
 			adminInfo["is_multi_key"] = true

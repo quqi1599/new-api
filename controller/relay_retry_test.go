@@ -12,32 +12,39 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func TestGPTChannelFallbackStopsAfterOutputOrOneFallback(t *testing.T) {
+func TestGPTChannelFallbackStopsAfterOutputButAllowsDistinctChannels(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.5"}
 	err := types.NewErrorWithStatusCode(errors.New("rate limited"), types.ErrorCodeChannelNoAvailableKey, http.StatusTooManyRequests)
-	if !isGPTChannelFallbackError(info, err) || !canRetryGPTChannelFallback(info, 1) {
+	if !isGPTChannelFallbackError(info, err) || !canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
 		t.Fatal("expected one pre-output GPT 429 fallback")
-	}
-	if canRetryGPTChannelFallback(info, 2) {
-		t.Fatal("must allow at most one fallback channel")
 	}
 
 	info.SendResponseCount = 1
-	if canRetryGPTChannelFallback(info, 1) {
+	if canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
 		t.Fatal("must not retry after output starts")
 	}
 
 	info.SendResponseCount = 0
 	info.MarkUpstreamRequestMayHaveBeenAccepted()
-	if canRetryGPTChannelFallback(info, 1) {
+	if canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
 		t.Fatal("must not retry after a non-idempotent upstream request may have been accepted")
+	}
+
+	err = types.NewErrorWithStatusCode(
+		errors.New("explicit upstream failure"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusInternalServerError,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+	if !canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
+		t.Fatal("an explicit upstream failure before output must allow a different GPT channel")
 	}
 }
 
-func TestGPT524GetsOneForcedFallback(t *testing.T) {
+func TestGPT524AllowsFallback(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
 	err := types.NewErrorWithStatusCode(errors.New("proxy read timeout"), types.ErrorCodeBadResponse, statusCodeCloudflareTimeout)
-	if !isGPTChannelFallbackError(info, err) || !canRetryGPTChannelFallback(info, 1) {
+	if !isGPTChannelFallbackError(info, err) || !canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
 		t.Fatal("expected one pre-output GPT 524 fallback")
 	}
 
@@ -127,14 +134,81 @@ func TestRelayRetryStopsAfterAnyStreamProgress(t *testing.T) {
 		}
 	})
 
-	t.Run("unsafe upstream request already sent", func(t *testing.T) {
+	t.Run("ambiguous upstream request already sent", func(t *testing.T) {
 		c, _ := gin.CreateTestContext(httptest.NewRecorder())
 		info := &relaycommon.RelayInfo{}
 		info.MarkUpstreamRequestMayHaveBeenAccepted()
-		if !relayProgressStarted(c, info) {
+		if !relayRetryIsUnsafe(c, info, types.RelayFormatClaude, err) {
 			t.Fatal("a possibly accepted POST must close the retry gate")
 		}
 	})
+
+	t.Run("explicit upstream failure permits cross-channel retry", func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{}
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		upstreamErr := types.NewErrorWithStatusCode(
+			errors.New("upstream 502"),
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusBadGateway,
+			types.ErrOptionWithUpstreamResponse(),
+		)
+		if !shouldRetry(c, upstreamErr, 1) {
+			t.Fatal("an explicit upstream 502 must be retryable")
+		}
+		for _, relayFormat := range []types.RelayFormat{
+			types.RelayFormatClaude,
+			types.RelayFormatOpenAI,
+			types.RelayFormatOpenAIImage,
+		} {
+			if relayRetryIsUnsafe(c, info, relayFormat, upstreamErr) {
+				t.Fatalf("explicit upstream failure must allow %s to try another channel", relayFormat)
+			}
+		}
+	})
+
+	t.Run("explicit upstream failure does not replay asynchronous task", func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{}
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		upstreamErr := types.NewErrorWithStatusCode(
+			errors.New("upstream 500"),
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusInternalServerError,
+			types.ErrOptionWithUpstreamResponse(),
+		)
+		if !relayRetryIsUnsafe(c, info, types.RelayFormatTask, upstreamErr) {
+			t.Fatal("a possibly accepted asynchronous task must not be replayed")
+		}
+	})
+}
+
+func TestExplicitUpstreamStatusesRetryAcrossSynchronousFormats(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	for _, statusCode := range []int{
+		http.StatusNotFound,
+		http.StatusRequestTimeout,
+		http.StatusTooEarly,
+		http.StatusTooManyRequests,
+		http.StatusBadGateway,
+		http.StatusGatewayTimeout,
+		statusCodeCloudflareTimeout,
+	} {
+		relayErr := types.NewErrorWithStatusCode(
+			errors.New("explicit upstream gateway timeout"),
+			types.ErrorCodeBadResponseStatusCode,
+			statusCode,
+			types.ErrOptionWithUpstreamResponse(),
+		)
+		for _, relayFormat := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAI, types.RelayFormatOpenAIImage} {
+			if !shouldRetry(c, relayErr, 1, relayFormat) {
+				t.Fatalf("status %d must retry for %s after an explicit upstream response", statusCode, relayFormat)
+			}
+		}
+		if shouldRetry(c, relayErr, 1, types.RelayFormatTask) {
+			t.Fatalf("status %d must not replay an asynchronous task", statusCode)
+		}
+	}
 }
 
 func TestTaskRelayDoesNotRetryLocalCancellationOrDeadline(t *testing.T) {
@@ -222,15 +296,14 @@ func TestProtectedChannelControlsGlobalTokenBan(t *testing.T) {
 	}
 }
 
-func TestForcedGPTFallbackExtendsZeroRetryBudgetOnce(t *testing.T) {
-	retryLimit := extendRetryLimitForForcedGPTFallback(0, 0)
-	if retryLimit != 1 {
-		t.Fatalf("retry limit = %d, want 1", retryLimit)
+func TestGPTFallbackContinuesWithinUnifiedRetryBudget(t *testing.T) {
+	if !canContinueRelayRetry(true, false, false) {
+		t.Fatal("ordinary retryable failures must continue")
 	}
-	if retryLimit = extendRetryLimitForForcedGPTFallback(retryLimit, 0); retryLimit != 1 {
-		t.Fatalf("existing retry budget changed to %d, want 1", retryLimit)
+	if !canContinueRelayRetry(true, true, true) {
+		t.Fatal("safe GPT fallback must continue across eligible channels")
 	}
-	if canContinueRelayRetry(true, false, false, true) {
-		t.Fatal("must not make a third attempt after the policy fallback channel fails")
+	if canContinueRelayRetry(true, true, false) {
+		t.Fatal("unsafe GPT fallback must stop")
 	}
 }

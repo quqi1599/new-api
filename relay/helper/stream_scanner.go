@@ -100,6 +100,7 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 
 	switch info.StreamStatus.EndReason {
 	case relaycommon.StreamEndReasonFirstEventTimeout:
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
 		statusCode = http.StatusGatewayTimeout
 		errorCode = types.ErrorCodeUpstreamFirstEventTimeout
 		message = "upstream returned headers but no valid stream event before the first-event timeout"
@@ -113,13 +114,16 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 	case relaycommon.StreamEndReasonHandlerStop:
 		message = "upstream stream was rejected before a valid response could be delivered"
 	case relaycommon.StreamEndReasonTimeout:
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
 		statusCode = http.StatusGatewayTimeout
 		message = "upstream stream became idle before a terminal event"
 	case relaycommon.StreamEndReasonPingFail:
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
 		message = "downstream stream heartbeat failed before a response could be delivered"
 	case relaycommon.StreamEndReasonClientGone:
 		statusCode = 499
-		message = "request canceled by client before the first valid event"
+		message = "downstream connection closed before the first valid event"
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
 		allowChannelPenalty = false
 	case relaycommon.StreamEndReasonDone:
 		// An intentionally empty response is valid only with an explicit marker.
@@ -411,6 +415,7 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 		}
 
 		if firstEventSeen.CompareAndSwap(false, true) {
+			common.SetContextKey(c, constant.ContextKeyRelayFirstValidEvent, true)
 			info.SetFirstResponseTime()
 			firstEventReadyOnce.Do(func() {
 				close(firstEventReady)
@@ -587,6 +592,7 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 			finished = true
 		case <-c.Request.Context().Done():
 			// 客户端断开：立即关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成。
+			common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
 			stop()
 			finished = true

@@ -86,68 +86,68 @@ func SetRelayRouter(router *gin.Engine) {
 
 		// claude related routes
 		httpRouter.POST("/messages", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatClaude)
+			controller.RelayDispatch(c, types.RelayFormatClaude)
 		})
 
 		// chat related routes
 		httpRouter.POST("/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
+			controller.RelayDispatch(c, types.RelayFormatOpenAI)
 		})
 		httpRouter.POST("/chat/completions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
+			controller.RelayDispatch(c, types.RelayFormatOpenAI)
 		})
 
 		// response related routes
 		httpRouter.POST("/responses", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIResponses)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIResponses)
 		})
 		httpRouter.POST("/responses/compact", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIResponsesCompaction)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIResponsesCompaction)
 		})
 
 		// image related routes
 		httpRouter.POST("/edits", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIImage)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIImage)
 		})
 		httpRouter.POST("/images/generations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIImage)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIImage)
 		})
 		httpRouter.POST("/images/edits", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIImage)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIImage)
 		})
 
 		// embedding related routes
 		httpRouter.POST("/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatEmbedding)
+			controller.RelayDispatch(c, types.RelayFormatEmbedding)
 		})
 
 		// audio related routes
 		httpRouter.POST("/audio/transcriptions", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIAudio)
 		})
 		httpRouter.POST("/audio/translations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIAudio)
 		})
 		httpRouter.POST("/audio/speech", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAIAudio)
+			controller.RelayDispatch(c, types.RelayFormatOpenAIAudio)
 		})
 
 		// rerank related routes
 		httpRouter.POST("/rerank", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatRerank)
+			controller.RelayDispatch(c, types.RelayFormatRerank)
 		})
 
 		// gemini relay routes
 		httpRouter.POST("/engines/:model/embeddings", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
+			controller.RelayDispatch(c, types.RelayFormatGemini)
 		})
 		httpRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
+			controller.RelayDispatch(c, types.RelayFormatGemini)
 		})
 
 		// other relay routes
 		httpRouter.POST("/moderations", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatOpenAI)
+			controller.RelayDispatch(c, types.RelayFormatOpenAI)
 		})
 
 		// not implemented
@@ -163,6 +163,14 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/fine-tunes/:id/cancel", controller.RelayNotImplemented)
 		httpRouter.GET("/fine-tunes/:id/events", controller.RelayNotImplemented)
 		httpRouter.DELETE("/models/:model", controller.RelayNotImplemented)
+	}
+
+	backgroundRelayRouter := router.Group("/v1/background")
+	backgroundRelayRouter.Use(middleware.RouteTag("relay"))
+	backgroundRelayRouter.Use(middleware.SystemPerformanceCheck())
+	backgroundRelayRouter.Use(middleware.TokenAuth())
+	{
+		backgroundRelayRouter.GET("/:id", controller.GetBackgroundRelayJob)
 	}
 
 	relayMjRouter := router.Group("/mj")
@@ -195,7 +203,7 @@ func SetRelayRouter(router *gin.Engine) {
 	{
 		// Gemini API 路径格式: /v1beta/models/{model_name}:{action}
 		relayGeminiRouter.POST("/models/*path", func(c *gin.Context) {
-			controller.Relay(c, types.RelayFormatGemini)
+			controller.RelayDispatch(c, types.RelayFormatGemini)
 		})
 	}
 }
