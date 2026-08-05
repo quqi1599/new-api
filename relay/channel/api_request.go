@@ -15,6 +15,7 @@ import (
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	constant2 "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
@@ -489,13 +490,15 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 	if c != nil && c.Request != nil {
 		switch requestErr := c.Request.Context().Err(); {
 		case errors.Is(requestErr, context.Canceled):
+			setRelayCancelOrigin(c, constant2.RelayCancelOriginDownstreamDisconnected)
 			return types.NewErrorWithStatusCode(
-				errors.New("request canceled by client"),
+				errors.New("downstream connection closed before completion"),
 				types.ErrorCodeDoRequestFailed,
 				statusClientClosedRequest,
 				types.ErrOptionWithSkipRetry(),
 			)
 		case errors.Is(requestErr, context.DeadlineExceeded):
+			setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
 			return types.NewErrorWithStatusCode(
 				errors.New("request deadline exceeded"),
 				types.ErrorCodeDoRequestFailed,
@@ -503,6 +506,12 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 				types.ErrOptionWithSkipRetry(),
 			)
 		}
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		setRelayCancelOrigin(c, constant2.RelayCancelOriginUpstreamTimeout)
+	} else if errors.Is(err, context.Canceled) {
+		setRelayCancelOrigin(c, constant2.RelayCancelOriginInternalAbort)
 	}
 
 	options := []types.NewAPIErrorOptions{
@@ -513,7 +522,6 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 		// timeout or connection error cannot prove that the provider rejected the
 		// request. Retrying could duplicate a generation, task, tool call, or bill.
 		options = append(options, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
-		var netErr net.Error
 		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
 			return types.NewErrorWithStatusCode(
 				errors.New("upstream response headers timed out before the first valid event"),
@@ -526,7 +534,8 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 	return types.NewError(err, types.ErrorCodeDoRequestFailed, options...)
 }
 
-func firstValidEventBudgetError(requestMayHaveBeenSent bool) *types.NewAPIError {
+func firstValidEventBudgetError(c *gin.Context, requestMayHaveBeenSent bool) *types.NewAPIError {
+	setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
 	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
 	if requestMayHaveBeenSent {
 		options = append(options, types.ErrOptionWithChannelPenalty())
@@ -537,6 +546,13 @@ func firstValidEventBudgetError(requestMayHaveBeenSent bool) *types.NewAPIError 
 		http.StatusGatewayTimeout,
 		options...,
 	)
+}
+
+func setRelayCancelOrigin(c *gin.Context, origin string) {
+	if c == nil || strings.TrimSpace(origin) == "" {
+		return
+	}
+	common2.SetContextKey(c, constant2.ContextKeyRelayCancelOrigin, origin)
 }
 
 // startPreResponseHeartbeat keeps streaming clients and transit proxies alive
@@ -593,8 +609,13 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		// Carry the validated edge request ID through NewAPI and compatible
 		// upstream relays (notably CPA) without overwriting an adaptor-provided
 		// value. Providers that do not use this private X- header ignore it.
-		if requestID := c.GetString(common2.RequestIdKey); requestID != "" && req.Header.Get(common2.RequestIdKey) == "" {
-			req.Header.Set(common2.RequestIdKey, requestID)
+		if requestID := c.GetString(common2.RequestIdKey); requestID != "" {
+			if req.Header.Get(common2.RequestIdKey) == "" {
+				req.Header.Set(common2.RequestIdKey, requestID)
+			}
+			if req.Header.Get("X-Request-Id") == "" {
+				req.Header.Set("X-Request-Id", requestID)
+			}
 		}
 		combinedCtx, cancel := context.WithCancel(req.Context())
 		combinedCancel = cancel
@@ -620,7 +641,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	var requestMayHaveBeenSent atomic.Bool
 	unsafeToReplay := !isReplaySafeMethod(req.Method)
 	trace := &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) {
+			common2.SetContextKey(c, constant2.ContextKeyRelayConnectedUpstream, true)
+		},
 		WroteRequest: func(httptrace.WroteRequestInfo) {
+			common2.SetContextKey(c, constant2.ContextKeyRelayRequestWritten, true)
 			requestMayHaveBeenSent.Store(true)
 			if unsafeToReplay {
 				info.MarkUpstreamRequestMayHaveBeenAccepted()
@@ -642,7 +667,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 					stopInbound()
 				}
 				combinedCancel()
-				return nil, firstValidEventBudgetError(false)
+				return nil, firstValidEventBudgetError(c, false)
 			}
 			budgetTimer = time.AfterFunc(remaining, func() {
 				if budgetState.CompareAndSwap(0, 2) {
@@ -680,7 +705,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			return nil, firstValidEventBudgetError(unsafeRequestReachedUpstream)
+			return nil, firstValidEventBudgetError(c, unsafeRequestReachedUpstream)
 		}
 		classifiedErr := classifyDoRequestError(c, err, unsafeRequestReachedUpstream)
 		if !types.IsSkipRetryError(classifiedErr) {
@@ -697,6 +722,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 		return nil, errors.New("resp is nil")
 	}
+	common2.SetContextKey(c, constant2.ContextKeyRelayResponseHeaders, true)
 	if budgetState.Load() == 2 {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
@@ -707,7 +733,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		if combinedCancel != nil {
 			combinedCancel()
 		}
-		return nil, firstValidEventBudgetError(unsafeRequestReachedUpstream)
+		return nil, firstValidEventBudgetError(c, unsafeRequestReachedUpstream)
 	}
 	if combinedCancel != nil {
 		if resp.Body == nil {
@@ -724,7 +750,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 	}
 
-	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
+	if upID := firstNonEmptyHeader(resp.Header, common2.RequestIdKey, "X-Request-Id", "OpenAI-Request-ID", "Request-ID"); upID != "" {
 		c.Set(common2.UpstreamRequestIdKey, upID)
 	}
 
@@ -735,6 +761,15 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		_ = c.Request.Body.Close()
 	}
 	return resp, nil
+}
+
+func firstNonEmptyHeader(header http.Header, names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(header.Get(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func isReplaySafeMethod(method string) bool {

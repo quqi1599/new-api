@@ -11,6 +11,7 @@ import (
 	"time"
 
 	common2 "github.com/QuantumNous/new-api/common"
+	constant2 "github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
@@ -135,6 +136,7 @@ func TestDoApiRequestClientCancelBeforeResponseHeadersKeepsAliveAndCancelsUpstre
 	}
 	require.Less(t, time.Since(cancelStarted), time.Second)
 	requireClientCanceledRequestError(t, result.err)
+	require.Equal(t, constant2.RelayCancelOriginDownstreamDisconnected, common2.GetContextKeyString(c, constant2.ContextKeyRelayCancelOrigin))
 	require.Contains(t, recorder.Body.String(), ": PING")
 	require.True(t, recorder.Flushed)
 }
@@ -258,6 +260,7 @@ func TestClassifyDoRequestErrorKeepsInternalTimeoutRetryable(t *testing.T) {
 
 	require.Equal(t, http.StatusInternalServerError, apiErr.StatusCode)
 	require.False(t, types.IsSkipRetryError(apiErr))
+	require.Equal(t, constant2.RelayCancelOriginUpstreamTimeout, common2.GetContextKeyString(c, constant2.ContextKeyRelayCancelOrigin))
 }
 
 func TestClassifyDoRequestErrorStopsRetryAfterRequestMayHaveBeenSent(t *testing.T) {
@@ -267,6 +270,7 @@ func TestClassifyDoRequestErrorStopsRetryAfterRequestMayHaveBeenSent(t *testing.
 	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
 	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, apiErr.GetErrorCode())
 	require.True(t, types.IsSkipRetryError(apiErr))
+	require.Equal(t, constant2.RelayCancelOriginUpstreamTimeout, common2.GetContextKeyString(c, constant2.ContextKeyRelayCancelOrigin))
 }
 
 func TestDoApiRequestResponseHeaderTimeoutDoesNotReplayWrittenRequest(t *testing.T) {
@@ -333,9 +337,14 @@ func TestDoRequestMarksUnsafeHTTPResponseAsPossiblyAccepted(t *testing.T) {
 
 func TestDoRequestPropagatesValidatedRequestIDWithoutOverwritingAdaptorValue(t *testing.T) {
 	service.InitHttpClient()
-	seenIDs := make(chan string, 2)
+	type requestIDs struct {
+		canonical string
+		standard  string
+	}
+	seenIDs := make(chan requestIDs, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenIDs <- r.Header.Get(common2.RequestIdKey)
+		seenIDs <- requestIDs{canonical: r.Header.Get(common2.RequestIdKey), standard: r.Header.Get("X-Request-Id")}
+		w.Header().Set("X-Request-Id", "cpa-request-456")
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(upstream.Close)
@@ -360,7 +369,10 @@ func TestDoRequestPropagatesValidatedRequestIDWithoutOverwritingAdaptorValue(t *
 			resp, err := DoRequest(c, req, &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}})
 			require.NoError(t, err)
 			require.NoError(t, resp.Body.Close())
-			require.Equal(t, test.wantHeader, <-seenIDs)
+			seen := <-seenIDs
+			require.Equal(t, test.wantHeader, seen.canonical)
+			require.Equal(t, "edge-trace-123", seen.standard)
+			require.Equal(t, "cpa-request-456", c.GetString(common2.UpstreamRequestIdKey))
 		})
 	}
 }
@@ -389,6 +401,7 @@ func TestDoRequestSharedFirstEventBudgetBoundsResponseHeaders(t *testing.T) {
 	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
 	require.True(t, types.IsSkipRetryError(apiErr))
 	require.True(t, info.UpstreamRequestMayHaveBeenAccepted())
+	require.Equal(t, constant2.RelayCancelOriginGatewayDeadline, common2.GetContextKeyString(c, constant2.ContextKeyRelayCancelOrigin))
 	require.Less(t, time.Since(started), time.Second)
 }
 

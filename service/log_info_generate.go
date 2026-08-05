@@ -101,6 +101,7 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	if stopReason := ctx.GetString("retry_stop_reason"); stopReason != "" {
 		adminInfo["retry_stop_reason"] = stopReason
 	}
+	AppendRelayObservabilityAdminInfo(ctx, relayInfo, adminInfo)
 	isMultiKey := common.GetContextKeyBool(ctx, constant.ContextKeyChannelIsMultiKey)
 	if isMultiKey {
 		adminInfo["is_multi_key"] = true
@@ -122,6 +123,30 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendParamOverrideInfo(relayInfo, other)
 	appendStreamStatus(relayInfo, other)
 	return other
+}
+
+func AppendRelayObservabilityAdminInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, adminInfo map[string]interface{}) {
+	if ctx == nil || adminInfo == nil {
+		return
+	}
+	if origin := common.GetContextKeyString(ctx, constant.ContextKeyRelayCancelOrigin); origin != "" {
+		adminInfo["cancel_origin"] = origin
+	}
+	outputStarted := common.GetContextKeyBool(ctx, constant.ContextKeyRelayOutputStarted)
+	if ctx.Writer != nil && ctx.Writer.Written() {
+		outputStarted = true
+	}
+	if relayInfo != nil && (relayInfo.HasSendResponse() || relayInfo.SendResponseCount > 0) {
+		outputStarted = true
+	}
+	adminInfo["relay_stage"] = map[string]bool{
+		"body_complete":              common.GetContextKeyBool(ctx, constant.ContextKeyRelayBodyComplete),
+		"connected_upstream":         common.GetContextKeyBool(ctx, constant.ContextKeyRelayConnectedUpstream),
+		"request_written":            common.GetContextKeyBool(ctx, constant.ContextKeyRelayRequestWritten),
+		"response_headers_received":  common.GetContextKeyBool(ctx, constant.ContextKeyRelayResponseHeaders),
+		"first_valid_event_received": common.GetContextKeyBool(ctx, constant.ContextKeyRelayFirstValidEvent),
+		"output_started":             outputStarted,
+	}
 }
 
 func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other map[string]interface{}) {

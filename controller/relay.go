@@ -294,6 +294,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = newRequestBodyFailure(c, bodyErr)
 			break
 		}
+		common.SetContextKey(c, constant.ContextKeyRelayBodyComplete, true)
 		c.Request.Body = io.NopCloser(bodyStorage)
 
 		switch relayFormat {
@@ -709,6 +710,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 		if stopReason := c.GetString("retry_stop_reason"); stopReason != "" {
 			adminInfo["retry_stop_reason"] = stopReason
 		}
+		service.AppendRelayObservabilityAdminInfo(c, nil, adminInfo)
 		isMultiKey := common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey)
 		if isMultiKey {
 			adminInfo["is_multi_key"] = true
