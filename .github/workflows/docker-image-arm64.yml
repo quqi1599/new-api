@@ -11,6 +11,14 @@ on:
         description: 'Immutable image tag; must be sha-<selected commit first 12 characters>'
         required: true
         type: string
+      architectures:
+        description: 'Production target architectures; manual hotfixes default to amd64 only'
+        required: true
+        default: amd64
+        type: choice
+        options:
+          - amd64
+          - amd64+arm64
 
 jobs:
   test:
@@ -53,13 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.architectures == 'amd64' && '[{"arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"}]' || '[{"arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},{"arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
 
     permissions:
@@ -176,13 +178,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create & push manifest (GHCR - version)
+        if: github.event_name != 'workflow_dispatch' || inputs.architectures == 'amd64+arm64'
         run: |
           docker buildx imagetools create \
             -t ghcr.io/${GHCR_REPOSITORY}:${TAG} \
             ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64 \
             ghcr.io/${GHCR_REPOSITORY}:${TAG}-arm64
 
+      - name: Create & push amd64 manifest (GHCR - version)
+        if: github.event_name == 'workflow_dispatch' && inputs.architectures == 'amd64'
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${GHCR_REPOSITORY}:${TAG} \
+            ghcr.io/${GHCR_REPOSITORY}:${TAG}-amd64
+
       - name: Create & push manifest (GHCR - latest)
+        if: github.event_name != 'workflow_dispatch' || inputs.architectures == 'amd64+arm64'
         run: |
           docker buildx imagetools create \
             -t ghcr.io/${GHCR_REPOSITORY}:latest \
