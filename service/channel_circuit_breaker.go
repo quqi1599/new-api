@@ -32,6 +32,7 @@ type channelCircuitConfig struct {
 	FailureWindow    time.Duration
 	OpenDuration     time.Duration
 	HalfOpenLease    time.Duration
+	BypassChannelIDs map[int]struct{}
 }
 
 var defaultChannelCircuitConfig = channelCircuitConfig{
@@ -39,6 +40,24 @@ var defaultChannelCircuitConfig = channelCircuitConfig{
 	FailureWindow:    time.Duration(common.GetEnvOrDefault("CHANNEL_CIRCUIT_FAILURE_WINDOW_SECONDS", 60)) * time.Second,
 	OpenDuration:     time.Duration(common.GetEnvOrDefault("CHANNEL_CIRCUIT_OPEN_SECONDS", 30)) * time.Second,
 	HalfOpenLease:    time.Duration(common.GetEnvOrDefault("CHANNEL_CIRCUIT_HALF_OPEN_LEASE_SECONDS", 30)) * time.Second,
+	BypassChannelIDs: parseChannelCircuitBypassIDs(common.GetEnvOrDefaultString("CHANNEL_CIRCUIT_BYPASS_CHANNEL_IDS", "")),
+}
+
+func parseChannelCircuitBypassIDs(raw string) map[int]struct{} {
+	channelIDs := make(map[int]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		channelID, err := strconv.Atoi(strings.TrimSpace(item))
+		if err != nil || channelID <= 0 {
+			continue
+		}
+		channelIDs[channelID] = struct{}{}
+	}
+	return channelIDs
+}
+
+func channelCircuitBypassed(config channelCircuitConfig, channelID int) bool {
+	_, bypassed := config.BypassChannelIDs[channelID]
+	return bypassed
 }
 
 func normalizedChannelCircuitConfig() channelCircuitConfig {
@@ -114,7 +133,10 @@ local window_ms = tonumber(ARGV[3])
 local open_ms = tonumber(ARGV[4])
 local lease_ms = tonumber(ARGV[5])
 local count = 0
-if state == 'open' or state == 'half_open' then
+if state == 'open' then
+  local until_ms = tonumber(redis.call('HGET', KEYS[1], 'open_until') or '0')
+  return {0, math.max(until_ms - now_ms, 0)}
+elseif state == 'half_open' then
   count = threshold
 else
   count = redis.call('INCR', KEYS[2])
@@ -148,8 +170,11 @@ func ChannelCircuitAllowAttempt(ctx context.Context, channelID int, modelName st
 	if channelID <= 0 || strings.TrimSpace(modelName) == "" {
 		return ChannelCircuitDecision{Allowed: true, State: channelCircuitStateClosed}
 	}
+	config := normalizedChannelCircuitConfig()
+	if channelCircuitBypassed(config, channelID) {
+		return ChannelCircuitDecision{Allowed: true, State: channelCircuitStateClosed}
+	}
 	if common.RedisEnabled && common.RDB != nil {
-		config := normalizedChannelCircuitConfig()
 		stateKey, failureKey, probeKey := channelCircuitKeys(channelID, modelName)
 		redisCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
@@ -213,6 +238,9 @@ func localChannelCircuitAllow(channelID int, modelName string) ChannelCircuitDec
 	key := channelCircuitKey(channelID, modelName)
 	now := channelCircuitNow()
 	config := normalizedChannelCircuitConfig()
+	if channelCircuitBypassed(config, channelID) {
+		return ChannelCircuitDecision{Allowed: true, State: channelCircuitStateClosed}
+	}
 	localChannelCircuits.Lock()
 	defer localChannelCircuits.Unlock()
 	state := localChannelCircuits.items[key]
@@ -243,8 +271,11 @@ func RecordChannelCircuitFailure(ctx context.Context, channelID int, modelName s
 	if !ShouldCountChannelCircuitFailure(relayErr) || channelID <= 0 || strings.TrimSpace(modelName) == "" {
 		return false
 	}
+	config := normalizedChannelCircuitConfig()
+	if channelCircuitBypassed(config, channelID) {
+		return false
+	}
 	if common.RedisEnabled && common.RDB != nil {
-		config := normalizedChannelCircuitConfig()
 		stateKey, failureKey, probeKey := channelCircuitKeys(channelID, modelName)
 		redisCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
@@ -280,7 +311,10 @@ func localRecordChannelCircuitFailure(channelID int, modelName string) bool {
 		state = &localChannelCircuitState{State: channelCircuitStateClosed, WindowStart: now}
 		localChannelCircuits.items[key] = state
 	}
-	if state.State == channelCircuitStateOpen || state.State == channelCircuitStateHalfOpen {
+	if state.State == channelCircuitStateOpen {
+		return false
+	}
+	if state.State == channelCircuitStateHalfOpen {
 		state.State = channelCircuitStateOpen
 		state.OpenUntil = now.Add(config.OpenDuration)
 		state.ProbeUntil = time.Time{}

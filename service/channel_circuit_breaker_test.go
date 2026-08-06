@@ -112,6 +112,115 @@ func TestRedisChannelCircuitOpensAndRecovers(t *testing.T) {
 	}
 }
 
+func TestChannelCircuitBypassSkipsOuterCircuit(t *testing.T) {
+	oldRedisEnabled := common.RedisEnabled
+	oldConfig := defaultChannelCircuitConfig
+	common.RedisEnabled = false
+	defaultChannelCircuitConfig = channelCircuitConfig{
+		FailureThreshold: 1,
+		FailureWindow:    time.Minute,
+		OpenDuration:     30 * time.Second,
+		HalfOpenLease:    30 * time.Second,
+		BypassChannelIDs: parseChannelCircuitBypassIDs("9, 131,invalid,0,-1"),
+	}
+	resetLocalChannelCircuitsForTest()
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		defaultChannelCircuitConfig = oldConfig
+		resetLocalChannelCircuitsForTest()
+	})
+
+	relayErr := types.NewErrorWithStatusCode(errors.New("upstream 503"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+	for range 3 {
+		if RecordChannelCircuitFailure(context.Background(), 9, "gpt-5.6-luna", relayErr) {
+			t.Fatal("bypassed channel must never open the outer circuit")
+		}
+	}
+	decision := ChannelCircuitAllowAttempt(context.Background(), 9, "gpt-5.6-luna")
+	if !decision.Allowed || decision.State != channelCircuitStateClosed {
+		t.Fatalf("bypassed decision = %#v", decision)
+	}
+	if _, ok := defaultChannelCircuitConfig.BypassChannelIDs[131]; !ok {
+		t.Fatal("comma-separated channel IDs must be parsed")
+	}
+}
+
+func TestLocalOpenCircuitFailureDoesNotExtendOpenWindow(t *testing.T) {
+	oldRedisEnabled := common.RedisEnabled
+	oldConfig := defaultChannelCircuitConfig
+	oldNow := channelCircuitNow
+	common.RedisEnabled = false
+	defaultChannelCircuitConfig = channelCircuitConfig{
+		FailureThreshold: 1,
+		FailureWindow:    time.Minute,
+		OpenDuration:     10 * time.Second,
+		HalfOpenLease:    5 * time.Second,
+	}
+	now := time.Unix(1_700_000_000, 0)
+	channelCircuitNow = func() time.Time { return now }
+	resetLocalChannelCircuitsForTest()
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		defaultChannelCircuitConfig = oldConfig
+		channelCircuitNow = oldNow
+		resetLocalChannelCircuitsForTest()
+	})
+
+	relayErr := types.NewErrorWithStatusCode(errors.New("upstream 503"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+	if !RecordChannelCircuitFailure(context.Background(), 119, "claude-opus-4-8", relayErr) {
+		t.Fatal("threshold failure must open the circuit")
+	}
+	now = now.Add(5 * time.Second)
+	if RecordChannelCircuitFailure(context.Background(), 119, "claude-opus-4-8", relayErr) {
+		t.Fatal("an in-flight failure must not reopen an already-open circuit")
+	}
+	now = now.Add(6 * time.Second)
+	decision := ChannelCircuitAllowAttempt(context.Background(), 119, "claude-opus-4-8")
+	if !decision.Allowed || decision.State != channelCircuitStateHalfOpen {
+		t.Fatalf("open window was unexpectedly extended: %#v", decision)
+	}
+}
+
+func TestRedisOpenCircuitFailureDoesNotExtendOpenWindow(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	oldRedisEnabled := common.RedisEnabled
+	oldRDB := common.RDB
+	oldConfig := defaultChannelCircuitConfig
+	oldNow := channelCircuitNow
+	common.RedisEnabled = true
+	common.RDB = client
+	defaultChannelCircuitConfig = channelCircuitConfig{
+		FailureThreshold: 1,
+		FailureWindow:    time.Minute,
+		OpenDuration:     10 * time.Second,
+		HalfOpenLease:    5 * time.Second,
+	}
+	now := time.Unix(1_700_000_000, 0)
+	channelCircuitNow = func() time.Time { return now }
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		common.RDB = oldRDB
+		defaultChannelCircuitConfig = oldConfig
+		channelCircuitNow = oldNow
+		_ = client.Close()
+	})
+
+	relayErr := types.NewErrorWithStatusCode(errors.New("upstream 503"), types.ErrorCodeBadResponse, http.StatusServiceUnavailable)
+	if !RecordChannelCircuitFailure(context.Background(), 119, "claude-opus-4-8", relayErr) {
+		t.Fatal("threshold failure must open the Redis circuit")
+	}
+	now = now.Add(5 * time.Second)
+	if RecordChannelCircuitFailure(context.Background(), 119, "claude-opus-4-8", relayErr) {
+		t.Fatal("an in-flight failure must not reopen an already-open Redis circuit")
+	}
+	now = now.Add(6 * time.Second)
+	decision := ChannelCircuitAllowAttempt(context.Background(), 119, "claude-opus-4-8")
+	if !decision.Allowed || decision.State != channelCircuitStateHalfOpen {
+		t.Fatalf("Redis open window was unexpectedly extended: %#v", decision)
+	}
+}
+
 func TestChannelCircuitFailureClassification(t *testing.T) {
 	tests := []struct {
 		name string
