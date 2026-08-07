@@ -125,6 +125,20 @@ func TestRelayErrorHandlerKeepsOpenAIErrorMessage(t *testing.T) {
 	require.Equal(t, message, newAPIError.Error())
 }
 
+func TestRelayErrorHandlerPreservesAuthUnavailableCode(t *testing.T) {
+	body := `{"error":{"message":"requested route is temporarily unavailable","type":"upstream_error","code":"auth_unavailable"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, newAPIError)
+	require.True(t, newAPIError.HasUpstreamResponse())
+	require.Equal(t, types.ErrorCodeAuthUnavailable, newAPIError.GetErrorCode())
+}
+
 func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
 	withDebugEnabled(t, true)
 

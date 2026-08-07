@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -8,9 +9,45 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
+
+func TestAuthUnavailableDoesNotReplayAggregateChannelAcrossRounds(t *testing.T) {
+	state := service.NewRelayRetryState(types.RelayFormatOpenAI, 16)
+	state.RecordAttempt(9)
+	authErr := types.WithOpenAIError(
+		types.OpenAIError{
+			Message: "requested route is temporarily unavailable",
+			Type:    "upstream_error",
+			Code:    string(types.ErrorCodeAuthUnavailable),
+		},
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+
+	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr) {
+		t.Fatal("auth_unavailable must not reset exclusions and replay the same aggregate channel")
+	}
+	if state.StopReason != service.RetryStopReasonAuthUnavailable {
+		t.Fatalf("stop reason = %q", state.StopReason)
+	}
+}
+
+func TestOtherRetryableFailureMayStartAnotherRound(t *testing.T) {
+	state := service.NewRelayRetryState(types.RelayFormatOpenAI, 1)
+	upstreamErr := types.NewErrorWithStatusCode(
+		errors.New("upstream 502"),
+		types.ErrorCodeBadResponseStatusCode,
+		http.StatusBadGateway,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+
+	if !canStartNextRelayRetryRound(context.Background(), state, true, false, upstreamErr) {
+		t.Fatal("ordinary retryable upstream failures must preserve bounded cross-round retry")
+	}
+}
 
 func TestGPTChannelFallbackStopsAfterOutputButAllowsDistinctChannels(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.5"}

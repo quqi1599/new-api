@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -32,7 +33,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const statusCodeCloudflareTimeout = 524
+const (
+	statusCodeCloudflareTimeout      = 524
+	authUnavailableRetryAfterSeconds = "30"
+)
 
 var moderationReviewIdPattern = regexp.MustCompile(`(?i)\bmoderation(?:[\s_-]+review)?[\s_-]+id\s*[:=]\s*([a-z0-9][a-z0-9_-]{7,127})\b`)
 
@@ -241,8 +245,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		channel, channelErr := getChannel(c, relayInfo, retryParam)
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
-			canStartNextRound := (lastRetryAllowed || len(retryParam.CircuitSkippedIds) > 0) &&
-				retryState.CanStartNextRound(c.Request.Context())
+			canStartNextRound := canStartNextRelayRetryRound(
+				c.Request.Context(),
+				retryState,
+				lastRetryAllowed,
+				len(retryParam.CircuitSkippedIds) > 0,
+				relayInfo.LastError,
+			)
 			if canStartNextRound {
 				delay := retryState.NextRoundDelay(retryParam.CircuitRetryAfter)
 				logger.LogInfo(c, fmt.Sprintf(
@@ -422,6 +431,9 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
 		c.Writer.Header().Del(header)
 	}
+	if isAuthUnavailableError(relayErr) {
+		c.Header("Retry-After", authUnavailableRetryAfterSeconds)
+	}
 
 	switch relayFormat {
 	case types.RelayFormatClaude:
@@ -434,6 +446,30 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 			"error": relayErr.ToOpenAIError(),
 		})
 	}
+}
+
+func isAuthUnavailableError(relayErr *types.NewAPIError) bool {
+	return relayErr != nil && relayErr.GetErrorCode() == types.ErrorCodeAuthUnavailable
+}
+
+func canStartNextRelayRetryRound(
+	ctx context.Context,
+	state *service.RelayRetryState,
+	lastRetryAllowed bool,
+	circuitSkipped bool,
+	lastErr *types.NewAPIError,
+) bool {
+	if state == nil {
+		return false
+	}
+	// auth_unavailable means the selected upstream proxy already exhausted its
+	// own credential/route pool. Keep failover within the current NewAPI round,
+	// but do not reset exclusions and replay the same aggregate channel again.
+	if isAuthUnavailableError(lastErr) {
+		state.StopReason = service.RetryStopReasonAuthUnavailable
+		return false
+	}
+	return (lastRetryAllowed || circuitSkipped) && state.CanStartNextRound(ctx)
 }
 
 var upgrader = websocket.Upgrader{

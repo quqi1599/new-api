@@ -19,6 +19,7 @@ const (
 	RetryStopReasonDeadlineExceeded  = "deadline_exceeded"
 	RetryStopReasonClientGone        = "client_gone"
 	RetryStopReasonNoChannel         = "no_channel"
+	RetryStopReasonAuthUnavailable   = "auth_unavailable_exhausted"
 )
 
 type RelayRetryPolicy struct {
