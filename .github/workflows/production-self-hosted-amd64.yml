@@ -1,0 +1,141 @@
+name: Production CI (self-hosted amd64)
+
+on:
+  push:
+    branches:
+      - codex/auth-unavailable-retry-amplification
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable image tag; must match sha-<selected commit first 12 characters>
+        required: true
+        type: string
+
+concurrency:
+  group: new-api-production-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-build-publish:
+    name: Test, build and publish amd64
+    runs-on: [self-hosted, ci-vps]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate immutable tag and host capacity
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          commit_sha="$(git rev-parse HEAD)"
+          expected_tag="sha-${commit_sha:0:12}"
+          if [ -n "$REQUESTED_TAG" ]; then
+            test "$REQUESTED_TAG" = "$expected_tag"
+          else
+            REQUESTED_TAG="$expected_tag"
+          fi
+          test "$(uname -m)" = "x86_64"
+          docker info >/dev/null
+          disk_percent="$(df -P / | awk 'NR == 2 {gsub(/%/, "", $5); print $5}')"
+          if [ "$disk_percent" -ge 85 ]; then
+            echo "CI disk usage is ${disk_percent}%; refusing a heavy image build" >&2
+            exit 1
+          fi
+          echo "$REQUESTED_TAG" > VERSION
+          echo "IMAGE_TAG=$REQUESTED_TAG" >> "$GITHUB_ENV"
+          echo "COMMIT_SHA=$commit_sha" >> "$GITHUB_ENV"
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Build frontend for Go embed
+        working-directory: web
+        env:
+          DISABLE_ESLINT_PLUGIN: "true"
+          VITE_REACT_APP_VERSION: ${{ inputs.tag }}
+        run: bun run build
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+        env:
+          RUNNER_TOOL_CACHE: ${{ runner.temp }}/tool-cache
+
+      - name: Run full Go test suite
+        run: go test ./... -count=1 -timeout=240s
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable amd64 image under host lock
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$IMAGE_TAG"
+          metadata="$RUNNER_TEMP/new-api-build-metadata.json"
+          export ACTIONS_RUNTIME_TOKEN ACTIONS_RESULTS_URL
+          flock -w 1800 /tmp/ci-vps-heavy-docker-build.lock \
+            docker buildx build \
+              --platform linux/amd64 \
+              --push \
+              --tag "$image" \
+              --label "org.opencontainers.image.revision=$COMMIT_SHA" \
+              --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              --provenance=mode=max \
+              --sbom=true \
+              --metadata-file "$metadata" \
+              .
+          digest="$(jq -r '."containerimage.digest"' "$metadata")"
+          case "$digest" in
+            sha256:*) ;;
+            *) echo "unexpected image digest: $digest" >&2; exit 1 ;;
+          esac
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign and inspect immutable image
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"
+          {
+            echo "### Published production candidate"
+            echo
+            echo "- Image: \`$IMAGE:$IMAGE_TAG\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Revision: \`$COMMIT_SHA\`"
+            echo "- Platform: \`linux/amd64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out from GHCR
+        if: always()
+        run: docker logout ghcr.io
