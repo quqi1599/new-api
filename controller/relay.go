@@ -36,6 +36,7 @@ import (
 const (
 	statusCodeCloudflareTimeout      = 524
 	authUnavailableRetryAfterSeconds = "30"
+	authUnavailableMessagePrefix     = "auth_unavailable:"
 )
 
 var moderationReviewIdPattern = regexp.MustCompile(`(?i)\bmoderation(?:[\s_-]+review)?[\s_-]+id\s*[:=]\s*([a-z0-9][a-z0-9_-]{7,127})\b`)
@@ -449,7 +450,19 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 }
 
 func isAuthUnavailableError(relayErr *types.NewAPIError) bool {
-	return relayErr != nil && relayErr.GetErrorCode() == types.ErrorCodeAuthUnavailable
+	if relayErr == nil {
+		return false
+	}
+	if relayErr.GetErrorCode() == types.ErrorCodeAuthUnavailable {
+		return true
+	}
+	// Older CPA responses preserve auth_unavailable only in the message while
+	// serializing the OpenAI error code as internal_server_error. Recognize that
+	// narrow upstream 503 contract so NewAPI does not reset channel exclusions
+	// and replay the same aggregate CPA channel across retry rounds.
+	return relayErr.StatusCode == http.StatusServiceUnavailable &&
+		relayErr.HasUpstreamResponse() &&
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(relayErr.Error())), authUnavailableMessagePrefix)
 }
 
 func canStartNextRelayRetryRound(

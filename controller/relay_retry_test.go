@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
@@ -32,6 +34,44 @@ func TestAuthUnavailableDoesNotReplayAggregateChannelAcrossRounds(t *testing.T) 
 	}
 	if state.StopReason != service.RetryStopReasonAuthUnavailable {
 		t.Fatalf("stop reason = %q", state.StopReason)
+	}
+}
+
+func TestCPAAuthUnavailableCompatibilityEnvelopeDoesNotReplayAcrossRounds(t *testing.T) {
+	body := `{"error":{"message":"auth_unavailable: requested route is temporarily unavailable","type":"server_error","code":"internal_server_error"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	authErr := service.RelayErrorHandler(context.Background(), resp, false)
+	if authErr == nil {
+		t.Fatal("expected CPA upstream error")
+	}
+	if authErr.GetErrorCode() == types.ErrorCodeAuthUnavailable {
+		t.Fatal("fixture must cover the legacy CPA envelope that loses the structured code")
+	}
+	if !isAuthUnavailableError(authErr) {
+		t.Fatal("legacy CPA auth_unavailable envelope must be classified")
+	}
+
+	state := service.NewRelayRetryState(types.RelayFormatOpenAI, 16)
+	state.RecordAttempt(9)
+	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr) {
+		t.Fatal("legacy CPA auth_unavailable must not replay the aggregate channel")
+	}
+	if state.StopReason != service.RetryStopReasonAuthUnavailable {
+		t.Fatalf("stop reason = %q", state.StopReason)
+	}
+}
+
+func TestAuthUnavailableMessageFallbackRequiresExplicitUpstream503(t *testing.T) {
+	localErr := types.NewErrorWithStatusCode(
+		errors.New("auth_unavailable: local diagnostic"),
+		types.ErrorCodeBadResponse,
+		http.StatusServiceUnavailable,
+	)
+	if isAuthUnavailableError(localErr) {
+		t.Fatal("local errors must not be classified by message text alone")
 	}
 }
 
