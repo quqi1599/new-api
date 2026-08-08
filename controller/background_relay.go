@@ -28,7 +28,8 @@ import (
 
 const (
 	backgroundRelayHeader                       = "X-Oneapi-Background"
-	defaultBackgroundRelayTextJobTimeoutSeconds = 600
+	defaultBackgroundRelayTextJobTimeoutSeconds = 1260
+	defaultBackgroundRelayJobTimeoutSeconds     = 1260
 )
 
 var backgroundRelaySubmitMu sync.Mutex
@@ -302,9 +303,9 @@ func runBackgroundRelayJob(job *service.BackgroundRelayJob, execution background
 		logger.LogError(context.Background(), fmt.Sprintf("failed to mark background relay job %s in progress: %v", task.TaskID, err))
 	}
 
-	timeoutSeconds := common.GetEnvOrDefault("BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS", 900)
+	timeoutSeconds := common.GetEnvOrDefault("BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS", defaultBackgroundRelayJobTimeoutSeconds)
 	if execution.RelayFormat != types.RelayFormatOpenAIImage {
-		// Keep the job envelope outside the 540s relay phase budgets so those
+		// Keep the job envelope outside the 1200s relay phase budgets so those
 		// inner guards can report their precise 504 code and finish persistence.
 		timeoutSeconds = common.GetEnvOrDefault("BACKGROUND_RELAY_TEXT_JOB_TIMEOUT_SECONDS", defaultBackgroundRelayTextJobTimeoutSeconds)
 	}

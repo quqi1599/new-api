@@ -224,17 +224,35 @@ func installTaskPollingAdaptor(t *testing.T, adaptor TaskPollingAdaptor) {
 	t.Cleanup(func() { GetTaskAdaptorFunc = previous })
 }
 
-func TestTaskPollingBudgetsNeverExceedTenMinutes(t *testing.T) {
+func TestTaskPollingBudgetsUseTwentyMinuteDefault(t *testing.T) {
 	previous := common.RelayNonStreamTimeout
 	common.RelayNonStreamTimeout = 1_200
 	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+	t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "")
 
-	require.Equal(t, 10*time.Minute, taskPollingRequestTimeout())
-	require.Equal(t, 10*time.Minute, taskPollingCycleTimeout())
+	require.Equal(t, 20*time.Minute, taskPollingRequestTimeout())
+	require.Equal(t, 20*time.Minute, taskPollingCycleTimeout())
 	ctx, cancel := newTaskPollingCycleContext(context.Background())
 	defer cancel()
 	deadline, ok := ctx.Deadline()
 	require.True(t, ok)
-	require.LessOrEqual(t, time.Until(deadline), 10*time.Minute)
-	require.Greater(t, time.Until(deadline), 9*time.Minute)
+	require.LessOrEqual(t, time.Until(deadline), 20*time.Minute)
+	require.Greater(t, time.Until(deadline), 19*time.Minute)
+}
+
+func TestTaskPollingBudgetUsesSmallerRelayOrExplicitLimit(t *testing.T) {
+	previous := common.RelayNonStreamTimeout
+	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+
+	t.Run("relay budget wins", func(t *testing.T) {
+		t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "1200")
+		common.RelayNonStreamTimeout = 900
+		require.Equal(t, 15*time.Minute, taskPollingRequestTimeout())
+	})
+
+	t.Run("explicit polling budget wins", func(t *testing.T) {
+		t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "900")
+		common.RelayNonStreamTimeout = 1200
+		require.Equal(t, 15*time.Minute, taskPollingRequestTimeout())
+	})
 }

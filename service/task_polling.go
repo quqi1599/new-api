@@ -48,17 +48,8 @@ type ContextTaskResultParser interface {
 	ParseTaskResultContext(ctx context.Context, body []byte) (*relaycommon.TaskInfo, error)
 }
 
-const fallbackTaskPollingRequestTimeout = 10 * time.Minute
-
 func taskPollingRequestTimeout() time.Duration {
-	timeout := fallbackTaskPollingRequestTimeout
-	if common.RelayNonStreamTimeout > 0 {
-		timeout = time.Duration(common.RelayNonStreamTimeout) * time.Second
-	}
-	if timeout > fallbackTaskPollingRequestTimeout {
-		return fallbackTaskPollingRequestTimeout
-	}
-	return timeout
+	return common.TaskPollingRequestTimeout()
 }
 
 func taskPollingCycleTimeout() time.Duration {

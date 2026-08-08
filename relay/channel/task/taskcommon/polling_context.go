@@ -10,19 +10,11 @@ import (
 	"github.com/QuantumNous/new-api/common"
 )
 
-const fallbackPollingRequestTimeout = 10 * time.Minute
-
 // PollingRequestTimeout keeps legacy polling callers bounded even when the
 // relay-specific non-stream timeout is explicitly disabled. The normal polling
 // loop supplies its own (usually earlier) request context.
 func PollingRequestTimeout() time.Duration {
-	if common.RelayNonStreamTimeout > 0 {
-		timeout := time.Duration(common.RelayNonStreamTimeout) * time.Second
-		if timeout < fallbackPollingRequestTimeout {
-			return timeout
-		}
-	}
-	return fallbackPollingRequestTimeout
+	return common.TaskPollingRequestTimeout()
 }
 
 type cancelOnCloseBody struct {

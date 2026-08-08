@@ -31,12 +31,15 @@ func printHelp() {
 const (
 	defaultRelayDialTimeoutSeconds            = 10
 	defaultRelayTLSHandshakeTimeoutSeconds    = 10
-	defaultRelayResponseHeaderTimeoutSeconds  = 520
+	defaultRelayResponseHeaderTimeoutSeconds  = 1140
 	defaultRelayExpectContinueTimeoutSeconds  = 1
-	defaultRelayFirstEventTimeoutSeconds      = 540
-	defaultRelayFirstEventTotalTimeoutSeconds = 540
-	defaultRelayNonStreamTimeoutSeconds       = 540
+	defaultRelayFirstEventTimeoutSeconds      = 1200
+	defaultRelayFirstEventTotalTimeoutSeconds = 1200
+	defaultRelayNonStreamTimeoutSeconds       = 1200
 	defaultRelayStreamHeartbeatSeconds        = 15
+	defaultStreamingTimeoutSeconds            = 1200
+	defaultRelayOuterProxyTimeoutSeconds      = 1260
+	defaultTaskPollingRequestTimeoutSeconds   = 1200
 )
 
 func getNonNegativeEnvOrDefault(name string, defaultValue int) int {
@@ -51,7 +54,7 @@ func getNonNegativeEnvOrDefault(name string, defaultValue int) int {
 func getRelayResponseHeaderTimeoutSeconds(legacyTimeout int) int {
 	fallback := defaultRelayResponseHeaderTimeoutSeconds
 	// Preserve smaller legacy limits, but do not let an old whole-request value
-	// (commonly 600s) consume the outer proxy's entire deadline. Operators that
+	// (commonly 1200s) consume the outer proxy's entire deadline. Operators that
 	// intentionally need a larger header phase can set the new variable explicitly.
 	if legacyTimeout > 0 && legacyTimeout < fallback {
 		fallback = legacyTimeout
@@ -61,6 +64,20 @@ func getRelayResponseHeaderTimeoutSeconds(legacyTimeout int) int {
 
 func getRelayFirstEventTimeoutSeconds() int {
 	return getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TIMEOUT_SECONDS", defaultRelayFirstEventTimeoutSeconds)
+}
+
+// TaskPollingRequestTimeout returns the shared request/cycle budget for task
+// polling. A shorter non-stream Relay budget still wins so polling can never
+// outlive its parent request envelope.
+func TaskPollingRequestTimeout() time.Duration {
+	timeoutSeconds := GetEnvOrDefault("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", defaultTaskPollingRequestTimeoutSeconds)
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = defaultTaskPollingRequestTimeoutSeconds
+	}
+	if RelayNonStreamTimeout > 0 && RelayNonStreamTimeout < timeoutSeconds {
+		timeoutSeconds = RelayNonStreamTimeout
+	}
+	return time.Duration(timeoutSeconds) * time.Second
 }
 
 func getRelayStreamHeartbeatSeconds() int {
@@ -76,8 +93,8 @@ func getRelayStreamHeartbeatSeconds() int {
 	return defaultRelayStreamHeartbeatSeconds
 }
 
-func relayTimeoutConfigurationWarnings(responseHeader, firstEvent, firstEventTotal, nonStream int) []string {
-	warnings := make([]string, 0, 3)
+func relayTimeoutConfigurationWarnings(responseHeader, firstEvent, firstEventTotal, nonStream, streaming, outerProxy int) []string {
+	warnings := make([]string, 0, 6)
 	if responseHeader > 0 && firstEventTotal > 0 && responseHeader >= firstEventTotal {
 		warnings = append(warnings, fmt.Sprintf(
 			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must be lower than RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d to preserve distinct timeout phases",
@@ -95,6 +112,19 @@ func relayTimeoutConfigurationWarnings(responseHeader, firstEvent, firstEventTot
 			"RELAY_FIRST_EVENT_TIMEOUT_SECONDS=%d exceeds RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d and will be shortened by the request-wide budget",
 			firstEvent, firstEventTotal,
 		))
+	}
+	for name, timeout := range map[string]int{
+		"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS":   responseHeader,
+		"RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS": firstEventTotal,
+		"RELAY_NON_STREAM_TIMEOUT_SECONDS":        nonStream,
+		"STREAMING_TIMEOUT":                       streaming,
+	} {
+		if timeout > 0 && outerProxy > 0 && timeout >= outerProxy {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s=%d must be lower than RELAY_OUTER_PROXY_TIMEOUT_SECONDS=%d so NewAPI can finish before the outer proxy",
+				name, timeout, outerProxy,
+			))
+		}
 	}
 	return warnings
 }
@@ -231,13 +261,15 @@ func InitEnv() {
 		constant.RelayFirstEventTimeout,
 		RelayFirstEventTotalTimeout,
 		RelayNonStreamTimeout,
+		constant.StreamingTimeout,
+		getNonNegativeEnvOrDefault("RELAY_OUTER_PROXY_TIMEOUT_SECONDS", defaultRelayOuterProxyTimeoutSeconds),
 	) {
 		SysError("WARNING: " + warning)
 	}
 }
 
 func initConstantEnv() {
-	constant.StreamingTimeout = GetEnvOrDefault("STREAMING_TIMEOUT", 300)
+	constant.StreamingTimeout = GetEnvOrDefault("STREAMING_TIMEOUT", defaultStreamingTimeoutSeconds)
 	constant.RelayFirstEventTimeout = getRelayFirstEventTimeoutSeconds()
 	constant.DifyDebug = GetEnvOrDefaultBool("DIFY_DEBUG", true)
 	constant.MaxFileDownloadMB = GetEnvOrDefault("MAX_FILE_DOWNLOAD_MB", 64)

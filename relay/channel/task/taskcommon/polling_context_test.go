@@ -34,10 +34,11 @@ func TestDoLegacyPollingRequestUsesBoundedContextAndCancelsOnClose(t *testing.T)
 	}
 }
 
-func TestPollingRequestTimeoutCapsAtTenMinutes(t *testing.T) {
+func TestPollingRequestTimeoutUsesTwentyMinuteBudget(t *testing.T) {
 	previous := common.RelayNonStreamTimeout
 	common.RelayNonStreamTimeout = 1_200
 	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+	t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "")
 
-	require.Equal(t, 10*time.Minute, PollingRequestTimeout())
+	require.Equal(t, 20*time.Minute, PollingRequestTimeout())
 }

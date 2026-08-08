@@ -25,8 +25,11 @@ func TestBackgroundRelayTaskIDIsIdempotentAndScoped(t *testing.T) {
 }
 
 func TestBackgroundRelayTextJobEnvelopeExceedsRelayPhaseBudgets(t *testing.T) {
-	if defaultBackgroundRelayTextJobTimeoutSeconds <= 540 {
-		t.Fatalf("background text job timeout = %d, must leave cleanup margin after 540s relay budgets", defaultBackgroundRelayTextJobTimeoutSeconds)
+	if defaultBackgroundRelayTextJobTimeoutSeconds <= 1200 {
+		t.Fatalf("background text job timeout = %d, must leave cleanup margin after 1200s relay budgets", defaultBackgroundRelayTextJobTimeoutSeconds)
+	}
+	if defaultBackgroundRelayJobTimeoutSeconds <= 1200 {
+		t.Fatalf("background job timeout = %d, must leave cleanup margin after 1200s relay budgets", defaultBackgroundRelayJobTimeoutSeconds)
 	}
 }
 

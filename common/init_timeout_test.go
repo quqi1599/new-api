@@ -2,6 +2,7 @@ package common
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -14,7 +15,7 @@ func TestGetRelayResponseHeaderTimeoutSeconds(t *testing.T) {
 
 	t.Run("caps unsafe legacy relay timeout at the safe phase default", func(t *testing.T) {
 		t.Setenv("RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS", "")
-		assert.Equal(t, defaultRelayResponseHeaderTimeoutSeconds, getRelayResponseHeaderTimeoutSeconds(600))
+		assert.Equal(t, defaultRelayResponseHeaderTimeoutSeconds, getRelayResponseHeaderTimeoutSeconds(1260))
 	})
 
 	t.Run("preserves a smaller legacy relay timeout", func(t *testing.T) {
@@ -52,18 +53,45 @@ func TestGetRelayFirstEventTimeoutSeconds(t *testing.T) {
 
 func TestFirstEventTotalTimeoutDefaultFitsInsideOuterProxyBudget(t *testing.T) {
 	t.Setenv("RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS", "")
-	assert.Equal(t, 540, getNonNegativeEnvOrDefault(
+	assert.Equal(t, 1200, getNonNegativeEnvOrDefault(
 		"RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS",
 		defaultRelayFirstEventTotalTimeoutSeconds,
 	))
 }
 
 func TestRelayTimeoutDefaultsFitInsideOuterProxyBudget(t *testing.T) {
-	assert.Equal(t, 520, defaultRelayResponseHeaderTimeoutSeconds)
-	assert.Equal(t, 540, defaultRelayFirstEventTimeoutSeconds)
-	assert.Equal(t, 540, defaultRelayFirstEventTotalTimeoutSeconds)
-	assert.Equal(t, 540, defaultRelayNonStreamTimeoutSeconds)
+	assert.Equal(t, 1140, defaultRelayResponseHeaderTimeoutSeconds)
+	assert.Equal(t, 1200, defaultRelayFirstEventTimeoutSeconds)
+	assert.Equal(t, 1200, defaultRelayFirstEventTotalTimeoutSeconds)
+	assert.Equal(t, 1200, defaultRelayNonStreamTimeoutSeconds)
+	assert.Equal(t, 1200, defaultStreamingTimeoutSeconds)
+	assert.Equal(t, 1260, defaultRelayOuterProxyTimeoutSeconds)
+	assert.Equal(t, 1200, defaultTaskPollingRequestTimeoutSeconds)
 	assert.Less(t, defaultRelayResponseHeaderTimeoutSeconds, defaultRelayFirstEventTotalTimeoutSeconds)
+	assert.Less(t, defaultRelayFirstEventTotalTimeoutSeconds, defaultRelayOuterProxyTimeoutSeconds)
+}
+
+func TestTaskPollingRequestTimeoutUsesSmallerConfiguredOrRelayBudget(t *testing.T) {
+	previous := RelayNonStreamTimeout
+	t.Cleanup(func() { RelayNonStreamTimeout = previous })
+
+	t.Run("twenty minute default", func(t *testing.T) {
+		t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "")
+		RelayNonStreamTimeout = 1200
+		assert.Equal(t, 20*time.Minute, TaskPollingRequestTimeout())
+	})
+
+	t.Run("relay budget wins", func(t *testing.T) {
+		t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "1200")
+		RelayNonStreamTimeout = 900
+		assert.Equal(t, 15*time.Minute, TaskPollingRequestTimeout())
+	})
+
+	t.Run("explicit polling budget wins", func(t *testing.T) {
+		t.Setenv("TASK_POLLING_REQUEST_TIMEOUT_SECONDS", "900")
+		RelayNonStreamTimeout = 1200
+		assert.Equal(t, 15*time.Minute, TaskPollingRequestTimeout())
+	})
 }
 
 func TestGetRelayStreamHeartbeatSeconds(t *testing.T) {
@@ -94,11 +122,11 @@ func TestGetRelayStreamHeartbeatSeconds(t *testing.T) {
 
 func TestRelayTimeoutConfigurationWarnings(t *testing.T) {
 	t.Run("safe defaults", func(t *testing.T) {
-		assert.Empty(t, relayTimeoutConfigurationWarnings(520, 540, 540, 540))
+		assert.Empty(t, relayTimeoutConfigurationWarnings(1140, 1200, 1200, 1200, 1200, 1260))
 	})
 
 	t.Run("reports ineffective or ambiguous phase ordering", func(t *testing.T) {
-		warnings := relayTimeoutConfigurationWarnings(600, 700, 540, 580)
+		warnings := relayTimeoutConfigurationWarnings(600, 700, 540, 580, 500, 0)
 		assert.Len(t, warnings, 3)
 		assert.Contains(t, warnings[0], "RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS", "warning should explain the phase ordering")
 		assert.Contains(t, warnings[1], "RELAY_NON_STREAM_TIMEOUT_SECONDS", "warning should explain the body budget ordering")
@@ -106,6 +134,14 @@ func TestRelayTimeoutConfigurationWarnings(t *testing.T) {
 	})
 
 	t.Run("zero disables a guard without warning", func(t *testing.T) {
-		assert.Empty(t, relayTimeoutConfigurationWarnings(0, 0, 0, 0))
+		assert.Empty(t, relayTimeoutConfigurationWarnings(0, 0, 0, 0, 0, 0))
+	})
+
+	t.Run("reports inner budgets that collide with the outer proxy", func(t *testing.T) {
+		warnings := relayTimeoutConfigurationWarnings(1140, 1200, 1200, 1200, 1200, 1200)
+		assert.Len(t, warnings, 3)
+		for _, warning := range warnings {
+			assert.Contains(t, warning, "RELAY_OUTER_PROXY_TIMEOUT_SECONDS")
+		}
 	})
 }
