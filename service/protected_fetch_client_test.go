@@ -311,7 +311,7 @@ func TestProtectedFetchRoundTripperReusesTransportPerProxy(t *testing.T) {
 	common.RelayTimeout = 0
 	common.RelayNonStreamTimeout = 1200
 	common.RelayTLSHandshakeTimeout = 10
-	common.RelayResponseHeaderTimeout = 1140
+	common.RelayResponseHeaderTimeout = 1200
 	common.RelayExpectContinueTimeout = 1
 	t.Cleanup(func() {
 		common.RelayTimeout = oldRelayTimeout
@@ -335,6 +335,6 @@ func TestProtectedFetchRoundTripperReusesTransportPerProxy(t *testing.T) {
 	require.False(t, direct.DisableKeepAlives)
 	require.Equal(t, 1200*time.Second, client.Timeout)
 	require.Equal(t, 10*time.Second, direct.TLSHandshakeTimeout)
-	require.Equal(t, 1140*time.Second, direct.ResponseHeaderTimeout)
+	require.Equal(t, 1200*time.Second, direct.ResponseHeaderTimeout)
 	require.Equal(t, time.Second, direct.ExpectContinueTimeout)
 }

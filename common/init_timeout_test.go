@@ -60,14 +60,14 @@ func TestFirstEventTotalTimeoutDefaultFitsInsideOuterProxyBudget(t *testing.T) {
 }
 
 func TestRelayTimeoutDefaultsFitInsideOuterProxyBudget(t *testing.T) {
-	assert.Equal(t, 1140, defaultRelayResponseHeaderTimeoutSeconds)
+	assert.Equal(t, 1200, defaultRelayResponseHeaderTimeoutSeconds)
 	assert.Equal(t, 1200, defaultRelayFirstEventTimeoutSeconds)
 	assert.Equal(t, 1200, defaultRelayFirstEventTotalTimeoutSeconds)
 	assert.Equal(t, 1200, defaultRelayNonStreamTimeoutSeconds)
 	assert.Equal(t, 1200, defaultStreamingTimeoutSeconds)
 	assert.Equal(t, 1260, defaultRelayOuterProxyTimeoutSeconds)
 	assert.Equal(t, 1200, defaultTaskPollingRequestTimeoutSeconds)
-	assert.Less(t, defaultRelayResponseHeaderTimeoutSeconds, defaultRelayFirstEventTotalTimeoutSeconds)
+	assert.LessOrEqual(t, defaultRelayResponseHeaderTimeoutSeconds, defaultRelayFirstEventTotalTimeoutSeconds)
 	assert.Less(t, defaultRelayFirstEventTotalTimeoutSeconds, defaultRelayOuterProxyTimeoutSeconds)
 }
 
@@ -122,7 +122,7 @@ func TestGetRelayStreamHeartbeatSeconds(t *testing.T) {
 
 func TestRelayTimeoutConfigurationWarnings(t *testing.T) {
 	t.Run("safe defaults", func(t *testing.T) {
-		assert.Empty(t, relayTimeoutConfigurationWarnings(1140, 1200, 1200, 1200, 1200, 1260))
+		assert.Empty(t, relayTimeoutConfigurationWarnings(1200, 1200, 1200, 1200, 1200, 1260))
 	})
 
 	t.Run("reports ineffective or ambiguous phase ordering", func(t *testing.T) {

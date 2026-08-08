@@ -315,7 +315,7 @@ docker run --name new-api -d --restart always \
 | `SHUTDOWN_TIMEOUT_SECONDS` | 优雅退出等待时间（秒），容器的停止宽限时间必须更长 | `120` |
 | `RELAY_DIAL_TIMEOUT_SECONDS` | TCP/代理建连超时（秒），`0` 表示禁用该阶段超时 | `10` |
 | `RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | TLS 握手超时（秒），`0` 表示禁用该阶段超时 | `10` |
-| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 单次尝试等待上游响应头超时（秒），不限制响应体的流式读取时长，并受跨尝试首事件总预算约束 | `1140` |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 单次尝试等待上游响应头超时（秒），给上游完整 20 分钟，不限制响应体的流式读取时长，并受跨尝试首事件总预算约束 | `1200` |
 | `RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS` | `Expect: 100-continue` 等待超时（秒） | `1` |
 | `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | 响应头返回后等待首个有效 SSE 事件的单次尝试上限；请求级总截止时间可缩短它 | `1200` |
 | `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | 从入站开始、跨所有渠道尝试共享的首个有效事件总预算；首事件后解除，不截断健康长流；应早于外层 Caddy 首包超时至少 60 秒，`0` 表示禁用 | `1200` |
@@ -326,7 +326,7 @@ docker run --name new-api -d --restart always \
 | `TASK_POLLING_REQUEST_TIMEOUT_SECONDS` | 异步任务轮询的请求级/单轮总预算；更短的非流式或调用方 deadline 仍优先生效 | `1200` |
 | `BACKGROUND_RELAY_TEXT_JOB_TIMEOUT_SECONDS` | 后台文本 Relay Job 外层预算，为 1200 秒 Relay 预算预留收尾时间 | `1260` |
 | `BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS` | 其他后台 Relay Job 外层预算 | `1260` |
-| `RELAY_TIMEOUT` | 旧版 Relay/供应商兼容值，新响应头超时未设置时作为回退（不超过安全的 1140 秒阶段默认值）；用户控制 URL 的 SSRF 保护下载仍将其作为整体超时 | `0` |
+| `RELAY_TIMEOUT` | 旧版 Relay/供应商兼容值，新响应头超时未设置时作为回退（不超过安全的 1200 秒阶段默认值）；用户控制 URL 的 SSRF 保护下载仍将其作为整体超时 | `0` |
 | `RELAY_IDLE_CONN_TIMEOUT` | Relay HTTP 客户端空闲保活连接超时（秒），`0` 表示禁用 | `90` |
 | `STREAMING_TIMEOUT` | 首个有效事件后，相邻有效 SSE data 事件的空闲超时；注释/心跳不重置 | `1200` |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | 流式扫描器单行最大缓冲（MB），图像生成等超大 `data:` 片段（如 4K 图片 base64）需适当调大 | `64` |

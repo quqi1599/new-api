@@ -31,7 +31,7 @@ func printHelp() {
 const (
 	defaultRelayDialTimeoutSeconds            = 10
 	defaultRelayTLSHandshakeTimeoutSeconds    = 10
-	defaultRelayResponseHeaderTimeoutSeconds  = 1140
+	defaultRelayResponseHeaderTimeoutSeconds  = 1200
 	defaultRelayExpectContinueTimeoutSeconds  = 1
 	defaultRelayFirstEventTimeoutSeconds      = 1200
 	defaultRelayFirstEventTotalTimeoutSeconds = 1200
@@ -95,15 +95,15 @@ func getRelayStreamHeartbeatSeconds() int {
 
 func relayTimeoutConfigurationWarnings(responseHeader, firstEvent, firstEventTotal, nonStream, streaming, outerProxy int) []string {
 	warnings := make([]string, 0, 6)
-	if responseHeader > 0 && firstEventTotal > 0 && responseHeader >= firstEventTotal {
+	if responseHeader > 0 && firstEventTotal > 0 && responseHeader > firstEventTotal {
 		warnings = append(warnings, fmt.Sprintf(
-			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must be lower than RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d to preserve distinct timeout phases",
+			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must not exceed RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d",
 			responseHeader, firstEventTotal,
 		))
 	}
-	if responseHeader > 0 && nonStream > 0 && responseHeader >= nonStream {
+	if responseHeader > 0 && nonStream > 0 && responseHeader > nonStream {
 		warnings = append(warnings, fmt.Sprintf(
-			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must be lower than RELAY_NON_STREAM_TIMEOUT_SECONDS=%d to preserve a non-stream body budget",
+			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must not exceed RELAY_NON_STREAM_TIMEOUT_SECONDS=%d",
 			responseHeader, nonStream,
 		))
 	}

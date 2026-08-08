@@ -40,7 +40,7 @@ services:
 #      - RELAY_IDLE_CONN_TIMEOUT=90  # Relay HTTP 客户端空闲连接超时时间，单位秒，默认跟随 Go 标准库，设置为0表示不限制 (Relay HTTP client idle keep-alive timeout in seconds, defaults to Go standard library; set 0 to disable)
 #      - RELAY_DIAL_TIMEOUT_SECONDS=10  # TCP/代理建连超时；0 表示不限制 (TCP/proxy dial timeout; 0 disables)
 #      - RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS=10  # TLS 握手超时；0 表示不限制 (TLS handshake timeout; 0 disables)
-#      - RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=1140  # 先于1200秒总预算触发，并给1260秒外层反代留余量 (Fires before the 1200s total budget and leaves margin before a 1260s outer proxy)
+#      - RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=1200  # 给上游完整20分钟等待响应头，并给1260秒外层反代留60秒余量 (Allows the full 20 minutes for upstream response headers and leaves 60s before a 1260s outer proxy)
 #      - RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS=1  # Expect: 100-continue 等待超时 (Expect: 100-continue timeout)
 #      - RELAY_FIRST_EVENT_TIMEOUT_SECONDS=1200  # 响应头后等待首个有效 SSE 事件，并受请求级总预算限制 (Per-attempt first valid event cap, bounded by request-wide budget)
 #      - RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=1200  # 从入站开始、跨渠道尝试共享的首事件总预算 (Request-wide first-event budget shared across attempts)
@@ -52,7 +52,7 @@ services:
 #      - TASK_POLLING_REQUEST_TIMEOUT_SECONDS=1200  # 异步任务轮询请求级/单轮总预算 (Request-wide/cycle budget for asynchronous task polling)
 #      - BACKGROUND_RELAY_TEXT_JOB_TIMEOUT_SECONDS=1260  # 后台文本Job外层预算，默认比1200秒Relay预算多60秒收尾 (Background text job envelope with 60s cleanup margin)
 #      - BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS=1260  # 其他后台Relay Job外层预算 (Outer envelope for other background Relay jobs)
-#      - RELAY_TIMEOUT=0  # 旧配置：新响应头超时未设置时仅作为不超过1140秒的兼容回退 (Legacy response-header fallback capped at 1140s; no longer a whole-stream timeout)
+#      - RELAY_TIMEOUT=0  # 旧配置：新响应头超时未设置时仅作为不超过1200秒的兼容回退 (Legacy response-header fallback capped at 1200s; no longer a whole-stream timeout)
 #      - MAX_CONCURRENT_LARGE_REQUEST_BODIES=4  # 并发处理的 >=1 MiB 请求体上限，包含磁盘暂存请求 (Concurrent >=1 MiB body cap, including disk-spooled bodies)
 #      - SESSION_SECRET=random_string  # 多机部署时设置，必须修改这个随机字符串！！ （multi-node deployment, set this to a random string!!!!!!!）
 #      - SESSION_COOKIE_SECURE=true  # 启用 Secure session cookie，必须同时配置 SESSION_COOKIE_TRUSTED_URL (Enable Secure session cookies; requires SESSION_COOKIE_TRUSTED_URL)

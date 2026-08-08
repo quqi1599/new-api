@@ -43,8 +43,7 @@
 
 ```text
 TCP/TLS 阶段超时
-< NewAPI 响应头超时 1140s
-< NewAPI 请求级总预算 1200s
+< NewAPI 响应头和请求级总预算 1200s
 < Caddy/OpenResty 外层预算 1260s
 < 建议客户端总超时 1320s
 ```
@@ -61,7 +60,7 @@ TCP/TLS 阶段超时
 RELAY_TIMEOUT=0
 RELAY_DIAL_TIMEOUT_SECONDS=10
 RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS=10
-RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=1140
+RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=1200
 RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS=1
 RELAY_FIRST_EVENT_TIMEOUT_SECONDS=1200
 RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=1200
@@ -78,7 +77,7 @@ BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS=1260
 
 | 参数 | 目标值 | 语义 |
 |---|---:|---|
-| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 1140 | 单次尝试等待上游响应头；必须比请求级总预算早 60 秒 |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 1200 | 单次尝试等待上游响应头；给上游完整 20 分钟，并比 1260 秒外层反代早 60 秒 |
 | `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | 1200 | 响应头后等待首个有效事件的单次上限，实际受请求级绝对截止时间缩短 |
 | `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | 1200 | 从入站开始、跨尝试共享的首事件总预算 |
 | `RELAY_NON_STREAM_TIMEOUT_SECONDS` | 1200 | 非流式上传至读完响应体的绝对总预算 |
@@ -186,13 +185,13 @@ send_timeout 1260s;
 
 ### 7.1 上游响应头超时
 
-在约 1140 秒结束，并记录：
+在约 1200 秒结束，并记录：
 
 ```text
 HTTP 504
 error_code=upstream_response_header_timeout
 timeout_phase=response_headers
-timeout_seconds=1140
+timeout_seconds=1200
 cancel_origin=upstream_timeout
 connected_upstream=true
 request_written=true
@@ -249,7 +248,7 @@ timeout_seconds=1200
 1. 容器 revision、镜像 digest 与 CI SHA 一致。
 2. `restart=0`、OOM=false，无 panic/fatal。
 3. 所有实际入口 `/api/status` 返回 200；未认证 `/v1/models` 返回预期 401。
-4. 使用受控假上游验证 1140 秒 NewAPI 504，禁止拿真实付费渠道故意挂满测试。
+4. 使用受控短预算假上游验证与生产 1200 秒相同的 NewAPI 504 分类，禁止拿真实付费渠道故意挂满 20 分钟测试。
 5. 504 日志包含正确 phase/seconds/stage，且 `output_started=false`。
 6. 至少完成一条真实流式成功请求，验证首帧、持续输出和正常结束。
 7. 观察 24 小时和 72 小时的连接数、FD、内存、goroutine、499/503/504、各渠道首帧分位和超时并发。
