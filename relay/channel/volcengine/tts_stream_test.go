@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
@@ -111,5 +112,66 @@ func TestVolcengineTTSUsesSharedFirstEventDeadline(t *testing.T) {
 	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, streamErr.GetErrorCode())
 	require.True(t, types.IsSkipRetryError(streamErr))
 	require.Equal(t, relaycommon.StreamEndReasonFirstEventTimeout, info.StreamStatus.EndReason)
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestVolcengineTTSEmptyNonTerminalFrameDoesNotSatisfyFirstEvent(t *testing.T) {
+	requestURL := newVolcengineTTSServer(t, func(conn *websocket.Conn) error {
+		message, err := NewMessage(MsgTypeAudioOnlyServer, 0)
+		if err != nil {
+			return err
+		}
+		message.Sequence = 1
+		frame, err := message.Marshal()
+		if err != nil {
+			return err
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	})
+	c, recorder, info := newVolcengineTTSTestContext()
+	info.SetFirstValidEventDeadline(time.Now().Add(30 * time.Millisecond))
+
+	usage, streamErr := handleTTSWebSocketResponse(c, requestURL, VolcengineTTSRequest{}, info, "mp3")
+
+	require.Nil(t, usage)
+	require.NotNil(t, streamErr)
+	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, streamErr.GetErrorCode())
+	require.Zero(t, info.ReceivedResponseCount)
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestVolcengineTTSHandshakeConsumesAbsoluteFirstEventBudget(t *testing.T) {
+	previous := common.RelayFirstEventTotalTimeout
+	common.RelayFirstEventTotalTimeout = 1
+	t.Cleanup(func() { common.RelayFirstEventTotalTimeout = previous })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+	c, recorder, info := newVolcengineTTSTestContext()
+	info.StartTime = time.Now().Add(-750 * time.Millisecond)
+	startedAt := time.Now()
+
+	usage, streamErr := handleTTSWebSocketResponse(
+		c,
+		"ws"+strings.TrimPrefix(upstream.URL, "http"),
+		VolcengineTTSRequest{},
+		info,
+		"mp3",
+	)
+
+	require.Nil(t, usage)
+	require.NotNil(t, streamErr)
+	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, streamErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(streamErr))
+	require.False(t, types.IsChannelPenaltyAllowed(streamErr))
+	require.Less(t, time.Since(startedAt), 750*time.Millisecond)
 	require.Empty(t, recorder.Body.String())
 }

@@ -2,6 +2,7 @@ package hailuo
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -79,13 +80,12 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
 		return
 	}
-	_ = resp.Body.Close()
-
 	var hResp VideoResponse
 	if err := common.Unmarshal(responseBody, &hResp); err != nil {
 		taskErr = service.TaskErrorWrapper(errors.Wrapf(err, "body: %s", responseBody), "unmarshal_response_body_failed", http.StatusInternalServerError)
@@ -111,7 +111,15 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	return hResp.TaskID, responseBody, nil
 }
 
+var _ service.ContextTaskPollingAdaptor = (*TaskAdaptor)(nil)
+
 func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+	return taskcommon.DoLegacyPollingRequest(func(ctx context.Context) (*http.Response, error) {
+		return a.FetchTaskContext(ctx, baseUrl, key, body, proxy)
+	})
+}
+
+func (a *TaskAdaptor) FetchTaskContext(ctx context.Context, baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
 	taskID, ok := body["task_id"].(string)
 	if !ok {
 		return nil, fmt.Errorf("invalid task_id")
@@ -119,7 +127,7 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 
 	uri := fmt.Sprintf("%s%s?task_id=%s", baseUrl, QueryTaskEndpoint, taskID)
 
-	req, err := http.NewRequest(http.MethodGet, uri, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +190,12 @@ func (a *TaskAdaptor) parseResolutionFromSize(size string, modelConfig ModelConf
 }
 
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), taskcommon.PollingRequestTimeout())
+	defer cancel()
+	return a.ParseTaskResultContext(ctx, respBody)
+}
+
+func (a *TaskAdaptor) ParseTaskResultContext(ctx context.Context, respBody []byte) (*relaycommon.TaskInfo, error) {
 	resTask := QueryTaskResponse{}
 	if err := common.Unmarshal(respBody, &resTask); err != nil {
 		return nil, errors.Wrap(err, "unmarshal task result failed")
@@ -208,7 +222,11 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 	case TaskStatusSuccess:
 		taskResult.Status = model.TaskStatusSuccess
 		taskResult.Progress = "100%"
-		taskResult.Url = a.buildVideoURL(resTask.TaskID, resTask.FileID)
+		videoURL, err := a.buildVideoURL(ctx, resTask.TaskID, resTask.FileID)
+		if err != nil {
+			return nil, err
+		}
+		taskResult.Url = videoURL
 	case TaskStatusFailed:
 		taskResult.Status = model.TaskStatusFailure
 		taskResult.Progress = "100%"
@@ -245,16 +263,16 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, erro
 	return jsonData, nil
 }
 
-func (a *TaskAdaptor) buildVideoURL(_, fileID string) string {
+func (a *TaskAdaptor) buildVideoURL(ctx context.Context, _, fileID string) (string, error) {
 	if a.apiKey == "" || a.baseURL == "" {
-		return ""
+		return "", errors.New("hailuo file retrieval is missing channel credentials")
 	}
 
 	url := fmt.Sprintf("%s/v1/files/retrieve?file_id=%s", a.baseURL, fileID)
 
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return ""
+		return "", err
 	}
 
 	req.Header.Set("Accept", "application/json")
@@ -262,25 +280,28 @@ func (a *TaskAdaptor) buildVideoURL(_, fileID string) string {
 
 	resp, err := service.GetHttpClient().Do(req)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("hailuo file retrieval returned HTTP %d", resp.StatusCode)
+	}
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return ""
+		return "", err
 	}
 
 	var retrieveResp RetrieveFileResponse
 	if err := common.Unmarshal(responseBody, &retrieveResp); err != nil {
-		return ""
+		return "", err
 	}
 
 	if retrieveResp.BaseResp.StatusCode != StatusSuccess {
-		return ""
+		return "", fmt.Errorf("hailuo file retrieval failed: %s", retrieveResp.BaseResp.StatusMsg)
 	}
 
-	return retrieveResp.File.DownloadURL
+	return retrieveResp.File.DownloadURL, nil
 }
 
 func contains(slice []string, item string) bool {

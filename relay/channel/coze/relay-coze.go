@@ -1,14 +1,20 @@
 package coze
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -19,6 +25,202 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+const cozeRequestBudgetKey = "coze_request_budget"
+
+type cozeRequestBudget struct {
+	ctx            context.Context
+	parent         context.Context
+	cancel         context.CancelFunc
+	timeoutSeconds int
+	state          atomic.Uint32 // 0=armed, 1=finished, 2=expired
+	timer          *time.Timer
+	finishOnce     sync.Once
+}
+
+func newCozeRequestBudget(c *gin.Context, info *relaycommon.RelayInfo) (*cozeRequestBudget, error) {
+	timeoutSeconds := common.RelayNonStreamTimeout
+	if timeoutSeconds <= 0 {
+		return newCozeRequestBudgetWithTimeout(c, 0, 0)
+	}
+	totalTimeout := time.Duration(timeoutSeconds) * time.Second
+	timeout := totalTimeout
+	if info != nil {
+		info.EnsureNonStreamDeadline(info.StartTime, totalTimeout)
+		if remaining, limited := info.RemainingNonStreamBudget(); limited {
+			if remaining <= 0 {
+				return nil, cozeTotalTimeoutError(c, &cozeRequestBudget{timeoutSeconds: timeoutSeconds}, info.UpstreamRequestMayHaveBeenAccepted())
+			}
+			timeout = remaining
+		}
+	}
+	return newCozeRequestBudgetWithTimeout(c, timeout, timeoutSeconds)
+}
+
+func newCozeRequestBudgetWithTimeout(c *gin.Context, timeout time.Duration, timeoutSeconds int) (*cozeRequestBudget, error) {
+	if c == nil || c.Request == nil {
+		return nil, errors.New("Coze request context is missing")
+	}
+	parent := c.Request.Context()
+	ctx, cancel := context.WithCancel(parent)
+	budget := &cozeRequestBudget{
+		ctx:            ctx,
+		parent:         parent,
+		cancel:         cancel,
+		timeoutSeconds: timeoutSeconds,
+	}
+	if timeout > 0 {
+		budget.timer = time.AfterFunc(timeout, func() {
+			if budget.state.CompareAndSwap(0, 2) {
+				cancel()
+			}
+		})
+	}
+	return budget, nil
+}
+
+func (b *cozeRequestBudget) finish() {
+	if b == nil {
+		return
+	}
+	b.finishOnce.Do(func() {
+		b.state.CompareAndSwap(0, 1)
+		if b.timer != nil {
+			b.timer.Stop()
+		}
+		b.cancel()
+	})
+}
+
+func (b *cozeRequestBudget) expired() bool {
+	return b != nil && b.state.Load() == 2
+}
+
+func getCozeRequestBudget(c *gin.Context) *cozeRequestBudget {
+	if c == nil {
+		return nil
+	}
+	value, exists := c.Get(cozeRequestBudgetKey)
+	if !exists {
+		return nil
+	}
+	budget, _ := value.(*cozeRequestBudget)
+	return budget
+}
+
+func setCozeTimeoutMetadata(c *gin.Context, origin, phase string, timeoutSeconds int) {
+	if c == nil {
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, origin)
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, phase)
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, timeoutSeconds)
+}
+
+func cozeTotalTimeoutError(c *gin.Context, budget *cozeRequestBudget, allowChannelPenalty bool) *types.NewAPIError {
+	timeoutSeconds := common.RelayNonStreamTimeout
+	if budget != nil {
+		timeoutSeconds = budget.timeoutSeconds
+	}
+	setCozeTimeoutMetadata(c, constant.RelayCancelOriginGatewayDeadline, "non_stream_total", timeoutSeconds)
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if allowChannelPenalty {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("Coze multi-step response exceeded the total timeout"),
+		types.ErrorCodeUpstreamNonStreamTimeout,
+		http.StatusGatewayTimeout,
+		options...,
+	)
+}
+
+func classifyCozeStageError(c *gin.Context, budget *cozeRequestBudget, err error, phase string) *types.NewAPIError {
+	if budget != nil && budget.expired() {
+		return cozeTotalTimeoutError(c, budget, true)
+	}
+	if budget != nil && budget.parent.Err() != nil {
+		return channel.ClassifyDoRequestError(c, err)
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		errorCode := types.ErrorCodeUpstreamResponseHeaderTimeout
+		timeoutSeconds := common.RelayResponseHeaderTimeout
+		message := "Coze response headers timed out"
+		if phase == "response_body" {
+			errorCode = types.ErrorCodeUpstreamNonStreamTimeout
+			timeoutSeconds = common.RelayNonStreamTimeout
+			message = "Coze response body timed out"
+		}
+		setCozeTimeoutMetadata(c, constant.RelayCancelOriginUpstreamTimeout, phase, timeoutSeconds)
+		return types.NewErrorWithStatusCode(
+			errors.New(message),
+			errorCode,
+			http.StatusGatewayTimeout,
+			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithChannelPenalty(),
+		)
+	}
+	return types.NewError(
+		err,
+		types.ErrorCodeDoRequestFailed,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithChannelPenalty(),
+	)
+}
+
+type cozeReadResult struct {
+	body []byte
+	err  error
+}
+
+type cozeBudgetBody struct {
+	io.ReadCloser
+	budget *cozeRequestBudget
+}
+
+func (b *cozeBudgetBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.budget.finish()
+	return err
+}
+
+func readCozeResponseBody(c *gin.Context, resp *http.Response, budget *cozeRequestBudget) ([]byte, *types.NewAPIError) {
+	if resp == nil || resp.Body == nil {
+		return nil, types.NewError(errors.New("Coze response body is missing"), types.ErrorCodeBadResponseBody)
+	}
+	if budget == nil {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+		return body, nil
+	}
+
+	resultCh := make(chan cozeReadResult, 1)
+	go func() {
+		body, err := io.ReadAll(resp.Body)
+		resultCh <- cozeReadResult{body: body, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, classifyCozeStageError(c, budget, result.err, "response_body")
+		}
+		return result.body, nil
+	case <-budget.ctx.Done():
+		_ = resp.Body.Close()
+		select {
+		case result := <-resultCh:
+			if result.err == nil && !budget.expired() && budget.parent.Err() == nil {
+				return result.body, nil
+			}
+		default:
+		}
+		return nil, classifyCozeStageError(c, budget, budget.ctx.Err(), "response_body")
+	}
+}
 
 func convertCozeChatRequest(c *gin.Context, request dto.GeneralOpenAIRequest) *CozeChatRequest {
 	var messages []CozeEnterMessage
@@ -47,16 +249,16 @@ func convertCozeChatRequest(c *gin.Context, request dto.GeneralOpenAIRequest) *C
 }
 
 func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
+	defer service.CloseResponseBodyGracefully(resp)
+	responseBody, readErr := readCozeResponseBody(c, resp, getCozeRequestBudget(c))
+	if readErr != nil {
+		return nil, readErr
 	}
-	service.CloseResponseBodyGracefully(resp)
 	// convert coze response to openai response
 	var response dto.TextResponse
 	var cozeResponse CozeChatDetailResponse
 	response.Model = info.UpstreamModelName
-	err = json.Unmarshal(responseBody, &cozeResponse)
+	err := common.Unmarshal(responseBody, &cozeResponse)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
@@ -86,7 +288,7 @@ func cozeChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Res
 			FinishReason: "stop",
 		},
 	}
-	jsonResponse, err := json.Marshal(response)
+	jsonResponse, err := common.Marshal(response)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
@@ -272,12 +474,12 @@ func handleCozeStreamFrame(c *gin.Context, frame helper.StreamFrame, sr *helper.
 	}
 }
 
-func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (error, bool) {
+func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo, budget *cozeRequestBudget) (error, bool) {
 	requestURL := fmt.Sprintf("%s/v3/chat/retrieve", info.ChannelBaseUrl)
 
 	requestURL = requestURL + "?conversation_id=" + c.GetString("coze_conversation_id") + "&chat_id=" + c.GetString("coze_chat_id")
 	// 将 conversationId和chatId作为参数发送get请求
-	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(budget.ctx, "GET", requestURL, nil)
 	if err != nil {
 		return err, false
 	}
@@ -286,7 +488,7 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 		return err, false
 	}
 
-	resp, err := doRequest(c, req, info) // 调用 doRequest
+	resp, err := doRequest(c, req, info, budget) // 调用 doRequest
 	if err != nil {
 		return err, false
 	}
@@ -297,11 +499,11 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 
 	// 解析 resp 到 CozeChatResponse
 	var cozeResponse CozeChatResponse
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read response body failed: %w", err), false
+	responseBody, readErr := readCozeResponseBody(c, resp, budget)
+	if readErr != nil {
+		return readErr, false
 	}
-	err = json.Unmarshal(responseBody, &cozeResponse)
+	err = common.Unmarshal(responseBody, &cozeResponse)
 	if err != nil {
 		return fmt.Errorf("unmarshal response body failed: %w", err), false
 	}
@@ -318,11 +520,11 @@ func checkIfChatComplete(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo
 	}
 }
 
-func getChatDetail(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (*http.Response, error) {
+func getChatDetail(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo, budget *cozeRequestBudget) (*http.Response, error) {
 	requestURL := fmt.Sprintf("%s/v3/chat/message/list", info.ChannelBaseUrl)
 
 	requestURL = requestURL + "?conversation_id=" + c.GetString("coze_conversation_id") + "&chat_id=" + c.GetString("coze_chat_id")
-	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", requestURL, nil)
+	req, err := http.NewRequestWithContext(budget.ctx, "GET", requestURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("new request failed: %w", err)
 	}
@@ -330,31 +532,30 @@ func getChatDetail(a *Adaptor, c *gin.Context, info *relaycommon.RelayInfo) (*ht
 	if err != nil {
 		return nil, fmt.Errorf("setup request header failed: %w", err)
 	}
-	resp, err := doRequest(c, req, info)
+	resp, err := doRequest(c, req, info, budget)
 	if err != nil {
 		return nil, fmt.Errorf("do request failed: %w", err)
 	}
 	return resp, nil
 }
 
-func doRequest(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo) (*http.Response, error) {
+func doRequest(c *gin.Context, req *http.Request, info *relaycommon.RelayInfo, budget *cozeRequestBudget) (*http.Response, error) {
 	var client *http.Client
 	var err error // 声明 err 变量
 	if info.ChannelSetting.Proxy != "" {
-		client, err = service.NewProxyHttpClient(info.ChannelSetting.Proxy)
+		client, err = service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 		if err != nil {
 			return nil, fmt.Errorf("new proxy http client failed: %w", err)
 		}
 	} else {
 		client = service.GetHttpClient()
 	}
+	info.MarkUpstreamRequestMayHaveBeenAccepted()
 	resp, err := client.Do(req)
 	if err != nil { // 增加对 client.Do(req) 返回错误的检查
-		if c.Request.Context().Err() != nil {
-			return nil, channel.ClassifyDoRequestError(c, err)
-		}
-		return nil, fmt.Errorf("client.Do failed: %w", err)
+		return nil, classifyCozeStageError(c, budget, err, "response_headers")
 	}
+	common.SetContextKey(c, constant.ContextKeyRelayResponseHeaders, true)
 	// _ = resp.Body.Close()
 	return resp, nil
 }

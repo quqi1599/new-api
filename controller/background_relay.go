@@ -26,7 +26,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const backgroundRelayHeader = "X-Oneapi-Background"
+const (
+	backgroundRelayHeader                       = "X-Oneapi-Background"
+	defaultBackgroundRelayTextJobTimeoutSeconds = 600
+)
 
 var backgroundRelaySubmitMu sync.Mutex
 
@@ -301,7 +304,9 @@ func runBackgroundRelayJob(job *service.BackgroundRelayJob, execution background
 
 	timeoutSeconds := common.GetEnvOrDefault("BACKGROUND_RELAY_JOB_TIMEOUT_SECONDS", 900)
 	if execution.RelayFormat != types.RelayFormatOpenAIImage {
-		timeoutSeconds = common.GetEnvOrDefault("BACKGROUND_RELAY_TEXT_JOB_TIMEOUT_SECONDS", 300)
+		// Keep the job envelope outside the 540s relay phase budgets so those
+		// inner guards can report their precise 504 code and finish persistence.
+		timeoutSeconds = common.GetEnvOrDefault("BACKGROUND_RELAY_TEXT_JOB_TIMEOUT_SECONDS", defaultBackgroundRelayTextJobTimeoutSeconds)
 	}
 	jobCtxBase, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()

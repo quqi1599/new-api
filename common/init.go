@@ -31,11 +31,12 @@ func printHelp() {
 const (
 	defaultRelayDialTimeoutSeconds            = 10
 	defaultRelayTLSHandshakeTimeoutSeconds    = 10
-	defaultRelayResponseHeaderTimeoutSeconds  = 480
+	defaultRelayResponseHeaderTimeoutSeconds  = 520
 	defaultRelayExpectContinueTimeoutSeconds  = 1
 	defaultRelayFirstEventTimeoutSeconds      = 540
 	defaultRelayFirstEventTotalTimeoutSeconds = 540
-	defaultRelayPreFirstEventHeartbeatSeconds = 15
+	defaultRelayNonStreamTimeoutSeconds       = 540
+	defaultRelayStreamHeartbeatSeconds        = 15
 )
 
 func getNonNegativeEnvOrDefault(name string, defaultValue int) int {
@@ -60,6 +61,42 @@ func getRelayResponseHeaderTimeoutSeconds(legacyTimeout int) int {
 
 func getRelayFirstEventTimeoutSeconds() int {
 	return getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TIMEOUT_SECONDS", defaultRelayFirstEventTimeoutSeconds)
+}
+
+func getRelayStreamHeartbeatSeconds() int {
+	if strings.TrimSpace(os.Getenv("RELAY_STREAM_HEARTBEAT_SECONDS")) != "" {
+		return getNonNegativeEnvOrDefault("RELAY_STREAM_HEARTBEAT_SECONDS", defaultRelayStreamHeartbeatSeconds)
+	}
+	// Preserve the old interval as a post-first-event heartbeat setting only.
+	// It must never cause bytes to be written before a valid upstream event,
+	// because doing so commits a downstream HTTP 200 and hides later 5xx errors.
+	if strings.TrimSpace(os.Getenv("RELAY_PRE_FIRST_EVENT_HEARTBEAT_SECONDS")) != "" {
+		return getNonNegativeEnvOrDefault("RELAY_PRE_FIRST_EVENT_HEARTBEAT_SECONDS", defaultRelayStreamHeartbeatSeconds)
+	}
+	return defaultRelayStreamHeartbeatSeconds
+}
+
+func relayTimeoutConfigurationWarnings(responseHeader, firstEvent, firstEventTotal, nonStream int) []string {
+	warnings := make([]string, 0, 3)
+	if responseHeader > 0 && firstEventTotal > 0 && responseHeader >= firstEventTotal {
+		warnings = append(warnings, fmt.Sprintf(
+			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must be lower than RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d to preserve distinct timeout phases",
+			responseHeader, firstEventTotal,
+		))
+	}
+	if responseHeader > 0 && nonStream > 0 && responseHeader >= nonStream {
+		warnings = append(warnings, fmt.Sprintf(
+			"RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS=%d must be lower than RELAY_NON_STREAM_TIMEOUT_SECONDS=%d to preserve a non-stream body budget",
+			responseHeader, nonStream,
+		))
+	}
+	if firstEvent > 0 && firstEventTotal > 0 && firstEvent > firstEventTotal {
+		warnings = append(warnings, fmt.Sprintf(
+			"RELAY_FIRST_EVENT_TIMEOUT_SECONDS=%d exceeds RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS=%d and will be shortened by the request-wide budget",
+			firstEvent, firstEventTotal,
+		))
+	}
+	return warnings
 }
 
 func InitEnv() {
@@ -149,7 +186,12 @@ func InitEnv() {
 	RelayResponseHeaderTimeout = getRelayResponseHeaderTimeoutSeconds(RelayTimeout)
 	RelayExpectContinueTimeout = getNonNegativeEnvOrDefault("RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS", defaultRelayExpectContinueTimeoutSeconds)
 	RelayFirstEventTotalTimeout = getNonNegativeEnvOrDefault("RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS", defaultRelayFirstEventTotalTimeoutSeconds)
-	RelayPreFirstEventHeartbeatInterval = time.Duration(getNonNegativeEnvOrDefault("RELAY_PRE_FIRST_EVENT_HEARTBEAT_SECONDS", defaultRelayPreFirstEventHeartbeatSeconds)) * time.Second
+	RelayNonStreamTimeout = getNonNegativeEnvOrDefault("RELAY_NON_STREAM_TIMEOUT_SECONDS", defaultRelayNonStreamTimeoutSeconds)
+	RelayStreamHeartbeatInterval = time.Duration(getRelayStreamHeartbeatSeconds()) * time.Second
+	// Keep the old exported symbol readable for downstream source compatibility.
+	// Relay code intentionally never reads it: pre-output writes would turn a
+	// later gateway timeout into an already-committed 200 response.
+	RelayPreFirstEventHeartbeatInterval = RelayStreamHeartbeatInterval
 	RelayMaxIdleConns = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS", 500)
 	RelayMaxIdleConnsPerHost = GetEnvOrDefault("RELAY_MAX_IDLE_CONNS_PER_HOST", 100)
 
@@ -184,6 +226,14 @@ func InitEnv() {
 	}
 	constant.SaaSTopupExcludedUserIDs = saasTopupExcludedUserIDs
 	initConstantEnv()
+	for _, warning := range relayTimeoutConfigurationWarnings(
+		RelayResponseHeaderTimeout,
+		constant.RelayFirstEventTimeout,
+		RelayFirstEventTotalTimeout,
+		RelayNonStreamTimeout,
+	) {
+		SysError("WARNING: " + warning)
+	}
 }
 
 func initConstantEnv() {

@@ -315,11 +315,14 @@ docker run --name new-api -d --restart always \
 | `SHUTDOWN_TIMEOUT_SECONDS` | 优雅退出等待时间（秒），容器的停止宽限时间必须更长 | `120` |
 | `RELAY_DIAL_TIMEOUT_SECONDS` | TCP/代理建连超时（秒），`0` 表示禁用该阶段超时 | `10` |
 | `RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | TLS 握手超时（秒），`0` 表示禁用该阶段超时 | `10` |
-| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 单次尝试等待上游响应头超时（秒），不限制响应体的流式读取时长，并受跨尝试首事件总预算约束 | `480` |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | 单次尝试等待上游响应头超时（秒），不限制响应体的流式读取时长，并受跨尝试首事件总预算约束 | `520` |
 | `RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS` | `Expect: 100-continue` 等待超时（秒） | `1` |
 | `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | 响应头返回后等待首个有效 SSE 事件的单次尝试上限；请求级总截止时间可缩短它 | `540` |
 | `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | 从入站请求开始、跨所有渠道尝试共享的首个有效事件总预算；首事件后解除，不截断健康长流；应早于海外 Caddy 首包超时至少 60 秒，`0` 表示禁用 | `540` |
-| `RELAY_TIMEOUT` | 旧版 Relay/供应商兼容值，新响应头超时未设置时作为回退（不超过安全的 480 秒阶段默认值）；用户控制 URL 的 SSRF 保护下载仍将其作为整体超时 | `0` |
+| `RELAY_NON_STREAM_TIMEOUT_SECONDS` | 非流式 Relay 总预算，覆盖请求体上传和响应体读取；与调用方 deadline 同时存在时较早者生效；`0` 表示禁用 | `540` |
+| `RELAY_STREAM_HEARTBEAT_SECONDS` | 收到首个有效上游事件后发送的 SSE 保活间隔；首事件前不写入，以保留真实 HTTP 4xx/5xx；`0` 表示禁用 | `15` |
+| `ALI_TASK_POLL_REQUEST_TIMEOUT_SECONDS` | Ali 异步任务单次轮询请求的总超时；完整任务仍受上层 Relay/后台 Job deadline 限制；`0` 表示仅使用上层预算 | `60` |
+| `RELAY_TIMEOUT` | 旧版 Relay/供应商兼容值，新响应头超时未设置时作为回退（不超过安全的 520 秒阶段默认值）；用户控制 URL 的 SSRF 保护下载仍将其作为整体超时 | `0` |
 | `RELAY_IDLE_CONN_TIMEOUT` | Relay HTTP 客户端空闲保活连接超时（秒），`0` 表示禁用 | `90` |
 | `STREAMING_TIMEOUT` | 首个有效事件后，相邻有效 SSE data 事件的空闲超时；注释/心跳不重置 | `300` |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | 流式扫描器单行最大缓冲（MB），图像生成等超大 `data:` 片段（如 4K 图片 base64）需适当调大 | `64` |

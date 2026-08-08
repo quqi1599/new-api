@@ -18,11 +18,15 @@ func TestAppendRelayObservabilityAdminInfo(t *testing.T) {
 	common.SetContextKey(c, constant.ContextKeyRelayBodyComplete, true)
 	common.SetContextKey(c, constant.ContextKeyRelayConnectedUpstream, true)
 	common.SetContextKey(c, constant.ContextKeyRelayRequestWritten, true)
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, "response_headers")
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, 540)
 
 	adminInfo := map[string]interface{}{}
 	AppendRelayObservabilityAdminInfo(c, &relaycommon.RelayInfo{}, adminInfo)
 
 	require.Equal(t, constant.RelayCancelOriginDownstreamDisconnected, adminInfo["cancel_origin"])
+	require.Equal(t, "response_headers", adminInfo["timeout_phase"])
+	require.Equal(t, 540, adminInfo["timeout_seconds"])
 	stage := adminInfo["relay_stage"].(map[string]bool)
 	require.True(t, stage["body_complete"])
 	require.True(t, stage["connected_upstream"])

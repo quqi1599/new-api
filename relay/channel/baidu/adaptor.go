@@ -114,7 +114,7 @@ func (a *Adaptor) getRequestURL(ctx context.Context, info *relaycommon.RelayInfo
 	fullRequestURL := fmt.Sprintf("%s/rpc/2.0/ai_custom/v1/wenxinworkshop/%s", info.ChannelBaseUrl, suffix)
 	var accessToken string
 	var err error
-	if accessToken, err = getBaiduAccessToken(ctx, info.ApiKey); err != nil {
+	if accessToken, err = getBaiduAccessToken(ctx, info); err != nil {
 		return "", err
 	}
 	fullRequestURL += "?access_token=" + accessToken

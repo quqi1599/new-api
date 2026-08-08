@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,7 +13,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 
+	"github.com/gin-gonic/gin"
 	"golang.org/x/image/webp"
 )
 
@@ -65,9 +69,10 @@ func DecodeBase64FileData(base64String string) (string, string, error) {
 	return mimeType, base64String, nil
 }
 
-// GetImageFromUrl 获取图片的类型和base64编码的数据
-func GetImageFromUrl(url string) (mimeType string, data string, err error) {
-	resp, err := DoDownloadRequest(url)
+type imageDownloadFunc func(string) (*http.Response, error)
+
+func getImageFromURL(url string, download imageDownloadFunc) (mimeType string, data string, err error) {
+	resp, err := download(url)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to download image: %w", err)
 	}
@@ -116,8 +121,28 @@ func GetImageFromUrl(url string) (mimeType string, data string, err error) {
 	return mimeType, data, nil
 }
 
-func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
-	response, err := DoDownloadRequest(imageUrl)
+// GetImageFromURLContext downloads an image using the caller context without
+// imposing a relay-specific local deadline.
+func GetImageFromURLContext(ctx context.Context, url string) (mimeType string, data string, err error) {
+	return getImageFromURL(url, func(url string) (*http.Response, error) {
+		return DoDownloadRequestContext(ctx, url, "get_image_data")
+	})
+}
+
+// GetImageFromURLWithRelayInfo shares the relay's absolute request budget.
+func GetImageFromURLWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, url string) (mimeType string, data string, err error) {
+	return getImageFromURL(url, func(url string) (*http.Response, error) {
+		return DoDownloadRequestWithRelayInfo(c, info, url, "get_image_data")
+	})
+}
+
+// GetImageFromUrl is retained as a Background-based compatibility wrapper.
+func GetImageFromUrl(url string) (mimeType string, data string, err error) {
+	return GetImageFromURLContext(context.Background(), url)
+}
+
+func decodeURLImageData(imageURL string, download imageDownloadFunc) (image.Config, string, error) {
+	response, err := download(imageURL)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("fail to get image from url: %s", err.Error()))
 		return image.Config{}, "", err
@@ -141,8 +166,11 @@ func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
 
 		// 从response.Body读取更多的数据直到达到当前的限制
 		additionalData := make([]byte, limit-int64(len(readData)))
-		n, _ := io.ReadFull(response.Body, additionalData)
+		n, readErr := io.ReadFull(response.Body, additionalData)
 		readData = append(readData, additionalData[:n]...)
+		if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return image.Config{}, "", fmt.Errorf("failed to read image data: %w", readErr)
+		}
 
 		// 使用io.MultiReader组合已经读取的数据和response.Body
 		limitReader := io.MultiReader(bytes.NewReader(readData), response.Body)
@@ -153,9 +181,30 @@ func DecodeUrlImageData(imageUrl string) (image.Config, string, error) {
 		if err == nil {
 			return config, format, nil
 		}
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return image.Config{}, "", err
+		}
 	}
 
 	return image.Config{}, "", err // 返回最后一个错误
+}
+
+func DecodeURLImageDataContext(ctx context.Context, imageURL string) (image.Config, string, error) {
+	return decodeURLImageData(imageURL, func(url string) (*http.Response, error) {
+		return DoDownloadRequestContext(ctx, url, "decode_image_data")
+	})
+}
+
+func DecodeURLImageDataWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, imageURL string) (image.Config, string, error) {
+	return decodeURLImageData(imageURL, func(url string) (*http.Response, error) {
+		return DoDownloadRequestWithRelayInfo(c, info, url, "decode_image_data")
+	})
+}
+
+// DecodeUrlImageData is retained as a Background-based compatibility wrapper.
+func DecodeUrlImageData(imageURL string) (image.Config, string, error) {
+	return DecodeURLImageDataContext(context.Background(), imageURL)
 }
 
 func getImageConfig(reader io.Reader) (image.Config, string, error) {

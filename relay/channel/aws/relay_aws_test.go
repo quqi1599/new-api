@@ -95,6 +95,114 @@ func TestNewAwsInvokeContextFollowsInboundCancellation(t *testing.T) {
 	}
 }
 
+func TestClassifyAwsInvokeErrorMapsHeaderTimeoutToTyped504(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	invokeErr := classifyAwsInvokeError(c, context.DeadlineExceeded, false, false)
+
+	require.Equal(t, http.StatusGatewayTimeout, invokeErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamResponseHeaderTimeout, invokeErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(invokeErr))
+	require.True(t, types.IsChannelPenaltyAllowed(invokeErr))
+	require.Equal(t, constant.RelayCancelOriginUpstreamTimeout, common.GetContextKeyString(c, constant.ContextKeyRelayCancelOrigin))
+	require.Equal(t, "response_headers", common.GetContextKeyString(c, constant.ContextKeyRelayTimeoutPhase))
+}
+
+func TestAwsNonStreamBudgetCancelsInvokeAndReturnsTyped504(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	guard := startAwsInvokeBudget(30*time.Millisecond, cancel)
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("AWS non-stream budget did not cancel the SDK invoke context")
+	}
+	require.True(t, guard.Stop())
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	invokeErr := awsNonStreamBudgetError(c, true)
+	require.Equal(t, http.StatusGatewayTimeout, invokeErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamNonStreamTimeout, invokeErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(invokeErr))
+	require.True(t, types.IsChannelPenaltyAllowed(invokeErr))
+	require.Equal(t, "non_stream_total", common.GetContextKeyString(c, constant.ContextKeyRelayTimeoutPhase))
+}
+
+func TestAwsNonStreamBudgetUsesOriginalRequestStart(t *testing.T) {
+	previous := common.RelayNonStreamTimeout
+	common.RelayNonStreamTimeout = 1
+	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{StartTime: time.Now().Add(-750 * time.Millisecond)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := time.Now()
+	guard, budgetErr := startAwsNonStreamBudget(c, info, cancel)
+	require.Nil(t, budgetErr)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("AWS non-stream budget restarted instead of using the original request start")
+	}
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+	require.True(t, guard.Stop())
+}
+
+func TestAwsNonStreamBudgetRejectsAlreadyExhaustedRequest(t *testing.T) {
+	previous := common.RelayNonStreamTimeout
+	common.RelayNonStreamTimeout = 1
+	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{StartTime: time.Now().Add(-2 * time.Second)}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	guard, budgetErr := startAwsNonStreamBudget(c, info, cancel)
+
+	require.Nil(t, guard)
+	require.NotNil(t, budgetErr)
+	require.Equal(t, http.StatusGatewayTimeout, budgetErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamNonStreamTimeout, budgetErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(budgetErr))
+	require.False(t, types.IsChannelPenaltyAllowed(budgetErr))
+}
+
+func TestAwsNonStreamBudgetZeroDisablesLocalBudget(t *testing.T) {
+	previous := common.RelayNonStreamTimeout
+	common.RelayNonStreamTimeout = 0
+	t.Cleanup(func() { common.RelayNonStreamTimeout = previous })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	info := &relaycommon.RelayInfo{StartTime: time.Now().Add(-time.Hour)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	guard, budgetErr := startAwsNonStreamBudget(c, info, cancel)
+
+	require.Nil(t, guard)
+	require.Nil(t, budgetErr)
+	_, limited := info.RemainingNonStreamBudget()
+	require.False(t, limited)
+	select {
+	case <-ctx.Done():
+		t.Fatal("disabled AWS non-stream budget canceled the invoke context")
+	default:
+	}
+}
+
 func TestDoAwsClientRequest_AppliesRuntimeHeaderOverrideToAnthropicBeta(t *testing.T) {
 	t.Parallel()
 
@@ -153,6 +261,48 @@ func TestConsumeAwsResponseStreamFirstEventTimeout(t *testing.T) {
 	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
 	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, streamErr.GetErrorCode())
 	require.Equal(t, relaycommon.StreamEndReasonFirstEventTimeout, info.StreamStatus.EndReason)
+	require.True(t, stream.closed.Load())
+}
+
+func TestConsumeAwsResponseStreamCallerDeadlineBeforeOutputReturnsTyped504(t *testing.T) {
+	events := make(chan bedrockruntimeTypes.ResponseStream)
+	stream := &fakeAwsResponseStream{events: events}
+	c, recorder, info, claudeInfo := newAwsStreamTestContext()
+	requestContext, cancel := context.WithTimeout(c.Request.Context(), 40*time.Millisecond)
+	defer cancel()
+	c.Request = c.Request.WithContext(requestContext)
+
+	streamErr, usage := consumeAwsResponseStream(c, info, requestContext, stream, claudeInfo)
+
+	require.NotNil(t, streamErr)
+	require.NotNil(t, usage)
+	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, streamErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(streamErr))
+	require.False(t, types.IsChannelPenaltyAllowed(streamErr))
+	require.Equal(t, relaycommon.StreamEndReasonRequestDeadline, info.StreamStatus.EndReason)
+	require.Empty(t, recorder.Body.String())
+	require.True(t, stream.closed.Load())
+}
+
+func TestConsumeAwsResponseStreamCallerDeadlineAfterOutputKeepsPartialUsage(t *testing.T) {
+	events := make(chan bedrockruntimeTypes.ResponseStream, 1)
+	events <- &bedrockruntimeTypes.ResponseStreamMemberChunk{
+		Value: bedrockruntimeTypes.PayloadPart{Bytes: []byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}`)},
+	}
+	stream := &fakeAwsResponseStream{events: events}
+	c, recorder, info, claudeInfo := newAwsStreamTestContext()
+	requestContext, cancel := context.WithTimeout(c.Request.Context(), 60*time.Millisecond)
+	defer cancel()
+	c.Request = c.Request.WithContext(requestContext)
+
+	streamErr, usage := consumeAwsResponseStream(c, info, requestContext, stream, claudeInfo)
+
+	require.Nil(t, streamErr)
+	require.NotNil(t, usage)
+	require.Equal(t, relaycommon.StreamEndReasonRequestDeadline, info.StreamStatus.EndReason)
+	require.NotEmpty(t, recorder.Body.String())
+	require.NotContains(t, recorder.Body.String(), "[DONE]")
 	require.True(t, stream.closed.Load())
 }
 

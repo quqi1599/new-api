@@ -15,6 +15,7 @@ const (
 	StreamEndReasonFirstEventTimeout StreamEndReason = "first_event_timeout"
 	StreamEndReasonTimeout           StreamEndReason = "timeout"
 	StreamEndReasonClientGone        StreamEndReason = "client_gone"
+	StreamEndReasonRequestDeadline   StreamEndReason = "request_deadline"
 	StreamEndReasonScannerErr        StreamEndReason = "scanner_error"
 	StreamEndReasonHandlerStop       StreamEndReason = "handler_stop"
 	StreamEndReasonEOF               StreamEndReason = "eof"
@@ -118,6 +119,7 @@ func (s *StreamStatus) IsAbortLikeEnd() bool {
 		return false
 	}
 	return s.EndReason == StreamEndReasonClientGone ||
+		s.EndReason == StreamEndReasonRequestDeadline ||
 		s.EndReason == StreamEndReasonFirstEventTimeout ||
 		s.EndReason == StreamEndReasonTimeout ||
 		s.EndReason == StreamEndReasonHandlerStop ||

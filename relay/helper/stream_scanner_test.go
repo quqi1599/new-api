@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -433,6 +434,42 @@ func TestStreamScannerHandler_ClientGoneClosesUpstreamBodyBeforeWaiting(t *testi
 	assert.Less(t, time.Since(start), 2*time.Second)
 }
 
+func TestStreamScannerHandler_RequestDeadlineReturns504WithoutChannelPenalty(t *testing.T) {
+	oldFirstEventTimeout := constant.RelayFirstEventTimeout
+	constant.RelayFirstEventTimeout = 5
+	t.Cleanup(func() { constant.RelayFirstEventTimeout = oldFirstEventTimeout })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 100*time.Millisecond)
+	defer cancel()
+	c.Request = req.WithContext(ctx)
+
+	body := newBlockingReadCloser(fmt.Errorf("http: read on closed response body"))
+	resp := &http.Response{Body: body}
+	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}}
+
+	startedAt := time.Now()
+	StreamScannerHandler(c, resp, info, acceptStreamHandler(func(data string, sr *StreamResult) {}))
+
+	require.Less(t, time.Since(startedAt), time.Second)
+	require.True(t, body.closed.Load(), "upstream response body should close at the caller deadline")
+	require.False(t, recorder.Flushed)
+	require.Empty(t, recorder.Body.String())
+	require.NotNil(t, info.StreamStatus)
+	require.Equal(t, relaycommon.StreamEndReasonRequestDeadline, info.StreamStatus.EndReason)
+	require.ErrorIs(t, info.StreamStatus.EndError, context.DeadlineExceeded)
+
+	streamErr := PreOutputStreamError(c, info)
+	require.NotNil(t, streamErr)
+	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, streamErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(streamErr))
+	require.False(t, types.IsChannelPenaltyAllowed(streamErr))
+	require.Equal(t, constant.RelayCancelOriginGatewayDeadline, common.GetContextKeyString(c, constant.ContextKeyRelayCancelOrigin))
+}
+
 func TestStreamScannerHandler_TimeoutClosesUpstreamBody(t *testing.T) {
 	// Not parallel: modifies global constant.StreamingTimeout
 	oldTimeout := constant.StreamingTimeout
@@ -520,7 +557,7 @@ func TestStreamScannerHandler_UsesRemainingRequestWideFirstEventBudget(t *testin
 		"a retry must use the request-wide remaining budget, not restart the full per-attempt timeout")
 }
 
-func TestStreamScannerHandler_PingsBeforeFirstValidEvent(t *testing.T) {
+func TestStreamScannerHandler_DoesNotPingBeforeFirstValidEvent(t *testing.T) {
 	setting := operation_setting.GetGeneralSetting()
 	oldEnabled := setting.PingIntervalEnabled
 	oldSeconds := setting.PingIntervalSeconds
@@ -533,14 +570,14 @@ func TestStreamScannerHandler_PingsBeforeFirstValidEvent(t *testing.T) {
 
 	oldTimeout := constant.StreamingTimeout
 	oldFirstEventTimeout := constant.RelayFirstEventTimeout
-	oldHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	oldHeartbeatInterval := common.RelayStreamHeartbeatInterval
 	constant.StreamingTimeout = 5
 	constant.RelayFirstEventTimeout = 2
-	common.RelayPreFirstEventHeartbeatInterval = 20 * time.Millisecond
+	common.RelayStreamHeartbeatInterval = 20 * time.Millisecond
 	t.Cleanup(func() {
 		constant.StreamingTimeout = oldTimeout
 		constant.RelayFirstEventTimeout = oldFirstEventTimeout
-		common.RelayPreFirstEventHeartbeatInterval = oldHeartbeatInterval
+		common.RelayStreamHeartbeatInterval = oldHeartbeatInterval
 	})
 
 	pr, pw := io.Pipe()
@@ -564,7 +601,10 @@ func TestStreamScannerHandler_PingsBeforeFirstValidEvent(t *testing.T) {
 
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonFirstEventTimeout, info.StreamStatus.EndReason)
-	assert.Contains(t, recorder.Body.String(), ": PING", "gateway heartbeat should keep slow-first-event streams alive")
+	assert.Empty(t, recorder.Body.String(), "a first-event timeout must remain eligible for a real non-200 relay response")
+	assert.False(t, recorder.Flushed, "gateway must not commit downstream HTTP 200 before the first valid event")
+	assert.Equal(t, "first_valid_event", common.GetContextKeyString(c, constant.ContextKeyRelayTimeoutPhase))
+	assert.Equal(t, 2, common.GetContextKeyInt(c, constant.ContextKeyRelayTimeoutSeconds))
 }
 
 func TestStreamScannerHandler_HeartbeatContinuesAfterFirstStatusEvent(t *testing.T) {
@@ -577,10 +617,10 @@ func TestStreamScannerHandler_HeartbeatContinuesAfterFirstStatusEvent(t *testing
 		setting.PingIntervalSeconds = oldSeconds
 	})
 
-	oldHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
-	common.RelayPreFirstEventHeartbeatInterval = 20 * time.Millisecond
+	oldHeartbeatInterval := common.RelayStreamHeartbeatInterval
+	common.RelayStreamHeartbeatInterval = 20 * time.Millisecond
 	t.Cleanup(func() {
-		common.RelayPreFirstEventHeartbeatInterval = oldHeartbeatInterval
+		common.RelayStreamHeartbeatInterval = oldHeartbeatInterval
 	})
 
 	pr, pw := io.Pipe()
@@ -1085,6 +1125,9 @@ func TestStreamScannerHandler_StreamStatus_Timeout(t *testing.T) {
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonTimeout, info.StreamStatus.EndReason)
 	assert.False(t, info.StreamStatus.IsNormalEnd())
+	assert.Equal(t, constant.RelayCancelOriginGatewayDeadline, common.GetContextKeyString(c, constant.ContextKeyRelayCancelOrigin))
+	assert.Equal(t, "stream_idle", common.GetContextKeyString(c, constant.ContextKeyRelayTimeoutPhase))
+	assert.Equal(t, 2, common.GetContextKeyInt(c, constant.ContextKeyRelayTimeoutSeconds))
 }
 
 func TestStreamScannerHandler_StreamStatus_SoftErrors(t *testing.T) {

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +44,26 @@ func taskErrorFromDoRequest(err error) *dto.TaskError {
 		return taskErr
 	}
 	return service.TaskErrorWrapper(err, "do_request_failed", http.StatusInternalServerError)
+}
+
+func taskErrorFromUpstreamResponse(resp *http.Response) *dto.TaskError {
+	if resp == nil || resp.Body == nil {
+		return service.TaskErrorWrapper(
+			errors.New("upstream task error response body is missing"),
+			"read_response_body_failed",
+			http.StatusBadGateway,
+		)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return service.TaskErrorWrapper(
+			fmt.Errorf("read upstream task error response: %w", err),
+			"read_response_body_failed",
+			http.StatusBadGateway,
+		)
+	}
+	return service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
 }
 
 // ResolveOriginTask 处理基于已有任务的提交（remix / continuation）：
@@ -237,8 +258,7 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		return nil, taskErrorFromDoRequest(err)
 	}
 	if resp != nil && resp.StatusCode != http.StatusOK {
-		responseBody, _ := io.ReadAll(resp.Body)
-		return nil, service.TaskErrorWrapper(fmt.Errorf("%s", string(responseBody)), "fail_to_fetch_task", resp.StatusCode)
+		return nil, taskErrorFromUpstreamResponse(resp)
 	}
 
 	// 10. 返回 OtherRatios 给下游（header 必须在 DoResponse 写 body 之前设置）
@@ -403,7 +423,12 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	isOpenAIVideoAPI := strings.HasPrefix(c.Request.RequestURI, "/v1/videos/")
 
 	// Gemini/Vertex 支持实时查询：用户 fetch 时直接从上游拉取最新状态
-	if realtimeResp := tryRealtimeFetch(originTask, isOpenAIVideoAPI); len(realtimeResp) > 0 {
+	realtimeResp, err := tryRealtimeFetch(c.Request.Context(), originTask, isOpenAIVideoAPI)
+	if err != nil {
+		taskResp = service.TaskErrorWrapper(err, "fetch_realtime_task_failed", http.StatusBadGateway)
+		return
+	}
+	if len(realtimeResp) > 0 {
 		respBody = realtimeResp
 		return
 	}
@@ -439,16 +464,20 @@ func videoFetchByIDRespBodyBuilder(c *gin.Context) (respBody []byte, taskResp *d
 	return
 }
 
+var getRealtimeTaskPollingAdaptor = func(platform constant.TaskPlatform) service.TaskPollingAdaptor {
+	return GetTaskAdaptor(platform)
+}
+
 // tryRealtimeFetch 尝试从上游实时拉取 Gemini/Vertex 任务状态。
-// 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或出错时返回 nil。
+// 仅当渠道类型为 Gemini 或 Vertex 时触发；其他渠道或适配器明确不支持时无错回退。
 // 当非 OpenAI Video API 时，还会构建自定义格式的响应体。
-func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
+func tryRealtimeFetch(ctx context.Context, task *model.Task, isOpenAIVideoAPI bool) ([]byte, error) {
 	channelModel, err := model.GetChannelById(task.ChannelId, true)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("get realtime task channel: %w", err)
 	}
 	if channelModel.Type != constant.ChannelTypeVertexAi && channelModel.Type != constant.ChannelTypeGemini {
-		return nil
+		return nil, nil
 	}
 
 	baseURL := constant.ChannelBaseURLs[channelModel.Type]
@@ -456,27 +485,24 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		baseURL = channelModel.GetBaseURL()
 	}
 	proxy := channelModel.GetSetting().Proxy
-	adaptor := GetTaskAdaptor(constant.TaskPlatform(strconv.Itoa(channelModel.Type)))
+	adaptor := getRealtimeTaskPollingAdaptor(constant.TaskPlatform(strconv.Itoa(channelModel.Type)))
 	if adaptor == nil {
-		return nil
+		return nil, nil
+	}
+	if _, ok := any(adaptor).(service.ContextTaskPollingAdaptor); !ok {
+		// A downstream legacy adaptor can keep serving cached task state until
+		// it explicitly opts into cancellation-safe realtime refreshes.
+		return nil, nil
 	}
 
-	resp, err := adaptor.FetchTask(baseURL, channelModel.Key, map[string]any{
+	requestCtx, cancel := service.NewTaskPollingRequestContext(ctx)
+	defer cancel()
+	ti, body, err := fetchRealtimeTaskResult(requestCtx, adaptor, baseURL, channelModel.Key, map[string]any{
 		"task_id": task.GetUpstreamTaskID(),
 		"action":  task.Action,
 	}, proxy)
-	if err != nil || resp == nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil
-	}
-
-	ti, err := adaptor.ParseTaskResult(body)
-	if err != nil || ti == nil {
-		return nil
+		return nil, err
 	}
 
 	snap := task.Snapshot()
@@ -498,12 +524,14 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 	}
 
 	if !snap.Equal(task.Snapshot()) {
-		_, _ = task.UpdateWithStatus(snap.Status)
+		if _, err := task.UpdateWithStatus(snap.Status); err != nil {
+			return nil, fmt.Errorf("persist realtime task state: %w", err)
+		}
 	}
 
 	// OpenAI Video API 由调用者的 ConvertToOpenAIVideo 分支处理
 	if isOpenAIVideoAPI {
-		return nil
+		return nil, nil
 	}
 
 	// 非 OpenAI Video API: 构建自定义格式响应
@@ -516,11 +544,37 @@ func tryRealtimeFetch(task *model.Task, isOpenAIVideoAPI bool) []byte {
 		"task_id":  task.TaskID,
 		"url":      task.GetResultURL(),
 	}
-	respBody, _ := common.Marshal(dto.TaskResponse[any]{
+	respBody, err := common.Marshal(dto.TaskResponse[any]{
 		Code: "success",
 		Data: out,
 	})
-	return respBody
+	if err != nil {
+		return nil, fmt.Errorf("marshal realtime task response: %w", err)
+	}
+	return respBody, nil
+}
+
+func fetchRealtimeTaskResult(ctx context.Context, adaptor service.TaskPollingAdaptor, baseURL, key string, requestBody map[string]any, proxy string) (*relaycommon.TaskInfo, []byte, error) {
+	resp, err := service.FetchTaskPollingContext(ctx, adaptor, baseURL, key, requestBody, proxy)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch realtime task: %w", err)
+	}
+	defer service.CloseResponseBodyGracefully(resp)
+	body, err := service.ReadTaskPollingBodyContext(ctx, resp)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read realtime task response: %w", err)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, nil, fmt.Errorf("realtime task upstream returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	ti, err := service.ParseTaskPollingResultContext(ctx, adaptor, body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse realtime task response: %w", err)
+	}
+	if ti == nil {
+		return nil, nil, errors.New("realtime task upstream returned an empty result")
+	}
+	return ti, body, nil
 }
 
 // detectVideoFormat 从 Gemini/Vertex 原始响应中探测视频格式

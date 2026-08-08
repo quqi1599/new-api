@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +23,11 @@ import (
 // GetFileTypeFromUrl 获取文件类型，返回 mime type， 例如 image/jpeg, image/png, image/gif, image/bmp, image/tiff, application/pdf
 // 如果获取失败，返回 application/octet-stream
 func GetFileTypeFromUrl(c *gin.Context, url string, reason ...string) (string, error) {
-	response, err := DoDownloadRequest(url, []string{"get_mime_type", strings.Join(reason, ", ")}...)
+	return GetFileTypeFromURLWithRelayInfo(c, nil, url, reason...)
+}
+
+func GetFileTypeFromURLWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, url string, reason ...string) (string, error) {
+	response, err := DoDownloadRequestWithRelayInfo(c, info, url, []string{"get_mime_type", strings.Join(reason, ", ")}...)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("fail to get file type from url: %s, error: %s", url, err.Error()))
 		return "", err
@@ -85,13 +91,18 @@ func GetFileTypeFromUrl(c *gin.Context, url string, reason ...string) (string, e
 	var readData []byte
 	limits := []int{512, 8 * 1024, 24 * 1024, 64 * 1024}
 	for _, limit := range limits {
+		var readErr error
 		logger.LogDebug(c, fmt.Sprintf("Trying to read %d bytes to determine file type", limit))
 		if len(readData) < limit {
 			need := limit - len(readData)
 			tmp := make([]byte, need)
-			n, _ := io.ReadFull(response.Body, tmp)
+			var n int
+			n, readErr = io.ReadFull(response.Body, tmp)
 			if n > 0 {
 				readData = append(readData, tmp[:n]...)
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+				return "", fmt.Errorf("failed to read file content for type detection: %w", readErr)
 			}
 		}
 
@@ -127,6 +138,9 @@ func GetFileTypeFromUrl(c *gin.Context, url string, reason ...string) (string, e
 				}
 			}
 		}
+		if readErr != nil {
+			break
+		}
 	}
 
 	// Fallback
@@ -137,8 +151,12 @@ func GetFileTypeFromUrl(c *gin.Context, url string, reason ...string) (string, e
 // Deprecated: 请使用 GetBase64Data 配合 types.NewURLFileSource 替代
 // 此函数保留用于向后兼容，内部已重构为调用统一的文件服务
 func GetFileBase64FromUrl(c *gin.Context, url string, reason ...string) (*types.LocalFileData, error) {
+	return GetFileBase64FromURLWithRelayInfo(c, nil, url, reason...)
+}
+
+func GetFileBase64FromURLWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, url string, reason ...string) (*types.LocalFileData, error) {
 	source := types.NewURLFileSource(url)
-	cachedData, err := LoadFileSource(c, source, reason...)
+	cachedData, err := LoadFileSourceWithRelayInfo(c, info, source, reason...)
 	if err != nil {
 		return nil, err
 	}

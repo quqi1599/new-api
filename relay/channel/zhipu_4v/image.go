@@ -55,11 +55,11 @@ type openAIImageData struct {
 }
 
 func zhipu4vImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
-	service.CloseResponseBodyGracefully(resp)
 
 	var zhipuResp zhipuImageResponse
 	if err := common.Unmarshal(responseBody, &zhipuResp); err != nil {
@@ -97,10 +97,9 @@ func zhipu4vImageHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		case data.B64Image != "":
 			b64 = data.B64Image
 		default:
-			_, downloaded, err := service.GetImageFromUrl(url)
+			_, downloaded, err := service.GetImageFromURLWithRelayInfo(c, info, url)
 			if err != nil {
-				logger.LogError(c, "zhipu_image_get_b64_failed: "+err.Error())
-				continue
+				return nil, types.NewError(err, types.ErrorCodeBadResponse)
 			}
 			b64 = downloaded
 		}

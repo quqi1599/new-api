@@ -88,8 +88,27 @@ func (c *xunfeiScriptedWebSocket) deadlines() []time.Time {
 }
 
 func xunfeiTestDial(conn xunfeiWebSocket) xunfeiDialFunc {
-	return func(context.Context, string) (xunfeiWebSocket, *http.Response, error) {
+	return func(context.Context, context.Context, string) (xunfeiWebSocket, *http.Response, error) {
 		return conn, &http.Response{StatusCode: http.StatusSwitchingProtocols}, nil
+	}
+}
+
+type xunfeiTestTimeoutError struct{}
+
+func (xunfeiTestTimeoutError) Error() string   { return "websocket handshake timeout" }
+func (xunfeiTestTimeoutError) Timeout() bool   { return true }
+func (xunfeiTestTimeoutError) Temporary() bool { return true }
+
+func xunfeiErrorDial(err error) xunfeiDialFunc {
+	return func(context.Context, context.Context, string) (xunfeiWebSocket, *http.Response, error) {
+		return nil, nil, err
+	}
+}
+
+func xunfeiWaitForHandshakeContextDial() xunfeiDialFunc {
+	return func(_ context.Context, handshakeCtx context.Context, _ string) (xunfeiWebSocket, *http.Response, error) {
+		<-handshakeCtx.Done()
+		return nil, nil, handshakeCtx.Err()
 	}
 }
 
@@ -142,6 +161,103 @@ func TestXunfeiStreamExplicitTerminalFinalizes(t *testing.T) {
 	require.True(t, deadlines[1].After(deadlines[0].Add(10*time.Second)), "the second read must use the longer idle timeout")
 }
 
+func TestXunfeiHandlersClassifyHandshakeTimeoutAs504(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*gin.Context, *relaycommon.RelayInfo, dto.GeneralOpenAIRequest, xunfeiDialFunc) (*dto.Usage, *types.NewAPIError)
+	}{
+		{
+			name: "stream",
+			invoke: func(c *gin.Context, info *relaycommon.RelayInfo, request dto.GeneralOpenAIRequest, dial xunfeiDialFunc) (*dto.Usage, *types.NewAPIError) {
+				return xunfeiStreamHandlerWithDial(c, info, request, "app", "secret", "key", dial)
+			},
+		},
+		{
+			name: "non-stream",
+			invoke: func(c *gin.Context, info *relaycommon.RelayInfo, request dto.GeneralOpenAIRequest, dial xunfeiDialFunc) (*dto.Usage, *types.NewAPIError) {
+				return xunfeiHandlerWithDial(c, info, request, "app", "secret", "key", dial)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c, info, recorder, request := newXunfeiHandlerTest(t, context.Background())
+
+			usage, apiErr := test.invoke(c, info, request, xunfeiErrorDial(xunfeiTestTimeoutError{}))
+
+			require.Nil(t, usage)
+			require.NotNil(t, apiErr)
+			require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+			require.Equal(t, types.ErrorCodeUpstreamResponseHeaderTimeout, apiErr.GetErrorCode())
+			require.False(t, types.IsSkipRetryError(apiErr), "the model request frame was not sent before the upgrade completed")
+			require.True(t, types.IsChannelPenaltyAllowed(apiErr))
+			require.Empty(t, recorder.Body.String())
+		})
+	}
+}
+
+func TestXunfeiHandshakeCallerDeadlineDoesNotPenalizeChannel(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-ctx.Done()
+	c, info, recorder, request := newXunfeiHandlerTest(t, ctx)
+
+	usage, apiErr := xunfeiStreamHandlerWithDial(c, info, request, "app", "secret", "key", xunfeiErrorDial(ctx.Err()))
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, apiErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiErr))
+	require.False(t, types.IsChannelPenaltyAllowed(apiErr))
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestXunfeiStreamHandshakeConsumesAbsoluteFirstEventBudget(t *testing.T) {
+	oldTimeout := common.RelayFirstEventTotalTimeout
+	common.RelayFirstEventTotalTimeout = 1
+	t.Cleanup(func() { common.RelayFirstEventTotalTimeout = oldTimeout })
+	c, info, recorder, request := newXunfeiHandlerTest(t, context.Background())
+	info.SetFirstValidEventDeadline(time.Time{})
+	info.StartTime = time.Now().Add(-750 * time.Millisecond)
+	startedAt := time.Now()
+
+	usage, apiErr := xunfeiStreamHandlerWithDial(c, info, request, "app", "secret", "key", xunfeiWaitForHandshakeContextDial())
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamFirstEventTimeout, apiErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiErr))
+	require.False(t, types.IsChannelPenaltyAllowed(apiErr))
+	require.Less(t, time.Since(startedAt), 750*time.Millisecond)
+	require.Empty(t, recorder.Body.String())
+}
+
+func TestXunfeiNonStreamInheritsAbsoluteRequestBudget(t *testing.T) {
+	oldTimeout := common.RelayNonStreamTimeout
+	common.RelayNonStreamTimeout = 1
+	t.Cleanup(func() { common.RelayNonStreamTimeout = oldTimeout })
+	conn := newXunfeiScriptedWebSocket(
+		xunfeiReadResult{data: xunfeiFrame(0, "partial", 1, 1, 2)},
+	)
+	c, info, recorder, request := newXunfeiHandlerTest(t, context.Background())
+	info.StartTime = time.Now().Add(-750 * time.Millisecond)
+	startedAt := time.Now()
+
+	usage, apiErr := xunfeiHandlerWithDial(c, info, request, "app", "secret", "key", xunfeiTestDial(conn))
+
+	require.Nil(t, usage)
+	require.NotNil(t, apiErr)
+	require.Equal(t, http.StatusGatewayTimeout, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeUpstreamNonStreamTimeout, apiErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiErr))
+	require.True(t, types.IsChannelPenaltyAllowed(apiErr))
+	require.Less(t, time.Since(startedAt), 750*time.Millisecond)
+	require.Empty(t, recorder.Body.String())
+}
+
 func TestXunfeiStreamTruncatedAfterPartialDoesNotFinalize(t *testing.T) {
 	conn := newXunfeiScriptedWebSocket(
 		xunfeiReadResult{data: xunfeiFrame(0, "partial", 0, 0, 0)},
@@ -187,6 +303,25 @@ func TestXunfeiStreamClientCancelClosesWebSocket(t *testing.T) {
 	require.NotNil(t, streamErr)
 	require.Equal(t, 499, streamErr.StatusCode)
 	require.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	require.Empty(t, recorder.Body.String())
+	require.Empty(t, recorder.Header().Get("Content-Type"))
+}
+
+func TestXunfeiStreamCallerDeadlineWhileWaitingReturns504(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	conn := newXunfeiScriptedWebSocket()
+	c, info, recorder, request := newXunfeiHandlerTest(t, ctx)
+
+	usage, streamErr := xunfeiStreamHandlerWithDial(c, info, request, "app", "secret", "key", xunfeiTestDial(conn))
+
+	require.Nil(t, usage)
+	require.NotNil(t, streamErr)
+	require.Equal(t, http.StatusGatewayTimeout, streamErr.StatusCode)
+	require.Equal(t, types.ErrorCodeDoRequestFailed, streamErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(streamErr))
+	require.False(t, types.IsChannelPenaltyAllowed(streamErr))
+	require.Equal(t, relaycommon.StreamEndReasonRequestDeadline, info.StreamStatus.EndReason)
 	require.Empty(t, recorder.Body.String())
 	require.Empty(t, recorder.Header().Get("Content-Type"))
 }

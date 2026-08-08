@@ -233,6 +233,11 @@ func TestChannelCircuitFailureClassification(t *testing.T) {
 		{name: "invalid request", err: types.NewErrorWithStatusCode(errors.New("bad request"), types.ErrorCodeInvalidRequest, http.StatusBadRequest), want: false},
 		{name: "plain skip retry", err: types.NewErrorWithStatusCode(errors.New("local"), types.ErrorCodeBadResponse, http.StatusInternalServerError, types.ErrOptionWithSkipRetry()), want: false},
 		{name: "ambiguous transport penalty", err: types.NewErrorWithStatusCode(errors.New("reset"), types.ErrorCodeDoRequestFailed, http.StatusBadGateway, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
+		{name: "connection timeout penalty", err: types.NewErrorWithStatusCode(errors.New("connect timeout"), types.ErrorCodeUpstreamConnectionTimeout, http.StatusGatewayTimeout, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
+		{name: "tls handshake timeout penalty", err: types.NewErrorWithStatusCode(errors.New("tls timeout"), types.ErrorCodeUpstreamTLSHandshakeTimeout, http.StatusGatewayTimeout, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
+		{name: "request write timeout penalty", err: types.NewErrorWithStatusCode(errors.New("write timeout"), types.ErrorCodeUpstreamRequestWriteTimeout, http.StatusGatewayTimeout, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
+		{name: "response header timeout penalty", err: types.NewErrorWithStatusCode(errors.New("header timeout"), types.ErrorCodeUpstreamResponseHeaderTimeout, http.StatusGatewayTimeout, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
+		{name: "non-stream total timeout penalty", err: types.NewErrorWithStatusCode(errors.New("body timeout"), types.ErrorCodeUpstreamNonStreamTimeout, http.StatusGatewayTimeout, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty()), want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

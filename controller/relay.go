@@ -291,6 +291,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		retryState.RecordAttempt(channel.Id)
+		common.ResetRelayAttemptTimeoutContext(c)
 		setRelayRetryDiagnostics(c, retryState)
 		addUsedChannel(c, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {

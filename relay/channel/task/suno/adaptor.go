@@ -2,6 +2,7 @@ package suno
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -93,6 +94,7 @@ func (a *TaskAdaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, req
 }
 
 func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (taskID string, taskData []byte, taskErr *dto.TaskError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "read_response_body_failed", http.StatusInternalServerError)
@@ -128,14 +130,22 @@ func (a *TaskAdaptor) GetChannelName() string {
 	return ChannelName
 }
 
+var _ service.ContextTaskPollingAdaptor = (*TaskAdaptor)(nil)
+
 func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
+	return taskcommon.DoLegacyPollingRequest(func(ctx context.Context) (*http.Response, error) {
+		return a.FetchTaskContext(ctx, baseUrl, key, body, proxy)
+	})
+}
+
+func (a *TaskAdaptor) FetchTaskContext(ctx context.Context, baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
 	requestUrl := fmt.Sprintf("%s/suno/fetch", baseUrl)
 	byteBody, err := common.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", requestUrl, bytes.NewBuffer(byteBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestUrl, bytes.NewBuffer(byteBody))
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task error: %v", err))
 		return nil, err

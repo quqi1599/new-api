@@ -171,6 +171,19 @@ func SetContextKey(c *gin.Context, key constant.ContextKey, value any) {
 	c.Set(string(key), value)
 }
 
+// ResetRelayAttemptTimeoutContext clears phase-local diagnostics before a new
+// upstream attempt or preflight begins. Retry attempts share one Gin context;
+// carrying a prior connect/TLS phase forward would misclassify a later response
+// header timeout and corrupt the final 504 log.
+func ResetRelayAttemptTimeoutContext(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, "")
+	SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, 0)
+	SetContextKey(c, constant.ContextKeyRelayCancelOrigin, "")
+}
+
 func GetContextKey(c *gin.Context, key constant.ContextKey) (any, bool) {
 	return c.Get(string(key))
 }

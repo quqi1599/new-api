@@ -73,6 +73,14 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 			return nil, streamErr
 		}
 	} else {
+		// Buffer the complete non-stream response before committing downstream
+		// headers. The shared body wrapper can still surface a typed 504 here;
+		// writing 200 first would turn that timeout into an empty success and bill it.
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			logger.LogError(c, fmt.Sprintf("failed to read TTS response body: %v", err))
+			return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusBadGateway)
+		}
 		for k, v := range resp.Header {
 			if !service.ShouldCopyUpstreamHeader(c, k, v) {
 				continue
@@ -81,13 +89,6 @@ func OpenaiTTSHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 		c.Writer.WriteHeader(resp.StatusCode)
 		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
-		// 读取响应体到缓冲区
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			logger.LogError(c, fmt.Sprintf("failed to read TTS response body: %v", err))
-			c.Writer.WriteHeaderNow()
-			return usage, nil
-		}
 
 		// 写入响应到客户端
 		c.Writer.WriteHeaderNow()

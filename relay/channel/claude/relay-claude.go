@@ -395,7 +395,7 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 						}
 						base64Data, mimeType, err := service.GetBase64Data(c, source, "formatting image for Claude")
 						if err != nil {
-							return nil, fmt.Errorf("get file data failed: %s", err.Error())
+							return nil, fmt.Errorf("get file data failed: %w", err)
 						}
 						claudeMediaMessage := dto.ClaudeMediaMessage{
 							Source: &dto.ClaudeMessageSource{
@@ -463,7 +463,7 @@ func convertOpenAIFileToClaudeContent(c *gin.Context, mediaMessage dto.MediaCont
 	source := types.NewFileSourceFromData(file.FileData, mimeType)
 	base64Data, loadedMimeType, err := service.GetBase64Data(c, source, "formatting file for Claude")
 	if err != nil {
-		return dto.ClaudeMediaMessage{}, false, fmt.Errorf("get file data failed: %s", err.Error())
+		return dto.ClaudeMediaMessage{}, false, fmt.Errorf("get file data failed: %w", err)
 	}
 	if loadedMimeType != "" {
 		mimeType = normalizeClaudeMimeType(loadedMimeType)

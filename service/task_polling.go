@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/types"
 
 	"github.com/samber/lo"
 )
@@ -29,6 +31,183 @@ type TaskPollingAdaptor interface {
 	// AdjustBillingOnComplete 在任务到达终态（成功/失败）时由轮询循环调用。
 	// 返回正数触发差额结算（补扣/退还），返回 0 保持预扣费金额不变。
 	AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int
+}
+
+// ContextTaskPollingAdaptor is the cancellation-safe polling path. All built-in
+// task adaptors implement it; rejecting a legacy-only adaptor is safer than
+// allowing a timed-out scheduler call to keep running in the background.
+type ContextTaskPollingAdaptor interface {
+	FetchTaskContext(ctx context.Context, baseURL string, key string, body map[string]any, proxy string) (*http.Response, error)
+}
+
+// ContextTaskResultParser covers provider-specific secondary requests made
+// while parsing a successful polling response (for example resolving a video
+// file ID into a download URL). The same per-task context must span both the
+// status request and these follow-up requests.
+type ContextTaskResultParser interface {
+	ParseTaskResultContext(ctx context.Context, body []byte) (*relaycommon.TaskInfo, error)
+}
+
+const fallbackTaskPollingRequestTimeout = 10 * time.Minute
+
+func taskPollingRequestTimeout() time.Duration {
+	timeout := fallbackTaskPollingRequestTimeout
+	if common.RelayNonStreamTimeout > 0 {
+		timeout = time.Duration(common.RelayNonStreamTimeout) * time.Second
+	}
+	if timeout > fallbackTaskPollingRequestTimeout {
+		return fallbackTaskPollingRequestTimeout
+	}
+	return timeout
+}
+
+func taskPollingCycleTimeout() time.Duration {
+	return taskPollingRequestTimeout()
+}
+
+func newTaskPollingCycleContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, taskPollingCycleTimeout())
+}
+
+// NewTaskPollingRequestContext gives request-driven polling paths (including
+// realtime task fetches) the same bounded lifetime as the background poller.
+// The caller must always invoke the returned cancel function.
+func NewTaskPollingRequestContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, taskPollingRequestTimeout())
+}
+
+func taskPollingTimeoutError(phase string, cause error) error {
+	errorCode := types.ErrorCodeUpstreamNonStreamTimeout
+	if phase == "response_headers" {
+		errorCode = types.ErrorCodeUpstreamResponseHeaderTimeout
+	}
+	return types.NewErrorWithStatusCode(
+		fmt.Errorf("task polling %s timeout: %w", phase, cause),
+		errorCode,
+		http.StatusGatewayTimeout,
+		types.ErrOptionWithSkipRetry(),
+	)
+}
+
+func classifyTaskPollingError(ctx context.Context, err error, phase string) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			return taskPollingTimeoutError(phase, ctxErr)
+		}
+		return ctxErr
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		return taskPollingTimeoutError(phase, err)
+	}
+	return err
+}
+
+func fetchTaskWithContext(ctx context.Context, adaptor TaskPollingAdaptor, baseURL, key string, body map[string]any, proxy string) (*http.Response, error) {
+	contextAdaptor, ok := adaptor.(ContextTaskPollingAdaptor)
+	if !ok {
+		return nil, errors.New("task polling adaptor does not support context cancellation")
+	}
+	resp, err := contextAdaptor.FetchTaskContext(ctx, baseURL, key, body, proxy)
+	if err != nil {
+		return nil, classifyTaskPollingError(ctx, err, "response_headers")
+	}
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("task polling adaptor returned an empty response")
+	}
+	return resp, nil
+}
+
+// FetchTaskPollingContext is the shared cancellation-safe entry point for both
+// scheduled polling and request-driven realtime task refreshes.
+func FetchTaskPollingContext(ctx context.Context, adaptor TaskPollingAdaptor, baseURL, key string, body map[string]any, proxy string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return fetchTaskWithContext(ctx, adaptor, baseURL, key, body, proxy)
+}
+
+type taskPollingReadResult struct {
+	body []byte
+	err  error
+}
+
+func readTaskPollingBody(ctx context.Context, resp *http.Response) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, errors.New("task polling response body is missing")
+	}
+	resultCh := make(chan taskPollingReadResult, 1)
+	go func() {
+		body, err := io.ReadAll(resp.Body)
+		resultCh <- taskPollingReadResult{body: body, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			return nil, classifyTaskPollingError(ctx, result.err, "response_body")
+		}
+		return result.body, nil
+	case <-ctx.Done():
+		_ = resp.Body.Close()
+		select {
+		case result := <-resultCh:
+			if result.err == nil && ctx.Err() == nil {
+				return result.body, nil
+			}
+		default:
+		}
+		return nil, classifyTaskPollingError(ctx, ctx.Err(), "response_body")
+	}
+}
+
+// ReadTaskPollingBodyContext reads a polling response without allowing a slow
+// or stalled body to outlive the request budget.
+func ReadTaskPollingBodyContext(ctx context.Context, resp *http.Response) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return readTaskPollingBody(ctx, resp)
+}
+
+func parseTaskPollingResultContext(ctx context.Context, adaptor TaskPollingAdaptor, body []byte) (*relaycommon.TaskInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, classifyTaskPollingError(ctx, err, "task_result")
+	}
+
+	var (
+		result *relaycommon.TaskInfo
+		err    error
+	)
+	if parser, ok := adaptor.(ContextTaskResultParser); ok {
+		result, err = parser.ParseTaskResultContext(ctx, body)
+	} else {
+		// Legacy parsers only process the already-buffered response. Adaptors
+		// that perform secondary I/O must implement ContextTaskResultParser.
+		result, err = adaptor.ParseTaskResult(body)
+	}
+	if err != nil {
+		return nil, classifyTaskPollingError(ctx, err, "task_result")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, classifyTaskPollingError(ctx, err, "task_result")
+	}
+	return result, nil
+}
+
+// ParseTaskPollingResultContext preserves typed timeout errors from any
+// provider-specific secondary request made while parsing a task result.
+func ParseTaskPollingResultContext(ctx context.Context, adaptor TaskPollingAdaptor, body []byte) (*relaycommon.TaskInfo, error) {
+	return parseTaskPollingResultContext(ctx, adaptor, body)
 }
 
 // GetTaskAdaptorFunc 由 main 包注入，用于获取指定平台的任务适配器。
@@ -92,7 +271,7 @@ func TaskPollingLoop() {
 	for {
 		time.Sleep(time.Duration(15) * time.Second)
 		common.SysLog("任务进度轮询开始")
-		ctx := context.TODO()
+		ctx, cancel := newTaskPollingCycleContext(context.Background())
 		sweepTimedOutTasks(ctx)
 		allTasks := model.GetAllUnFinishSyncTasks(constant.TaskQueryLimit)
 		platformTask := make(map[constant.TaskPlatform][]*model.Task)
@@ -131,37 +310,56 @@ func TaskPollingLoop() {
 				continue
 			}
 
-			DispatchPlatformUpdate(platform, taskChannelM, taskM)
+			if err := DispatchPlatformUpdateContext(ctx, platform, taskChannelM, taskM); err != nil {
+				common.SysLog(fmt.Sprintf("DispatchPlatformUpdate fail for platform %s: %s", platform, err))
+			}
 		}
+		cancel()
 		common.SysLog("任务进度轮询完成")
 	}
 }
 
-// DispatchPlatformUpdate 按平台分发轮询更新
+// DispatchPlatformUpdate 按平台分发轮询更新。
+// Deprecated: use DispatchPlatformUpdateContext when a caller context is
+// available. The original signature remains for downstream source compatibility.
 func DispatchPlatformUpdate(platform constant.TaskPlatform, taskChannelM map[int][]string, taskM map[string]*model.Task) {
+	ctx, cancel := newTaskPollingCycleContext(context.Background())
+	defer cancel()
+	if err := DispatchPlatformUpdateContext(ctx, platform, taskChannelM, taskM); err != nil {
+		common.SysLog(fmt.Sprintf("DispatchPlatformUpdate fail for platform %s: %s", platform, err))
+	}
+}
+
+// DispatchPlatformUpdateContext 按平台分发轮询更新，并把本轮预算传给所有上游请求。
+func DispatchPlatformUpdateContext(ctx context.Context, platform constant.TaskPlatform, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
 	switch platform {
 	case constant.TaskPlatformMidjourney:
 		// MJ 轮询由其自身处理，这里预留入口
+		return nil
 	case constant.TaskPlatformBackgroundRelay:
 		// 通用后台 Relay Job 由提交它的工作协程推进；这里不能把它当成视频任务轮询。
+		return nil
 	case constant.TaskPlatformSuno:
-		_ = UpdateSunoTasks(context.Background(), taskChannelM, taskM)
+		return UpdateSunoTasks(ctx, taskChannelM, taskM)
 	default:
-		if err := UpdateVideoTasks(context.Background(), platform, taskChannelM, taskM); err != nil {
-			common.SysLog(fmt.Sprintf("UpdateVideoTasks fail: %s", err))
-		}
+		return UpdateVideoTasks(ctx, platform, taskChannelM, taskM)
 	}
 }
 
 // UpdateSunoTasks 按渠道更新所有 Suno 任务
 func UpdateSunoTasks(ctx context.Context, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
+	var errs []error
 	for channelId, taskIds := range taskChannelM {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		err := updateSunoTasks(ctx, channelId, taskIds, taskM)
 		if err != nil {
 			logger.LogError(ctx, fmt.Sprintf("渠道 #%d 更新异步任务失败: %s", channelId, err.Error()))
+			errs = append(errs, fmt.Errorf("channel #%d: %w", channelId, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM map[string]*model.Task) error {
@@ -194,19 +392,21 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		return errors.New("adaptor not found")
 	}
 	proxy := ch.GetSetting().Proxy
-	resp, err := adaptor.FetchTask(*ch.BaseURL, ch.Key, map[string]any{
+	requestCtx, cancel := context.WithTimeout(ctx, taskPollingRequestTimeout())
+	defer cancel()
+	resp, err := fetchTaskWithContext(requestCtx, adaptor, *ch.BaseURL, ch.Key, map[string]any{
 		"ids": taskIds,
 	}, proxy)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Task Do req error: %v", err))
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		logger.LogError(ctx, fmt.Sprintf("Get Task status code: %d", resp.StatusCode))
 		return fmt.Errorf("Get Task status code: %d", resp.StatusCode)
 	}
-	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := readTaskPollingBody(requestCtx, resp)
 	if err != nil {
 		common.SysLog(fmt.Sprintf("Get Suno Task parse body error: %v", err))
 		return err
@@ -219,11 +419,16 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 	}
 	if !responseItems.IsSuccess() {
 		common.SysLog(fmt.Sprintf("渠道 #%d 未完成的任务有: %d, 成功获取到任务数: %s", channelId, len(taskIds), string(responseBody)))
-		return err
+		return fmt.Errorf("upstream returned unsuccessful task response: %s", string(responseBody))
 	}
 
+	var errs []error
 	for _, responseItem := range responseItems.Data {
 		task := taskM[responseItem.TaskID]
+		if task == nil {
+			errs = append(errs, fmt.Errorf("task %s not found in task map", responseItem.TaskID))
+			continue
+		}
 		if !taskNeedsUpdate(task, responseItem) {
 			continue
 		}
@@ -243,12 +448,12 @@ func updateSunoTasks(ctx context.Context, channelId int, taskIds []string, taskM
 		}
 		task.Data = responseItem.Data
 
-		err = task.Update()
-		if err != nil {
-			common.SysLog("UpdateSunoTask task error: " + err.Error())
+		if updateErr := task.Update(); updateErr != nil {
+			common.SysLog("UpdateSunoTask task error: " + updateErr.Error())
+			errs = append(errs, fmt.Errorf("update task %s: %w", responseItem.TaskID, updateErr))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // taskNeedsUpdate 检查 Suno 任务是否需要更新
@@ -291,12 +496,17 @@ func taskNeedsUpdate(oldTask *model.Task, newTask dto.SunoDataResponse) bool {
 
 // UpdateVideoTasks 按渠道更新所有视频任务
 func UpdateVideoTasks(ctx context.Context, platform constant.TaskPlatform, taskChannelM map[int][]string, taskM map[string]*model.Task) error {
+	var errs []error
 	for channelId, taskIds := range taskChannelM {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		if err := updateVideoTasks(ctx, platform, channelId, taskIds, taskM); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Channel #%d failed to update video async tasks: %s", channelId, err.Error()))
+			errs = append(errs, fmt.Errorf("channel #%d: %w", channelId, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, channelId int, taskIds []string, taskM map[string]*model.Task) error {
@@ -333,14 +543,33 @@ func updateVideoTasks(ctx context.Context, platform constant.TaskPlatform, chann
 	}
 	info.ApiKey = cacheGetChannel.Key
 	adaptor.Init(info)
-	for _, taskId := range taskIds {
+	var errs []error
+	for index, taskId := range taskIds {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
 			logger.LogError(ctx, fmt.Sprintf("Failed to update video task %s: %s", taskId, err.Error()))
+			errs = append(errs, fmt.Errorf("task %s: %w", taskId, err))
+		}
+		if index == len(taskIds)-1 {
+			continue
 		}
 		// sleep 1 second between each task to avoid hitting rate limits of upstream platforms
-		time.Sleep(1 * time.Second)
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return errors.Join(append(errs, ctx.Err())...)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *model.Channel, taskId string, taskM map[string]*model.Task) error {
@@ -361,7 +590,9 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 	if privateData.Key != "" {
 		key = privateData.Key
 	}
-	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
+	requestCtx, cancel := context.WithTimeout(ctx, taskPollingRequestTimeout())
+	defer cancel()
+	resp, err := fetchTaskWithContext(requestCtx, adaptor, baseURL, key, map[string]any{
 		"task_id": task.GetUpstreamTaskID(),
 		"action":  task.Action,
 	}, proxy)
@@ -369,7 +600,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		return fmt.Errorf("fetchTask failed for task %s: %w", taskId, err)
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(resp.Body)
+	responseBody, err := readTaskPollingBody(requestCtx, resp)
 	if err != nil {
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
 	}
@@ -390,8 +621,11 @@ func updateVideoSingleTask(ctx context.Context, adaptor TaskPollingAdaptor, ch *
 		taskResult.Progress = t.Progress
 		taskResult.Reason = t.FailReason
 		task.Data = t.Data
-	} else if taskResult, err = adaptor.ParseTaskResult(responseBody); err != nil {
-		return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
+	} else {
+		taskResult, err = parseTaskPollingResultContext(requestCtx, adaptor, responseBody)
+		if err != nil {
+			return fmt.Errorf("parseTaskResult failed for task %s: %w", taskId, err)
+		}
 	}
 
 	task.Data = redactVideoResponseBody(responseBody)

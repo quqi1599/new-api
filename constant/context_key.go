@@ -18,6 +18,8 @@ const (
 	ContextKeyRelayResponseHeaders   ContextKey = "relay_response_headers_received"
 	ContextKeyRelayFirstValidEvent   ContextKey = "relay_first_valid_event_received"
 	ContextKeyRelayOutputStarted     ContextKey = "relay_output_started"
+	ContextKeyRelayTimeoutPhase      ContextKey = "relay_timeout_phase"
+	ContextKeyRelayTimeoutSeconds    ContextKey = "relay_timeout_seconds"
 
 	/* token related keys */
 	ContextKeyTokenUnlimited         ContextKey = "token_unlimited_quota"

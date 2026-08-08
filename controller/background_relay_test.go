@@ -24,6 +24,12 @@ func TestBackgroundRelayTaskIDIsIdempotentAndScoped(t *testing.T) {
 	}
 }
 
+func TestBackgroundRelayTextJobEnvelopeExceedsRelayPhaseBudgets(t *testing.T) {
+	if defaultBackgroundRelayTextJobTimeoutSeconds <= 540 {
+		t.Fatalf("background text job timeout = %d, must leave cleanup margin after 540s relay budgets", defaultBackgroundRelayTextJobTimeoutSeconds)
+	}
+}
+
 func TestBackgroundRelayRequestFingerprintIncludesRouteAndFormat(t *testing.T) {
 	request := &http.Request{Method: http.MethodPost, URL: &url.URL{Path: "/v1/chat/completions"}}
 	first := backgroundRelayRequestFingerprint(request, types.RelayFormatOpenAI, []byte(`{"model":"gpt-example"}`))

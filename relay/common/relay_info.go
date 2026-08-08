@@ -173,6 +173,11 @@ type RelayInfo struct {
 	// every channel attempt. It is deliberately not a request Context deadline:
 	// after the first valid event a healthy SSE body may outlive this instant.
 	firstValidEventDeadline time.Time
+	// nonStreamDeadline is the absolute request-wide budget for non-stream
+	// relay work, shared by preflight calls, channel retries, and response-body
+	// reads. Unlike the stream deadline it remains active until the whole body or
+	// provider-specific task flow completes.
+	nonStreamDeadline time.Time
 
 	PriceData types.PriceData
 
@@ -226,6 +231,24 @@ func (info *RelayInfo) SetFirstValidEventDeadline(deadline time.Time) {
 	}
 }
 
+// EnsureFirstValidEventDeadline initializes the absolute pre-output budget
+// without replacing a deadline already shared across earlier channel attempts.
+// Dynamic SSE responses call this only after their response Content-Type makes
+// the stream lifecycle known, so the supplied start time must still represent
+// the inbound request (or, for synthetic callers, the current relay attempt).
+func (info *RelayInfo) EnsureFirstValidEventDeadline(startTime time.Time, totalTimeout time.Duration) {
+	if info == nil || totalTimeout <= 0 || !info.firstValidEventDeadline.IsZero() {
+		return
+	}
+	if startTime.IsZero() {
+		startTime = info.StartTime
+	}
+	if startTime.IsZero() {
+		startTime = time.Now()
+	}
+	info.firstValidEventDeadline = startTime.Add(totalTimeout)
+}
+
 // RemainingFirstValidEventBudget returns the request-wide time remaining until
 // the first valid upstream event. A false limited value keeps compatibility for
 // synthetic/test RelayInfo instances that have no deadline configured.
@@ -234,6 +257,28 @@ func (info *RelayInfo) RemainingFirstValidEventBudget() (remaining time.Duration
 		return 0, false
 	}
 	return time.Until(info.firstValidEventDeadline), true
+}
+
+// EnsureNonStreamDeadline initializes the absolute non-stream budget without
+// resetting it on a later preflight, retry, or response-body phase.
+func (info *RelayInfo) EnsureNonStreamDeadline(startTime time.Time, totalTimeout time.Duration) {
+	if info == nil || totalTimeout <= 0 || !info.nonStreamDeadline.IsZero() {
+		return
+	}
+	if startTime.IsZero() {
+		startTime = info.StartTime
+	}
+	if startTime.IsZero() {
+		startTime = time.Now()
+	}
+	info.nonStreamDeadline = startTime.Add(totalTimeout)
+}
+
+func (info *RelayInfo) RemainingNonStreamBudget() (remaining time.Duration, limited bool) {
+	if info == nil || info.nonStreamDeadline.IsZero() {
+		return 0, false
+	}
+	return time.Until(info.nonStreamDeadline), true
 }
 
 // BoundFirstValidEventWait applies the smaller of a phase-local timeout and the
@@ -560,6 +605,9 @@ func genBaseRelayInfo(c *gin.Context, request dto.Request) *RelayInfo {
 	}
 	if isStream && common.RelayFirstEventTotalTimeout > 0 {
 		info.SetFirstValidEventDeadline(startTime.Add(time.Duration(common.RelayFirstEventTotalTimeout) * time.Second))
+	}
+	if !isStream && common.RelayNonStreamTimeout > 0 {
+		info.EnsureNonStreamDeadline(startTime, time.Duration(common.RelayNonStreamTimeout)*time.Second)
 	}
 
 	if info.RelayMode == relayconstant.RelayModeUnknown {

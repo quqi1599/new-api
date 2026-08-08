@@ -1,16 +1,17 @@
 package coze
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
+	common2 "github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -67,27 +68,50 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *common.RelayInfo, requestBody 
 	if info.IsStream {
 		return channel.DoApiRequest(a, c, info, requestBody)
 	}
+	budget, err := newCozeRequestBudget(c, info)
+	if err != nil {
+		return nil, err
+	}
+	c.Set(cozeRequestBudgetKey, budget)
+	handOffBudget := false
+	defer func() {
+		if !handOffBudget {
+			budget.finish()
+			c.Set(cozeRequestBudgetKey, nil)
+		}
+	}()
+
 	// 首先发送创建消息请求，成功后再发送获取消息请求
 	// 发送创建消息请求
+	originalRequest := c.Request
+	c.Request = originalRequest.WithContext(budget.ctx)
 	resp, err := channel.DoApiRequest(a, c, info, requestBody)
+	c.Request = originalRequest
 	if err != nil {
+		if budget.expired() {
+			return nil, cozeTotalTimeoutError(c, budget, true)
+		}
 		return nil, err
 	}
 	// 解析 resp
 	var cozeResponse CozeChatResponse
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	respBody, readErr := readCozeResponseBody(c, resp, budget)
+	service.CloseResponseBodyGracefully(resp)
+	if readErr != nil {
+		return nil, readErr
 	}
-	err = json.Unmarshal(respBody, &cozeResponse)
+	err = common2.Unmarshal(respBody, &cozeResponse)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+	}
 	if cozeResponse.Code != 0 {
-		return nil, errors.New(cozeResponse.Msg)
+		return nil, types.NewError(errors.New(cozeResponse.Msg), types.ErrorCodeBadResponseBody, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
 	}
 	c.Set("coze_conversation_id", cozeResponse.Data.ConversationId)
 	c.Set("coze_chat_id", cozeResponse.Data.Id)
 	// 轮询检查消息是否完成
 	for {
-		err, isComplete := checkIfChatComplete(a, c, info)
+		err, isComplete := checkIfChatComplete(a, c, info, budget)
 		if err != nil {
 			return nil, err
 		} else {
@@ -96,17 +120,32 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *common.RelayInfo, requestBody 
 			}
 		}
 		select {
-		case <-c.Request.Context().Done():
-			return nil, channel.ClassifyDoRequestError(c, c.Request.Context().Err())
+		case <-budget.ctx.Done():
+			if budget.expired() {
+				return nil, cozeTotalTimeoutError(c, budget, true)
+			}
+			return nil, channel.ClassifyDoRequestError(c, budget.ctx.Err())
 		case <-time.After(time.Second):
 		}
 	}
 	// 发送获取消息请求
-	return getChatDetail(a, c, info)
+	resp, err = getChatDetail(a, c, info, budget)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &cozeBudgetBody{ReadCloser: resp.Body, budget: budget}
+	handOffBudget = true
+	return resp, nil
 }
 
 // DoResponse implements channel.Adaptor.
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *common.RelayInfo) (usage any, err *types.NewAPIError) {
+	if budget := getCozeRequestBudget(c); budget != nil {
+		defer func() {
+			budget.finish()
+			c.Set(cozeRequestBudgetKey, nil)
+		}()
+	}
 	if info.IsStream {
 		usage, err = cozeChatStreamHandler(c, info, resp)
 	} else {

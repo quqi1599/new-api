@@ -315,11 +315,14 @@ docker run --name new-api -d --restart always \
 | `SHUTDOWN_TIMEOUT_SECONDS` | Graceful shutdown timeout; container stop grace must be longer | `120` |
 | `RELAY_DIAL_TIMEOUT_SECONDS` | TCP/proxy dial timeout in seconds; `0` disables the phase timeout | `10` |
 | `RELAY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | TLS handshake timeout in seconds; `0` disables the phase timeout | `10` |
-| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | Per-attempt upstream response-header timeout in seconds; does not limit response-body streaming and is also bounded by the cross-attempt first-event budget | `480` |
+| `RELAY_RESPONSE_HEADER_TIMEOUT_SECONDS` | Per-attempt upstream response-header timeout in seconds; does not limit response-body streaming and is also bounded by the cross-attempt first-event budget | `520` |
 | `RELAY_EXPECT_CONTINUE_TIMEOUT_SECONDS` | `Expect: 100-continue` wait timeout in seconds | `1` |
 | `RELAY_FIRST_EVENT_TIMEOUT_SECONDS` | Per-attempt cap for the first valid SSE event after response headers; the request-wide deadline can shorten it | `540` |
 | `RELAY_FIRST_EVENT_TOTAL_TIMEOUT_SECONDS` | Request-wide budget shared by all channel attempts until the first valid event; disarmed afterward so healthy long streams continue. Keep it at least 60 seconds below the transit Caddy first-byte timeout; `0` disables it | `540` |
-| `RELAY_TIMEOUT` | Legacy relay/provider compatibility fallback for the response-header timeout (capped at the safe 480s phase default); it remains a whole-fetch timeout for SSRF-protected user-controlled URL downloads | `0` |
+| `RELAY_NON_STREAM_TIMEOUT_SECONDS` | Total budget for a non-stream relay request, including request-body upload and response-body read. The earlier of this budget and a caller deadline wins; `0` disables this guard | `540` |
+| `RELAY_STREAM_HEARTBEAT_SECONDS` | Gateway SSE heartbeat interval after the first valid upstream event. No heartbeat is written before the first event, preserving real HTTP 4xx/5xx responses; `0` disables it | `15` |
+| `ALI_TASK_POLL_REQUEST_TIMEOUT_SECONDS` | Per-request total timeout for Ali asynchronous task polling; the parent relay/job deadline still bounds the complete task; `0` uses only the parent deadline | `60` |
+| `RELAY_TIMEOUT` | Legacy relay/provider compatibility fallback for the response-header timeout (capped at the safe 520s phase default); it remains a whole-fetch timeout for SSRF-protected user-controlled URL downloads | `0` |
 | `RELAY_IDLE_CONN_TIMEOUT` | Idle keep-alive timeout for relay HTTP clients, seconds. Defaults to Go standard library behavior; set `0` to disable | `90` |
 | `STREAMING_TIMEOUT` | Idle timeout between valid SSE data events; comments/heartbeats do not reset it | `300` |
 | `STREAM_SCANNER_MAX_BUFFER_MB` | Max per-line buffer (MB) for the stream scanner; increase when upstream sends huge image/base64 payloads | `64` |

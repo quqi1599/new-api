@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -100,6 +101,9 @@ type AliOutput struct {
 	} `json:"choices,omitempty"`
 }
 
+// ChoicesToOpenAIImageDate preserves the historical exported API. Relay code
+// that needs request-scoped timeout propagation must use
+// ChoicesToOpenAIImageDataWithRelayInfo instead.
 func (o *AliOutput) ChoicesToOpenAIImageDate(c *gin.Context, responseFormat string) []dto.ImageData {
 	var imageData []dto.ImageData
 	if len(o.Choices) > 0 {
@@ -129,10 +133,44 @@ func (o *AliOutput) ChoicesToOpenAIImageDate(c *gin.Context, responseFormat stri
 			imageData = append(imageData, data)
 		}
 	}
-
 	return imageData
 }
 
+func (o *AliOutput) ChoicesToOpenAIImageDataWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, responseFormat string) ([]dto.ImageData, error) {
+	var imageData []dto.ImageData
+	if len(o.Choices) > 0 {
+		for _, choice := range o.Choices {
+			var data dto.ImageData
+			for _, content := range choice.Message.Content {
+				if content.Image != "" {
+					if strings.HasPrefix(content.Image, "http") {
+						var b64Json string
+						if responseFormat == "b64_json" {
+							_, b64, err := service.GetImageFromURLWithRelayInfo(c, info, content.Image)
+							if err != nil {
+								return nil, err
+							}
+							b64Json = b64
+						}
+						data.Url = content.Image
+						data.B64Json = b64Json
+					} else {
+						data.B64Json = content.Image
+					}
+				} else if content.Text != "" {
+					data.RevisedPrompt = content.Text
+				}
+			}
+			imageData = append(imageData, data)
+		}
+	}
+
+	return imageData, nil
+}
+
+// ResultToOpenAIImageDate preserves the historical exported API. Relay code
+// that needs request-scoped timeout propagation must use
+// ResultToOpenAIImageDataWithRelayInfo instead.
 func (o *AliOutput) ResultToOpenAIImageDate(c *gin.Context, responseFormat string) []dto.ImageData {
 	var imageData []dto.ImageData
 	for _, data := range o.Results {
@@ -147,7 +185,6 @@ func (o *AliOutput) ResultToOpenAIImageDate(c *gin.Context, responseFormat strin
 		} else {
 			b64Json = data.B64Image
 		}
-
 		imageData = append(imageData, dto.ImageData{
 			Url:           data.Url,
 			B64Json:       b64Json,
@@ -155,6 +192,29 @@ func (o *AliOutput) ResultToOpenAIImageDate(c *gin.Context, responseFormat strin
 		})
 	}
 	return imageData
+}
+
+func (o *AliOutput) ResultToOpenAIImageDataWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, responseFormat string) ([]dto.ImageData, error) {
+	var imageData []dto.ImageData
+	for _, data := range o.Results {
+		var b64Json string
+		if responseFormat == "b64_json" {
+			_, b64, err := service.GetImageFromURLWithRelayInfo(c, info, data.Url)
+			if err != nil {
+				return nil, err
+			}
+			b64Json = b64
+		} else {
+			b64Json = data.B64Image
+		}
+
+		imageData = append(imageData, dto.ImageData{
+			Url:           data.Url,
+			B64Json:       b64Json,
+			RevisedPrompt: "",
+		})
+	}
+	return imageData, nil
 }
 
 type AliResponse struct {

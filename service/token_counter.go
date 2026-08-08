@@ -267,7 +267,7 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 			cachedData, err := LoadFileSource(c, file.Source, "token_counter")
 			if err != nil {
 				if shouldFetchFiles {
-					return 0, fmt.Errorf("error getting file type: %v", err)
+					return 0, fmt.Errorf("error getting file type: %w", err)
 				}
 				continue
 			}
@@ -281,7 +281,7 @@ func EstimateRequestToken(c *gin.Context, meta *types.TokenCountMeta, info *rela
 			if common.IsOpenAITextModel(model) {
 				token, err := getImageToken(c, file, model, info.IsStream)
 				if err != nil {
-					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %v", i, file.GetIdentifier(), err)
+					return 0, fmt.Errorf("error counting image token, media index[%d], identifier[%s], err: %w", i, file.GetIdentifier(), err)
 				}
 				tkm += token
 			} else {

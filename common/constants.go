@@ -141,12 +141,18 @@ var BatchUpdateInterval int
 // value is used as its compatibility fallback.
 var RelayTimeout int
 
-var RelayIdleConnTimeout int        // unit is second
-var RelayDialTimeout int            // unit is second
-var RelayTLSHandshakeTimeout int    // unit is second
-var RelayResponseHeaderTimeout int  // unit is second
-var RelayExpectContinueTimeout int  // unit is second
-var RelayFirstEventTotalTimeout int // unit is second; shared across all channel attempts
+var RelayIdleConnTimeout int                   // unit is second
+var RelayDialTimeout int                       // unit is second
+var RelayTLSHandshakeTimeout int               // unit is second
+var RelayResponseHeaderTimeout int             // unit is second
+var RelayExpectContinueTimeout int             // unit is second
+var RelayFirstEventTotalTimeout int            // unit is second; shared across all channel attempts
+var RelayNonStreamTimeout int                  // unit is second; total budget for non-stream relay requests
+var RelayStreamHeartbeatInterval time.Duration // post-first-valid-event heartbeat only
+// RelayPreFirstEventHeartbeatInterval is retained for source compatibility.
+// Deprecated: pre-output heartbeats are disabled because they commit an HTTP
+// 200 before the upstream has produced a valid response. Use
+// RelayStreamHeartbeatInterval for post-first-valid-event heartbeats.
 var RelayPreFirstEventHeartbeatInterval time.Duration
 var RelayMaxIdleConns int
 var RelayMaxIdleConnsPerHost int

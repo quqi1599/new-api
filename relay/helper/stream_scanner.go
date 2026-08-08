@@ -3,6 +3,7 @@ package helper
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -125,6 +126,12 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		message = "downstream connection closed before the first valid event"
 		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
 		allowChannelPenalty = false
+	case relaycommon.StreamEndReasonRequestDeadline:
+		statusCode = http.StatusGatewayTimeout
+		errorCode = types.ErrorCodeDoRequestFailed
+		message = "request deadline exceeded before the first valid event"
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
+		allowChannelPenalty = false
 	case relaycommon.StreamEndReasonDone:
 		// An intentionally empty response is valid only with an explicit marker.
 		return nil
@@ -153,6 +160,19 @@ func ShouldFinalizeStream(info *relaycommon.RelayInfo) bool {
 	default:
 		return false
 	}
+}
+
+func setRequestContextStreamEnd(c *gin.Context, info *relaycommon.RelayInfo, err error) {
+	if err == nil || info == nil || info.StreamStatus == nil {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonRequestDeadline, err)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
 }
 
 func NewStreamScanner(reader io.Reader) *bufio.Scanner {
@@ -256,10 +276,10 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
 	generalSettings := operation_setting.GetGeneralSetting()
-	preFirstEventHeartbeatInterval := common.RelayPreFirstEventHeartbeatInterval
+	streamHeartbeatInterval := common.RelayStreamHeartbeatInterval
 	generalPingEnabled := generalSettings.PingIntervalEnabled && !info.DisablePing
-	pingEnabled := generalPingEnabled || (!info.DisablePing && preFirstEventHeartbeatInterval > 0)
-	pingInterval := preFirstEventHeartbeatInterval
+	pingEnabled := generalPingEnabled || (!info.DisablePing && streamHeartbeatInterval > 0)
+	pingInterval := streamHeartbeatInterval
 	if generalPingEnabled {
 		pingInterval = time.Duration(generalSettings.PingIntervalSeconds) * time.Second
 	}
@@ -354,53 +374,6 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 		})
 	}
 
-	// Keep the downstream connection alive while response headers have arrived
-	// but the provider has not produced its first valid protocol event yet. The
-	// pre-response phase uses the same interval in relay/channel; this goroutine
-	// takes over after client.Do returns and exits before the first data write.
-	// After that event, the regular serialized ping goroutine above continues at
-	// this interval even when the dashboard's optional ping switch is disabled.
-	if !info.DisablePing && preFirstEventHeartbeatInterval > 0 {
-		wg.Add(1)
-		gopool.Go(func() {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.LogError(c, fmt.Sprintf("pre-first-event heartbeat panic: %v", r))
-					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonPanic, fmt.Errorf("pre-first-event heartbeat panic: %v", r))
-					stop()
-				}
-				wg.Done()
-			}()
-
-			ticker := time.NewTicker(preFirstEventHeartbeatInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					var err error
-					func() {
-						writeMutex.Lock()
-						defer writeMutex.Unlock()
-						ExtendWriteDeadline(c)
-						err = PingData(c)
-					}()
-					if err != nil {
-						logger.LogDebug(c, "pre-first-event heartbeat stopped: "+err.Error())
-						return
-					}
-				case <-firstEventReady:
-					return
-				case <-ctx.Done():
-					return
-				case <-stopChan:
-					return
-				case <-c.Request.Context().Done():
-					return
-				}
-			}
-		})
-	}
-
 	dataChan := make(chan StreamFrame, 10)
 	scannerEndReason := relaycommon.StreamEndReasonEOF
 	var scannerEndErr error
@@ -485,7 +458,7 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 				case dataChan <- frame:
 				case <-ctx.Done():
 					if err := c.Request.Context().Err(); err != nil {
-						info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+						setRequestContextStreamEnd(c, info, err)
 					}
 					return false
 				case <-stopChan:
@@ -502,7 +475,7 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 				return
 			case <-ctx.Done():
 				if err := c.Request.Context().Err(); err != nil {
-					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+					setRequestContextStreamEnd(c, info, err)
 				}
 				return
 			default:
@@ -577,9 +550,15 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 				continue
 			default:
 			}
+			common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
 			if firstEventSeen.Load() {
+				common.SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, "stream_idle")
+				common.SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, int(streamingTimeout/time.Second))
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
 			} else {
+				firstEventTimeoutSeconds := int((firstEventTimeout + time.Second - 1) / time.Second)
+				common.SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, "first_valid_event")
+				common.SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, firstEventTimeoutSeconds)
 				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonFirstEventTimeout, nil)
 			}
 			stop()
@@ -587,13 +566,13 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 			finished = true
 		case <-stopChan:
 			if err := c.Request.Context().Err(); err != nil {
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+				setRequestContextStreamEnd(c, info, err)
 			}
 			finished = true
 		case <-c.Request.Context().Done():
-			// 客户端断开：立即关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成。
-			common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
-			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			// 调用方断开或 deadline 到期：立即关闭上游 resp.Body，
+			// 解除 scanner 阻塞并让上游停止生成。两者的对外状态码不同。
+			setRequestContextStreamEnd(c, info, c.Request.Context().Err())
 			stop()
 			finished = true
 		}

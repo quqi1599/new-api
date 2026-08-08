@@ -132,6 +132,12 @@ func AppendRelayObservabilityAdminInfo(ctx *gin.Context, relayInfo *relaycommon.
 	if origin := common.GetContextKeyString(ctx, constant.ContextKeyRelayCancelOrigin); origin != "" {
 		adminInfo["cancel_origin"] = origin
 	}
+	if phase := common.GetContextKeyString(ctx, constant.ContextKeyRelayTimeoutPhase); phase != "" {
+		adminInfo["timeout_phase"] = phase
+	}
+	if seconds := common.GetContextKeyInt(ctx, constant.ContextKeyRelayTimeoutSeconds); seconds > 0 {
+		adminInfo["timeout_seconds"] = seconds
+	}
 	outputStarted := common.GetContextKeyBool(ctx, constant.ContextKeyRelayOutputStarted)
 	if ctx.Writer != nil && ctx.Writer.Written() {
 		outputStarted = true

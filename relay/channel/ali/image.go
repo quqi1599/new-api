@@ -198,15 +198,21 @@ func updateTask(ctx context.Context, info *relaycommon.RelayInfo, taskID string)
 	url := fmt.Sprintf("%s/api/v1/tasks/%s", info.ChannelBaseUrl, taskID)
 
 	var aliResponse AliResponse
+	pollCtx := ctx
+	cancel := func() {}
+	if timeoutSeconds := common.GetEnvOrDefault("ALI_TASK_POLL_REQUEST_TIMEOUT_SECONDS", 60); timeoutSeconds > 0 {
+		pollCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	}
+	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(pollCtx, "GET", url, nil)
 	if err != nil {
 		return &aliResponse, err, nil
 	}
 
 	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
 
-	client := &http.Client{}
+	client := service.GetHttpClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		common.SysLog("updateTask client.Do err: " + err.Error())
@@ -215,6 +221,10 @@ func updateTask(ctx context.Context, info *relaycommon.RelayInfo, taskID string)
 	defer resp.Body.Close()
 
 	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		common.SysLog("updateTask read response body err: " + err.Error())
+		return &aliResponse, err, responseBody
+	}
 
 	var response AliResponse
 	err = common.Unmarshal(responseBody, &response)
@@ -238,84 +248,105 @@ func waitForAliTaskPoll(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-func asyncTaskWait(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (*AliResponse, []byte, error) {
-	waitSeconds := 10
-	step := 0
-	maxStep := 20
+var (
+	aliTaskInitialPollDelay         = 5 * time.Second
+	aliTaskPollInterval             = 10 * time.Second
+	aliTaskMaxConsecutivePollErrors = 20
+)
 
+func asyncTaskWait(c *gin.Context, info *relaycommon.RelayInfo, taskID string) (*AliResponse, []byte, error) {
 	var taskResponse AliResponse
 	var responseBody []byte
+	consecutivePollErrors := 0
 
 	ctx := c.Request.Context()
-	if err := waitForAliTaskPoll(ctx, 5*time.Second); err != nil {
-		return nil, nil, err
+	cancel := func() {}
+	if common.RelayNonStreamTimeout > 0 {
+		info.EnsureNonStreamDeadline(time.Time{}, time.Duration(common.RelayNonStreamTimeout)*time.Second)
+		remaining, _ := info.RemainingNonStreamBudget()
+		if remaining <= 0 {
+			return nil, nil, channel.NewNonStreamTotalTimeoutError(c, common.RelayNonStreamTimeout, true)
+		}
+		ctx, cancel = context.WithTimeout(ctx, remaining)
+	}
+	defer cancel()
+	classifyContextError := func(err error) error {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) && c.Request.Context().Err() == nil {
+			return channel.NewNonStreamTotalTimeoutError(c, common.RelayNonStreamTimeout, true)
+		}
+		return channel.ClassifyDoRequestError(c, err)
+	}
+	if err := waitForAliTaskPoll(ctx, aliTaskInitialPollDelay); err != nil {
+		return nil, nil, classifyContextError(err)
 	}
 
 	for {
-		logger.LogDebug(c, fmt.Sprintf("asyncTaskWait step %d/%d, wait %d seconds", step, maxStep, waitSeconds))
-		step++
 		rsp, err, body := updateTask(ctx, info, taskID)
 		responseBody = body
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, responseBody, channel.ClassifyDoRequestError(c, err)
+				return nil, responseBody, classifyContextError(err)
 			}
+			consecutivePollErrors++
 			logger.LogWarn(c, "asyncTaskWait UpdateTask err: "+err.Error())
-			if waitErr := waitForAliTaskPoll(ctx, time.Duration(waitSeconds)*time.Second); waitErr != nil {
-				return nil, responseBody, waitErr
+			if aliTaskMaxConsecutivePollErrors > 0 && consecutivePollErrors >= aliTaskMaxConsecutivePollErrors {
+				return nil, responseBody, types.NewErrorWithStatusCode(
+					fmt.Errorf("Ali async task polling failed after %d consecutive errors: %w", consecutivePollErrors, err),
+					types.ErrorCodeBadResponse,
+					http.StatusBadGateway,
+					types.ErrOptionWithSkipRetry(),
+					types.ErrOptionWithChannelPenalty(),
+				)
+			}
+			if waitErr := waitForAliTaskPoll(ctx, aliTaskPollInterval); waitErr != nil {
+				return nil, responseBody, classifyContextError(waitErr)
 			}
 			continue
 		}
+		consecutivePollErrors = 0
 
 		if rsp.Output.TaskStatus == "" {
 			return &taskResponse, responseBody, nil
 		}
 
 		switch rsp.Output.TaskStatus {
-		case "FAILED":
-			fallthrough
-		case "CANCELED":
-			fallthrough
-		case "SUCCEEDED":
-			fallthrough
-		case "UNKNOWN":
+		case "FAILED", "CANCELED", "SUCCEEDED", "UNKNOWN":
 			return rsp, responseBody, nil
 		}
-		if step >= maxStep {
-			break
-		}
-		if err := waitForAliTaskPoll(ctx, time.Duration(waitSeconds)*time.Second); err != nil {
-			return nil, responseBody, err
+		if err := waitForAliTaskPoll(ctx, aliTaskPollInterval); err != nil {
+			return nil, responseBody, classifyContextError(err)
 		}
 	}
-
-	return nil, nil, fmt.Errorf("aliAsyncTaskWait timeout")
 }
 
-func responseAli2OpenAIImage(c *gin.Context, response *AliResponse, originBody []byte, info *relaycommon.RelayInfo, responseFormat string) *dto.ImageResponse {
+func responseAli2OpenAIImage(c *gin.Context, response *AliResponse, originBody []byte, info *relaycommon.RelayInfo, responseFormat string) (*dto.ImageResponse, error) {
 	imageResponse := dto.ImageResponse{
 		Created: info.StartTime.Unix(),
 	}
 
+	var err error
 	if len(response.Output.Results) > 0 {
-		imageResponse.Data = response.Output.ResultToOpenAIImageDate(c, responseFormat)
+		imageResponse.Data, err = response.Output.ResultToOpenAIImageDataWithRelayInfo(c, info, responseFormat)
 	} else if len(response.Output.Choices) > 0 {
-		imageResponse.Data = response.Output.ChoicesToOpenAIImageDate(c, responseFormat)
+		imageResponse.Data, err = response.Output.ChoicesToOpenAIImageDataWithRelayInfo(c, info, responseFormat)
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	imageResponse.Metadata = originBody
-	return &imageResponse
+	return &imageResponse, nil
 }
 
 func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*types.NewAPIError, *dto.Usage) {
 	responseFormat := c.GetString("response_format")
+	defer service.CloseResponseBodyGracefully(resp)
 
 	var aliTaskResponse AliResponse
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError), nil
 	}
-	service.CloseResponseBodyGracefully(resp)
 	err = common.Unmarshal(responseBody, &aliTaskResponse)
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError), nil
@@ -360,7 +391,10 @@ func aliImageHandler(a *Adaptor, c *gin.Context, resp *http.Response, info *rela
 		logger.LogDebug(c, "ali_async_image_result: "+string(originRespBody))
 	}
 
-	imageResponses := responseAli2OpenAIImage(c, aliResponse, originRespBody, info, responseFormat)
+	imageResponses, err := responseAli2OpenAIImage(c, aliResponse, originRespBody, info, responseFormat)
+	if err != nil {
+		return types.NewError(err, types.ErrorCodeBadResponse), nil
+	}
 	if aliResponse.Usage.ImageCount != 0 {
 		info.PriceData.AddOtherRatio("n", float64(aliResponse.Usage.ImageCount))
 	} else if len(imageResponses.Data) != 0 {

@@ -2,15 +2,16 @@ package aws
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
@@ -52,29 +53,59 @@ func newAwsInvokeContext(c *gin.Context) (context.Context, context.CancelFunc) {
 	return context.WithCancel(parent)
 }
 
-type awsFirstEventBudgetGuard struct {
+type awsInvokeBudgetGuard struct {
 	state atomic.Uint32 // 0=armed, 1=disarmed, 2=expired
 	timer *time.Timer
 }
 
-func startAwsFirstEventBudget(info *relaycommon.RelayInfo, cancel context.CancelFunc) (*awsFirstEventBudgetGuard, *types.NewAPIError) {
+func awsNonStreamTimeoutSeconds() int {
+	return common.RelayNonStreamTimeout
+}
+
+func startAwsInvokeBudget(timeout time.Duration, cancel context.CancelFunc) *awsInvokeBudgetGuard {
+	if timeout <= 0 || cancel == nil {
+		return nil
+	}
+	guard := &awsInvokeBudgetGuard{}
+	guard.timer = time.AfterFunc(timeout, func() {
+		if guard.state.CompareAndSwap(0, 2) {
+			cancel()
+		}
+	})
+	return guard
+}
+
+func startAwsFirstEventBudget(c *gin.Context, info *relaycommon.RelayInfo, cancel context.CancelFunc) (*awsInvokeBudgetGuard, *types.NewAPIError) {
 	remaining, limited := info.RemainingFirstValidEventBudget()
 	if !limited || cancel == nil {
 		return nil, nil
 	}
 	if remaining <= 0 {
-		return nil, awsFirstEventBudgetError(false)
+		return nil, awsFirstEventBudgetError(c, false)
 	}
-	guard := &awsFirstEventBudgetGuard{}
-	guard.timer = time.AfterFunc(remaining, func() {
-		if guard.state.CompareAndSwap(0, 2) {
-			cancel()
-		}
-	})
-	return guard, nil
+	return startAwsInvokeBudget(remaining, cancel), nil
 }
 
-func (g *awsFirstEventBudgetGuard) Stop() bool {
+func startAwsNonStreamBudget(c *gin.Context, info *relaycommon.RelayInfo, cancel context.CancelFunc) (*awsInvokeBudgetGuard, *types.NewAPIError) {
+	timeoutSeconds := awsNonStreamTimeoutSeconds()
+	if timeoutSeconds <= 0 {
+		return nil, nil
+	}
+	totalTimeout := time.Duration(timeoutSeconds) * time.Second
+	timeout := totalTimeout
+	if info != nil {
+		info.EnsureNonStreamDeadline(info.StartTime, totalTimeout)
+		if remaining, limited := info.RemainingNonStreamBudget(); limited {
+			if remaining <= 0 {
+				return nil, awsNonStreamBudgetError(c, info.UpstreamRequestMayHaveBeenAccepted())
+			}
+			timeout = remaining
+		}
+	}
+	return startAwsInvokeBudget(timeout, cancel), nil
+}
+
+func (g *awsInvokeBudgetGuard) Stop() bool {
 	if g == nil {
 		return false
 	}
@@ -85,7 +116,17 @@ func (g *awsFirstEventBudgetGuard) Stop() bool {
 	return g.state.Load() == 2
 }
 
-func awsFirstEventBudgetError(allowChannelPenalty bool) *types.NewAPIError {
+func setAwsTimeoutMetadata(c *gin.Context, origin, phase string, timeoutSeconds int) {
+	if c == nil {
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, origin)
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutPhase, phase)
+	common.SetContextKey(c, constant.ContextKeyRelayTimeoutSeconds, timeoutSeconds)
+}
+
+func awsFirstEventBudgetError(c *gin.Context, allowChannelPenalty bool) *types.NewAPIError {
+	setAwsTimeoutMetadata(c, constant.RelayCancelOriginGatewayDeadline, "first_valid_event_total", common.RelayFirstEventTotalTimeout)
 	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
 	if allowChannelPenalty {
 		options = append(options, types.ErrOptionWithChannelPenalty())
@@ -96,6 +137,49 @@ func awsFirstEventBudgetError(allowChannelPenalty bool) *types.NewAPIError {
 		http.StatusGatewayTimeout,
 		options...,
 	)
+}
+
+func awsNonStreamBudgetError(c *gin.Context, allowChannelPenalty bool) *types.NewAPIError {
+	setAwsTimeoutMetadata(c, constant.RelayCancelOriginGatewayDeadline, "non_stream_total", awsNonStreamTimeoutSeconds())
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if allowChannelPenalty {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("upstream non-stream response exceeded the total timeout"),
+		types.ErrorCodeUpstreamNonStreamTimeout,
+		http.StatusGatewayTimeout,
+		options...,
+	)
+}
+
+func awsResponseHeaderTimeoutError(c *gin.Context) *types.NewAPIError {
+	setAwsTimeoutMetadata(c, constant.RelayCancelOriginUpstreamTimeout, "response_headers", common.RelayResponseHeaderTimeout)
+	return types.NewErrorWithStatusCode(
+		errors.New("upstream response headers timed out before the first valid event"),
+		types.ErrorCodeUpstreamResponseHeaderTimeout,
+		http.StatusGatewayTimeout,
+		types.ErrOptionWithSkipRetry(),
+		types.ErrOptionWithChannelPenalty(),
+	)
+}
+
+func classifyAwsInvokeError(c *gin.Context, err error, budgetExpired bool, nonStream bool) *types.NewAPIError {
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return channel.ClassifyDoRequestError(c, err)
+	}
+	if budgetExpired {
+		if nonStream {
+			return awsNonStreamBudgetError(c, true)
+		}
+		return awsFirstEventBudgetError(c, true)
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		return awsResponseHeaderTimeoutError(c)
+	}
+	statusCode := getAwsErrorStatusCode(err)
+	return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode)
 }
 
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
@@ -278,7 +362,7 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 
 	ctx, cancel := newAwsInvokeContext(c)
 	defer cancel()
-	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	budgetGuard, budgetErr := startAwsNonStreamBudget(c, info, cancel)
 	if budgetErr != nil {
 		return budgetErr, nil
 	}
@@ -287,17 +371,10 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
 	budgetExpired := budgetGuard.Stop()
 	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return channel.ClassifyDoRequestError(c, err), nil
-		}
-		if budgetExpired {
-			return awsFirstEventBudgetError(true), nil
-		}
-		statusCode := getAwsErrorStatusCode(err)
-		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
+		return classifyAwsInvokeError(c, err, budgetExpired, true), nil
 	}
 	if budgetExpired {
-		return awsFirstEventBudgetError(true), nil
+		return awsNonStreamBudgetError(c, true), nil
 	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
@@ -327,7 +404,7 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 
 	ctx, cancel := newAwsInvokeContext(c)
 	defer cancel()
-	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	budgetGuard, budgetErr := startAwsFirstEventBudget(c, info, cancel)
 	if budgetErr != nil {
 		return budgetErr, nil
 	}
@@ -336,19 +413,12 @@ func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (
 	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
 	budgetExpired := budgetGuard.Stop()
 	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return channel.ClassifyDoRequestError(c, err), nil
-		}
-		if budgetExpired {
-			return awsFirstEventBudgetError(true), nil
-		}
-		statusCode := getAwsErrorStatusCode(err)
-		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode), nil
+		return classifyAwsInvokeError(c, err, budgetExpired, false), nil
 	}
 	stream := awsResp.GetStream()
 	if budgetExpired {
 		_ = stream.Close()
-		return awsFirstEventBudgetError(true), nil
+		return awsFirstEventBudgetError(c, true), nil
 	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
@@ -471,9 +541,16 @@ streamLoop:
 	}
 
 	if requestErr := c.Request.Context().Err(); requestErr != nil {
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+		if errors.Is(requestErr, context.DeadlineExceeded) {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonRequestDeadline, requestErr)
+		} else {
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+		}
 		// Preserve partial usage for settlement without manufacturing a final chunk.
 		claude.FinalizeClaudeUsage(c, info, claudeInfo)
+		if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
+			return preOutputErr, claudeInfo.Usage
+		}
 		return nil, claudeInfo.Usage
 	}
 	if streamErr := stream.Err(); streamErr != nil {
@@ -503,7 +580,7 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 
 	ctx, cancel := newAwsInvokeContext(c)
 	defer cancel()
-	budgetGuard, budgetErr := startAwsFirstEventBudget(info, cancel)
+	budgetGuard, budgetErr := startAwsNonStreamBudget(c, info, cancel)
 	if budgetErr != nil {
 		return budgetErr, nil
 	}
@@ -512,17 +589,10 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
 	budgetExpired := budgetGuard.Stop()
 	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return channel.ClassifyDoRequestError(c, err), nil
-		}
-		if budgetExpired {
-			return awsFirstEventBudgetError(true), nil
-		}
-		statusCode := getAwsErrorStatusCode(err)
-		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
+		return classifyAwsInvokeError(c, err, budgetExpired, true), nil
 	}
 	if budgetExpired {
-		return awsFirstEventBudgetError(true), nil
+		return awsNonStreamBudgetError(c, true), nil
 	}
 
 	// 解析Nova响应
@@ -541,7 +611,7 @@ func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) 
 		} `json:"usage"`
 	}
 
-	if err := json.Unmarshal(awsResp.Body, &novaResp); err != nil {
+	if err := common.Unmarshal(awsResp.Body, &novaResp); err != nil {
 		return types.NewError(errors.Wrap(err, "unmarshal nova response"), types.ErrorCodeBadResponseBody), nil
 	}
 

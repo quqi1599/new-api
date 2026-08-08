@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,8 @@ import (
 // https://cloud.baidu.com/doc/WENXINWORKSHOP/s/flfmc9do2
 
 var baiduTokenStore sync.Map
+
+var baiduOAuthTokenURL = "https://aip.baidubce.com/oauth/2.0/token"
 
 func requestOpenAI2Baidu(request dto.GeneralOpenAIRequest) *BaiduChatRequest {
 	baiduRequest := BaiduChatRequest{
@@ -154,11 +157,11 @@ func baiduStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.
 
 func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var baiduResponse BaiduChatResponse
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
-	service.CloseResponseBodyGracefully(resp)
 	err = json.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
@@ -179,11 +182,11 @@ func baiduHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respon
 
 func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*types.NewAPIError, *dto.Usage) {
 	var baiduResponse BaiduEmbeddingResponse
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
 	}
-	service.CloseResponseBodyGracefully(resp)
 	err = json.Unmarshal(responseBody, &baiduResponse)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody), nil
@@ -202,20 +205,24 @@ func baiduEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 	return nil, &fullTextResponse.Usage
 }
 
-func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
+func getBaiduAccessToken(ctx context.Context, info *relaycommon.RelayInfo) (string, error) {
+	if info == nil {
+		return "", errors.New("getBaiduAccessToken relay info is nil")
+	}
+	apiKey := info.ApiKey
 	if val, ok := baiduTokenStore.Load(apiKey); ok {
 		var accessToken BaiduAccessToken
 		if accessToken, ok = val.(BaiduAccessToken); ok {
 			// soon this will expire
 			if time.Now().Add(time.Hour).After(accessToken.ExpiresAt) {
 				go func() {
-					_, _ = getBaiduAccessTokenHelper(context.Background(), apiKey)
+					_, _ = getBaiduAccessTokenHelper(context.Background(), apiKey, nil)
 				}()
 			}
 			return accessToken.AccessToken, nil
 		}
 	}
-	accessToken, err := getBaiduAccessTokenHelper(ctx, apiKey)
+	accessToken, err := getBaiduAccessTokenHelper(ctx, apiKey, info)
 	if err != nil {
 		return "", err
 	}
@@ -225,34 +232,54 @@ func getBaiduAccessToken(ctx context.Context, apiKey string) (string, error) {
 	return (*accessToken).AccessToken, nil
 }
 
-func getBaiduAccessTokenHelper(ctx context.Context, apiKey string) (*BaiduAccessToken, error) {
+func getBaiduAccessTokenHelper(ctx context.Context, apiKey string, info *relaycommon.RelayInfo) (*BaiduAccessToken, error) {
 	parts := strings.Split(apiKey, "|")
 	if len(parts) != 2 {
 		return nil, errors.New("invalid baidu apikey")
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=%s&client_secret=%s",
-		parts[0], parts[1]), nil)
+	preflight := service.NewRelayPreflight(nil, ctx, info, false)
+	defer preflight.Close()
+	tokenURL, err := url.Parse(baiduOAuthTokenURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse baidu access token URL failed: %w", err)
+	}
+	query := tokenURL.Query()
+	query.Set("grant_type", "client_credentials")
+	query.Set("client_id", parts[0])
+	query.Set("client_secret", parts[1])
+	tokenURL.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(preflight.Context(), http.MethodPost, tokenURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("Accept", "application/json")
-	res, err := service.GetHttpClient().Do(req)
+	client := service.GetHttpClient()
+	if info != nil {
+		client, err = service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("new proxy http client failed: %w", err)
+		}
+	}
+	res, err := preflight.Do(client, req)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 
 	var accessToken BaiduAccessToken
-	err = json.NewDecoder(res.Body).Decode(&accessToken)
+	err = common.DecodeJson(res.Body, &accessToken)
 	if err != nil {
-		return nil, err
+		return nil, preflight.ClassifyError(fmt.Errorf("decode baidu access token response failed: %w", err))
 	}
 	if accessToken.Error != "" {
-		return nil, errors.New(accessToken.Error + ": " + accessToken.ErrorDescription)
+		return nil, preflight.ClassifyError(errors.New(accessToken.Error + ": " + accessToken.ErrorDescription))
+	}
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		return nil, preflight.ClassifyError(fmt.Errorf("baidu access token request failed with status %d", res.StatusCode))
 	}
 	if accessToken.AccessToken == "" {
-		return nil, errors.New("getBaiduAccessTokenHelper get empty access token")
+		return nil, preflight.ClassifyError(errors.New("getBaiduAccessTokenHelper get empty access token"))
 	}
 	accessToken.ExpiresAt = time.Now().Add(time.Duration(accessToken.ExpiresIn) * time.Second)
 	baiduTokenStore.Store(apiKey, accessToken)

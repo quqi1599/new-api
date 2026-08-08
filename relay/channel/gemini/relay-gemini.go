@@ -1453,11 +1453,11 @@ func GeminiChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *
 }
 
 func GeminiChatHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	service.CloseResponseBodyGracefully(resp)
 	if common.DebugEnabled {
 		println(string(responseBody))
 	}
@@ -1575,12 +1575,11 @@ func GeminiEmbeddingHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *h
 }
 
 func GeminiImageHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
 	responseBody, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
 		return nil, types.NewOpenAIError(readErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
-	_ = resp.Body.Close()
-
 	var geminiResponse dto.GeminiImageResponse
 	if jsonErr := common.Unmarshal(responseBody, &geminiResponse); jsonErr != nil {
 		return nil, types.NewOpenAIError(jsonErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
@@ -1633,6 +1632,11 @@ type GeminiModelsResponse struct {
 	NextPageToken string            `json:"nextPageToken"`
 }
 
+func readGeminiResponseBody(response *http.Response) ([]byte, error) {
+	defer service.CloseResponseBodyGracefully(response)
+	return io.ReadAll(response.Body)
+}
+
 func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 	client, err := service.GetHttpClientWithProxy(proxyURL)
 	if err != nil {
@@ -1664,18 +1668,13 @@ func FetchGeminiModels(baseURL, apiKey, proxyURL string) ([]string, error) {
 			return nil, fmt.Errorf("请求失败: %v", err)
 		}
 
+		body, readErr := readGeminiResponseBody(response)
+		cancel()
 		if response.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(response.Body)
-			response.Body.Close()
-			cancel()
 			return nil, fmt.Errorf("服务器返回错误 %d: %s", response.StatusCode, string(body))
 		}
-
-		body, err := io.ReadAll(response.Body)
-		response.Body.Close()
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("读取响应失败: %v", err)
+		if readErr != nil {
+			return nil, fmt.Errorf("读取响应失败: %v", readErr)
 		}
 
 		var modelsResponse GeminiModelsResponse

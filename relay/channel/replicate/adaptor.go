@@ -179,12 +179,12 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	if resp == nil {
 		return nil, types.NewError(errors.New("replicate adaptor: empty response"), types.ErrorCodeBadResponse)
 	}
+	defer service.CloseResponseBodyGracefully(resp)
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeReadResponseBodyFailed)
 	}
-	_ = resp.Body.Close()
 
 	var prediction PredictionResponse
 	if err := common.Unmarshal(responseBody, &prediction); err != nil {
@@ -255,7 +255,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 	}
 
 	if wantsBase64 {
-		converted, convErr := downloadImagesToBase64(urls)
+		converted, convErr := downloadImagesToBase64(c, info, urls)
 		if convErr != nil {
 			return nil, types.NewError(convErr, types.ErrorCodeBadResponse)
 		}
@@ -299,13 +299,13 @@ func (a *Adaptor) GetChannelName() string {
 	return ChannelName
 }
 
-func downloadImagesToBase64(urls []string) ([]string, error) {
+func downloadImagesToBase64(c *gin.Context, info *relaycommon.RelayInfo, urls []string) ([]string, error) {
 	results := make([]string, 0, len(urls))
 	for _, url := range urls {
 		if strings.TrimSpace(url) == "" {
 			continue
 		}
-		_, data, err := service.GetImageFromUrl(url)
+		_, data, err := service.GetImageFromURLWithRelayInfo(c, info, url)
 		if err != nil {
 			return nil, fmt.Errorf("replicate adaptor: failed to download image from %s: %w", url, err)
 		}
@@ -463,7 +463,9 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 		return "", fmt.Errorf("replicate adaptor: copy image content failed: %w", err)
 	}
 	formContentType := writer.FormDataContentType()
-	writer.Close()
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("replicate adaptor: close upload form failed: %w", err)
+	}
 
 	baseURL := info.ChannelBaseUrl
 	if baseURL == "" {
@@ -471,36 +473,40 @@ func uploadFileFromForm(c *gin.Context, info *relaycommon.RelayInfo, fieldCandid
 	}
 	uploadURL := relaycommon.GetFullRequestURL(baseURL, "/v1/files", info.ChannelType)
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, uploadURL, &body)
+	preflight := service.NewRelayPreflight(c, c.Request.Context(), info, true)
+	defer preflight.Close()
+
+	req, err := http.NewRequestWithContext(preflight.Context(), http.MethodPost, uploadURL, &body)
 	if err != nil {
 		return "", fmt.Errorf("replicate adaptor: create upload request failed: %w", err)
 	}
 	req.Header.Set("Content-Type", formContentType)
 	req.Header.Set("Authorization", "Bearer "+info.ApiKey)
 
-	resp, err := service.GetHttpClient().Do(req)
+	client, err := service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return "", channel.ClassifyDoRequestError(c, err)
-		}
-		return "", fmt.Errorf("replicate adaptor: upload image failed: %w", err)
+		return "", fmt.Errorf("replicate adaptor: create upload client failed: %w", err)
+	}
+	resp, err := preflight.Do(client, req)
+	if err != nil {
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("replicate adaptor: read upload response failed: %w", err)
+		return "", preflight.ClassifyError(fmt.Errorf("replicate adaptor: read upload response failed: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("replicate adaptor: upload image failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", preflight.ClassifyError(fmt.Errorf("replicate adaptor: upload image failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody))))
 	}
 
 	var uploadResp FileUploadResponse
 	if err := common.Unmarshal(respBody, &uploadResp); err != nil {
-		return "", fmt.Errorf("replicate adaptor: decode upload response failed: %w", err)
+		return "", preflight.ClassifyError(fmt.Errorf("replicate adaptor: decode upload response failed: %w", err))
 	}
 	if uploadResp.Urls.Get == "" {
-		return "", errors.New("replicate adaptor: upload response missing url")
+		return "", preflight.ClassifyError(errors.New("replicate adaptor: upload response missing url"))
 	}
 	return uploadResp.Urls.Get, nil
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting/system_setting"
@@ -302,6 +303,24 @@ func TestProtectedFetchRoundTripperNoProxyUsesProtectedDialer(t *testing.T) {
 }
 
 func TestProtectedFetchRoundTripperReusesTransportPerProxy(t *testing.T) {
+	oldRelayTimeout := common.RelayTimeout
+	oldNonStreamTimeout := common.RelayNonStreamTimeout
+	oldTLSHandshakeTimeout := common.RelayTLSHandshakeTimeout
+	oldResponseHeaderTimeout := common.RelayResponseHeaderTimeout
+	oldExpectContinueTimeout := common.RelayExpectContinueTimeout
+	common.RelayTimeout = 0
+	common.RelayNonStreamTimeout = 540
+	common.RelayTLSHandshakeTimeout = 10
+	common.RelayResponseHeaderTimeout = 520
+	common.RelayExpectContinueTimeout = 1
+	t.Cleanup(func() {
+		common.RelayTimeout = oldRelayTimeout
+		common.RelayNonStreamTimeout = oldNonStreamTimeout
+		common.RelayTLSHandshakeTimeout = oldTLSHandshakeTimeout
+		common.RelayResponseHeaderTimeout = oldResponseHeaderTimeout
+		common.RelayExpectContinueTimeout = oldExpectContinueTimeout
+	})
+
 	client := newProtectedFetchHTTPClientWithDialer(nil, nil, nil)
 	roundTripper, ok := client.Transport.(*ssrfProtectedRoundTripper)
 	require.True(t, ok)
@@ -314,4 +333,8 @@ func TestProtectedFetchRoundTripperReusesTransportPerProxy(t *testing.T) {
 	require.NotSame(t, direct, proxied)
 	require.True(t, direct.ForceAttemptHTTP2)
 	require.False(t, direct.DisableKeepAlives)
+	require.Equal(t, 540*time.Second, client.Timeout)
+	require.Equal(t, 10*time.Second, direct.TLSHandshakeTimeout)
+	require.Equal(t, 520*time.Second, direct.ResponseHeaderTimeout)
+	require.Equal(t, time.Second, direct.ExpectContinueTimeout)
 }

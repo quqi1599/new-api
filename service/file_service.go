@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -16,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -45,6 +47,13 @@ func getBase64ContextCacheKey(data string, mimeType string) string {
 // LoadFileSource 加载文件源数据
 // 这是统一的入口，会自动处理缓存和不同的来源类型
 func LoadFileSource(c *gin.Context, source types.FileSource, reason ...string) (*types.CachedFileData, error) {
+	return LoadFileSourceWithRelayInfo(c, nil, source, reason...)
+}
+
+// LoadFileSourceWithRelayInfo loads a file while sharing the relay's absolute
+// first-event/non-stream deadline. Passing nil info still derives that deadline
+// from the inbound Gin request start time.
+func LoadFileSourceWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, source types.FileSource, reason ...string) (*types.CachedFileData, error) {
 	if source == nil {
 		return nil, fmt.Errorf("file source is nil")
 	}
@@ -89,7 +98,7 @@ func LoadFileSource(c *gin.Context, source types.FileSource, reason ...string) (
 				return data, nil
 			}
 		}
-		cachedData, err = loadFromURL(c, s.URL, reason...)
+		cachedData, err = loadFromURL(c, info, s.URL, reason...)
 	case *types.Base64Source:
 		if c != nil {
 			contextKey = getBase64ContextCacheKey(s.Base64Data, s.MimeType)
@@ -154,14 +163,14 @@ func CleanupFileSources(c *gin.Context) {
 }
 
 // loadFromURL 从 URL 加载文件
-func loadFromURL(c *gin.Context, url string, reason ...string) (*types.CachedFileData, error) {
+func loadFromURL(c *gin.Context, info *relaycommon.RelayInfo, url string, reason ...string) (*types.CachedFileData, error) {
 	// 下载文件
 	var maxFileSize = constant.MaxFileDownloadMB * 1024 * 1024
 
 	if common.DebugEnabled {
 		logger.LogDebug(c, "loadFromURL: initiating download")
 	}
-	resp, err := DoDownloadRequest(url, reason...)
+	resp, err := DoDownloadRequestWithRelayInfo(c, info, url, reason...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to download file from %s: %w", url, err)
 	}
@@ -385,7 +394,11 @@ func loadFromBase64(base64String string, providedMimeType string) (*types.Cached
 
 // GetImageConfig 获取图片配置
 func GetImageConfig(c *gin.Context, source types.FileSource) (image.Config, string, error) {
-	cachedData, err := LoadFileSource(c, source, "get_image_config")
+	return GetImageConfigWithRelayInfo(c, nil, source)
+}
+
+func GetImageConfigWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, source types.FileSource) (image.Config, string, error) {
+	cachedData, err := LoadFileSourceWithRelayInfo(c, info, source, "get_image_config")
 	if err != nil {
 		return image.Config{}, "", err
 	}
@@ -416,7 +429,11 @@ func GetImageConfig(c *gin.Context, source types.FileSource) (image.Config, stri
 
 // GetBase64Data 获取 base64 编码的数据
 func GetBase64Data(c *gin.Context, source types.FileSource, reason ...string) (string, string, error) {
-	cachedData, err := LoadFileSource(c, source, reason...)
+	return GetBase64DataWithRelayInfo(c, nil, source, reason...)
+}
+
+func GetBase64DataWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, source types.FileSource, reason ...string) (string, string, error) {
+	cachedData, err := LoadFileSourceWithRelayInfo(c, info, source, reason...)
 	if err != nil {
 		return "", "", err
 	}
@@ -429,18 +446,26 @@ func GetBase64Data(c *gin.Context, source types.FileSource, reason ...string) (s
 
 // GetMimeType 获取文件的 MIME 类型
 func GetMimeType(c *gin.Context, source types.FileSource) (string, error) {
+	return GetMimeTypeWithRelayInfo(c, nil, source)
+}
+
+func GetMimeTypeWithRelayInfo(c *gin.Context, info *relaycommon.RelayInfo, source types.FileSource) (string, error) {
 	if source.HasCache() {
 		return source.GetCache().MimeType, nil
 	}
 
 	if urlSource, ok := source.(*types.URLSource); ok {
-		mimeType, err := GetFileTypeFromUrl(c, urlSource.URL, "get_mime_type")
+		mimeType, err := GetFileTypeFromURLWithRelayInfo(c, info, urlSource.URL, "get_mime_type")
 		if err == nil && mimeType != "" && mimeType != "application/octet-stream" {
 			return mimeType, nil
 		}
+		var apiErr *types.NewAPIError
+		if errors.As(err, &apiErr) {
+			return "", apiErr
+		}
 	}
 
-	cachedData, err := LoadFileSource(c, source, "get_mime_type")
+	cachedData, err := LoadFileSourceWithRelayInfo(c, info, source, "get_mime_type")
 	if err != nil {
 		return "", err
 	}

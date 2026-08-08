@@ -147,16 +147,19 @@ func getContentTypeByEncoding(encoding string) string {
 }
 
 func handleTTSResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, encoding string) (usage any, err *types.NewAPIError) {
+	defer resp.Body.Close()
 	body, readErr := io.ReadAll(resp.Body)
 	if readErr != nil {
+		var apiErr *types.NewAPIError
+		if errors.As(readErr, &apiErr) {
+			return nil, apiErr
+		}
 		return nil, types.NewErrorWithStatusCode(
-			errors.New("failed to read volcengine response"),
+			fmt.Errorf("failed to read volcengine response: %w", readErr),
 			types.ErrorCodeReadResponseBodyFailed,
 			http.StatusInternalServerError,
 		)
 	}
-	defer resp.Body.Close()
-
 	var volcResp VolcengineTTSResponse
 	if unmarshalErr := common.Unmarshal(body, &volcResp); unmarshalErr != nil {
 		return nil, types.NewErrorWithStatusCode(
@@ -217,10 +220,45 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 	header := http.Header{}
 	header.Set("Authorization", fmt.Sprintf("Bearer;%s", token))
 
-	conn, resp, dialErr := channel.DialWebSocketContext(c.Request.Context(), requestURL, header)
+	requestCtx := c.Request.Context()
+	handshakeCtx := requestCtx
+	cancelHandshake := func() {}
+	if common.RelayFirstEventTotalTimeout > 0 {
+		info.EnsureFirstValidEventDeadline(info.StartTime, time.Duration(common.RelayFirstEventTotalTimeout)*time.Second)
+		remaining, _ := info.RemainingFirstValidEventBudget()
+		if remaining <= 0 {
+			return nil, channel.NewFirstValidEventTotalTimeoutError(c, false)
+		}
+		handshakeCtx, cancelHandshake = context.WithTimeout(requestCtx, remaining)
+	}
+	conn, resp, dialErr := channel.DialWebSocketContextWithHandshakeContext(requestCtx, handshakeCtx, requestURL, header)
+	firstEventBudgetExpired := false
+	if requestCtx.Err() == nil {
+		if errors.Is(handshakeCtx.Err(), context.DeadlineExceeded) {
+			firstEventBudgetExpired = true
+		} else if remaining, limited := info.RemainingFirstValidEventBudget(); limited && remaining <= 5*time.Millisecond {
+			// The socket poll deadline and context timer can wake together before
+			// Context.Err publishes DeadlineExceeded. The absolute RelayInfo
+			// deadline is the authoritative request-wide budget.
+			firstEventBudgetExpired = true
+		}
+	}
+	cancelHandshake()
+	if firstEventBudgetExpired {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		return nil, channel.NewFirstValidEventTotalTimeoutError(c, false)
+	}
 	if dialErr != nil {
-		if c.Request.Context().Err() != nil {
-			return nil, channel.ClassifyDoRequestError(c, dialErr)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if classifiedErr := channel.ClassifyWebSocketHandshakeError(c, dialErr); classifiedErr != nil {
+			return nil, classifiedErr
 		}
 		if resp != nil {
 			return nil, types.NewErrorWithStatusCode(
@@ -287,8 +325,12 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 		}
 		msg, recvErr := ReceiveMessage(conn)
 		if recvErr != nil {
-			if c.Request.Context().Err() != nil {
-				info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+			if requestErr := requestCtx.Err(); requestErr != nil {
+				if errors.Is(requestErr, context.DeadlineExceeded) {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonRequestDeadline, requestErr)
+				} else {
+					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, requestErr)
+				}
 				return nil, channel.ClassifyDoRequestError(c, recvErr)
 			}
 			var netErr net.Error
@@ -318,11 +360,14 @@ func handleTTSWebSocketResponse(c *gin.Context, requestURL string, volcRequest V
 		case MsgTypeFrontEndResultServer:
 			continue
 		case MsgTypeAudioOnlyServer:
-			if firstAudio {
-				firstAudio = false
-				info.SetFirstResponseTime()
+			validAudioEvent := len(msg.Payload) > 0 || msg.Sequence < 0
+			if validAudioEvent {
+				if firstAudio {
+					firstAudio = false
+					info.SetFirstResponseTime()
+				}
+				info.ReceivedResponseCount++
 			}
-			info.ReceivedResponseCount++
 			if len(msg.Payload) > 0 {
 				helper.ExtendWriteDeadline(c)
 				if _, writeErr := c.Writer.Write(msg.Payload); writeErr != nil {

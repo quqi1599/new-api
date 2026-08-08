@@ -25,6 +25,41 @@ func TestRelayInfoWithoutSharedDeadlineKeepsPhaseTimeout(t *testing.T) {
 	require.Equal(t, 3*time.Second, info.BoundFirstValidEventWait(3*time.Second))
 }
 
+func TestRelayInfoEnsureFirstEventDeadlineUsesOriginalStartAndDoesNotReplaceIt(t *testing.T) {
+	startTime := time.Now().Add(-250 * time.Millisecond)
+	info := &RelayInfo{StartTime: startTime}
+	info.EnsureFirstValidEventDeadline(time.Time{}, time.Second)
+
+	remaining, limited := info.RemainingFirstValidEventBudget()
+	require.True(t, limited)
+	require.Positive(t, remaining)
+	require.Less(t, remaining, 800*time.Millisecond,
+		"dynamic stream budget must include time already spent waiting for response headers")
+
+	info.EnsureFirstValidEventDeadline(time.Now(), 10*time.Second)
+	remainingAfterSecondEnsure, limited := info.RemainingFirstValidEventBudget()
+	require.True(t, limited)
+	require.LessOrEqual(t, remainingAfterSecondEnsure, remaining,
+		"a retry or late stream detection must not reset the request-wide deadline")
+}
+
+func TestRelayInfoNonStreamDeadlineUsesOriginalStartAndDoesNotReset(t *testing.T) {
+	startTime := time.Now().Add(-250 * time.Millisecond)
+	info := &RelayInfo{StartTime: startTime}
+	info.EnsureNonStreamDeadline(time.Time{}, time.Second)
+
+	remaining, limited := info.RemainingNonStreamBudget()
+	require.True(t, limited)
+	require.Positive(t, remaining)
+	require.Less(t, remaining, 800*time.Millisecond)
+
+	info.EnsureNonStreamDeadline(time.Now(), 10*time.Second)
+	remainingAfterRetry, limited := info.RemainingNonStreamBudget()
+	require.True(t, limited)
+	require.LessOrEqual(t, remainingAfterRetry, remaining,
+		"a preflight or channel retry must not reset the non-stream request deadline")
+}
+
 func TestRelayInfoGetFinalRequestRelayFormatPrefersExplicitFinal(t *testing.T) {
 	info := &RelayInfo{
 		RelayFormat:             types.RelayFormatOpenAI,

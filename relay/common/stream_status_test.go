@@ -45,6 +45,7 @@ func TestStreamStatus_SetEndReason_Concurrent(t *testing.T) {
 		StreamEndReasonDone,
 		StreamEndReasonTimeout,
 		StreamEndReasonClientGone,
+		StreamEndReasonRequestDeadline,
 		StreamEndReasonScannerErr,
 		StreamEndReasonHandlerStop,
 		StreamEndReasonEOF,
@@ -155,6 +156,7 @@ func TestStreamStatus_IsNormalEnd(t *testing.T) {
 		{StreamEndReasonFirstEventTimeout, false},
 		{StreamEndReasonTimeout, false},
 		{StreamEndReasonClientGone, false},
+		{StreamEndReasonRequestDeadline, false},
 		{StreamEndReasonScannerErr, false},
 		{StreamEndReasonPanic, false},
 		{StreamEndReasonPingFail, false},
@@ -175,6 +177,7 @@ func TestStreamStatus_IsAbortLikeEnd(t *testing.T) {
 		abortLike bool
 	}{
 		{StreamEndReasonClientGone, true},
+		{StreamEndReasonRequestDeadline, true},
 		{StreamEndReasonFirstEventTimeout, true},
 		{StreamEndReasonTimeout, true},
 		{StreamEndReasonHandlerStop, true},

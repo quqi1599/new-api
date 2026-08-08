@@ -84,6 +84,7 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+	defer CloseResponseBodyGracefully(resp)
 	newApiErr = types.InitOpenAIError(
 		types.ErrorCodeBadResponseStatusCode,
 		resp.StatusCode,
@@ -92,9 +93,16 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return
+		var typedErr *types.NewAPIError
+		if errors.As(err, &typedErr) {
+			return typedErr
+		}
+		return types.NewErrorWithStatusCode(
+			fmt.Errorf("failed to read upstream error response body: %w", err),
+			types.ErrorCodeReadResponseBodyFailed,
+			http.StatusBadGateway,
+		)
 	}
-	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
@@ -206,6 +214,10 @@ func TaskErrorWrapperLocal(err error, code string, statusCode int) *dto.TaskErro
 }
 
 func TaskErrorWrapper(err error, code string, statusCode int) *dto.TaskError {
+	var apiErr *types.NewAPIError
+	if errors.As(err, &apiErr) {
+		return TaskErrorFromAPIError(apiErr)
+	}
 	text := err.Error()
 	lowerText := strings.ToLower(text)
 	if strings.Contains(lowerText, "post") || strings.Contains(lowerText, "dial") || strings.Contains(lowerText, "http") {
@@ -233,6 +245,7 @@ func TaskErrorFromAPIError(apiErr *types.NewAPIError) *dto.TaskError {
 		Code:       string(apiErr.GetErrorCode()),
 		Message:    apiErr.Err.Error(),
 		StatusCode: apiErr.StatusCode,
-		Error:      apiErr.Err,
+		SkipRetry:  types.IsSkipRetryError(apiErr),
+		Error:      apiErr,
 	}
 }

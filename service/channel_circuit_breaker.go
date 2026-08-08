@@ -386,6 +386,11 @@ func ShouldCountChannelCircuitFailure(relayErr *types.NewAPIError) bool {
 	}
 	switch relayErr.GetErrorCode() {
 	case types.ErrorCodeDoRequestFailed,
+		types.ErrorCodeUpstreamConnectionTimeout,
+		types.ErrorCodeUpstreamTLSHandshakeTimeout,
+		types.ErrorCodeUpstreamRequestWriteTimeout,
+		types.ErrorCodeUpstreamResponseHeaderTimeout,
+		types.ErrorCodeUpstreamNonStreamTimeout,
 		types.ErrorCodeUpstreamFirstEventTimeout,
 		types.ErrorCodeUpstreamStreamIncomplete,
 		types.ErrorCodeEmptyResponse,

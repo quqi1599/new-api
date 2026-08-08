@@ -2,12 +2,14 @@ package channel
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -19,7 +21,6 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
-	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
@@ -382,6 +383,7 @@ func DoFormRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBod
 }
 
 func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*websocket.Conn, error) {
+	common2.ResetRelayAttemptTimeoutContext(c)
 	fullRequestURL, err := getRequestURL(a, c, info)
 	if err != nil {
 		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
@@ -405,12 +407,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	common2.ReleaseBodyAdmission(c)
-	targetConn, _, err := DialWebSocketContext(c.Request.Context(), fullRequestURL, targetHeader)
+	targetConn, targetResp, err := DialWebSocketContext(c.Request.Context(), fullRequestURL, targetHeader)
 	if err != nil {
-		if c.Request.Context().Err() != nil {
-			return nil, ClassifyDoRequestError(c, err)
-		}
-		return nil, fmt.Errorf("dial failed to %s: %w", fullRequestURL, err)
+		return nil, handleWebSocketHandshakeFailure(c, fullRequestURL, targetResp, err)
 	}
 	// send request body
 	//all, err := io.ReadAll(requestBody)
@@ -418,18 +417,172 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	return targetConn, nil
 }
 
+func handleWebSocketHandshakeFailure(c *gin.Context, requestURL string, resp *http.Response, err error) error {
+	service.CloseResponseBodyGracefully(resp)
+	if classifiedErr := ClassifyWebSocketHandshakeError(c, err); classifiedErr != nil {
+		return classifiedErr
+	}
+	return fmt.Errorf("dial failed to %s: %w", requestURL, err)
+}
+
 // DialWebSocketContext binds an established socket to the original request
 // context in addition to using that context for DNS, TCP, and the HTTP upgrade.
 // The close watcher must use the original ctx rather than NetDialContext's
 // argument: gorilla derives a handshake-only child context and cancels it after
 // a successful upgrade, which would immediately close the healthy websocket.
-func DialWebSocketContext(ctx context.Context, requestURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+type relayWebSocketPhaseTimeoutError struct {
+	phase          string
+	timeoutSeconds int
+	err            error
+}
+
+func (e *relayWebSocketPhaseTimeoutError) Error() string { return e.err.Error() }
+func (e *relayWebSocketPhaseTimeoutError) Unwrap() error { return e.err }
+func (e *relayWebSocketPhaseTimeoutError) Timeout() bool { return true }
+func (e *relayWebSocketPhaseTimeoutError) Temporary() bool {
+	return true
+}
+
+func phaseTimeoutSeconds(timeout time.Duration) int {
+	if timeout <= 0 {
+		return 0
+	}
+	return int((timeout + time.Second - 1) / time.Second)
+}
+
+func withRelayWebSocketDialTimeout(baseDialContext func(context.Context, string, string) (net.Conn, error), timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
+	if timeout <= 0 {
+		return baseDialContext
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		conn, err := baseDialContext(dialCtx, network, address)
+		if err != nil && errors.Is(dialCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, &relayWebSocketPhaseTimeoutError{
+				phase:          "connect",
+				timeoutSeconds: phaseTimeoutSeconds(timeout),
+				err:            err,
+			}
+		}
+		return conn, err
+	}
+}
+
+func withRelayWebSocketTLSHandshakeTimeout(
+	baseDialContext func(context.Context, string, string) (net.Conn, error),
+	tlsConfig *tls.Config,
+	timeout time.Duration,
+) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		rawConn, err := baseDialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		config := &tls.Config{}
+		if tlsConfig != nil {
+			config = tlsConfig.Clone()
+		}
+		if config.ServerName == "" {
+			host, _, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				host = address
+			}
+			config.ServerName = strings.Trim(host, "[]")
+		}
+		tlsConn := tls.Client(rawConn, config)
+		handshakeCtx := ctx
+		cancel := func() {}
+		if timeout > 0 {
+			handshakeCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		defer cancel()
+		if err = tlsConn.HandshakeContext(handshakeCtx); err != nil {
+			_ = rawConn.Close()
+			if errors.Is(handshakeCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil, &relayWebSocketPhaseTimeoutError{
+					phase:          "tls_handshake",
+					timeoutSeconds: phaseTimeoutSeconds(timeout),
+					err:            err,
+				}
+			}
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+}
+
+func newRelayWebSocketDialer() websocket.Dialer {
 	websocketDialer := *websocket.DefaultDialer
+	// gorilla's DefaultDialer carries a hidden 45s handshake timeout. Use the
+	// same explicit response-header phase budget as HTTP relay requests so a
+	// WebSocket upgrade does not fail early with an unrelated 500. A configured
+	// value of zero deliberately disables the local handshake deadline.
+	websocketDialer.HandshakeTimeout = time.Duration(common2.RelayResponseHeaderTimeout) * time.Second
 	baseDialContext := websocketDialer.NetDialContext
 	if baseDialContext == nil {
-		baseDialContext = (&net.Dialer{}).DialContext
+		baseDialContext = (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext
 	}
-	requestContext := ctx
+	websocketDialer.NetDialContext = withRelayWebSocketDialTimeout(
+		baseDialContext,
+		time.Duration(common2.RelayDialTimeout)*time.Second,
+	)
+	if common2.TLSInsecureSkipVerify {
+		websocketDialer.TLSClientConfig = common2.InsecureTLSConfig.Clone()
+	}
+	return websocketDialer
+}
+
+func configureDirectRelayWebSocketTLS(ctx context.Context, requestURL string, websocketDialer *websocket.Dialer) {
+	if websocketDialer == nil {
+		return
+	}
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil || !strings.EqualFold(parsedURL.Scheme, "wss") {
+		return
+	}
+	proxyURL := *parsedURL
+	proxyURL.Scheme = "https"
+	if websocketDialer.Proxy != nil {
+		proxyRequest := &http.Request{Method: http.MethodGet, URL: &proxyURL, Header: make(http.Header)}
+		proxyRequest = proxyRequest.WithContext(ctx)
+		resolvedProxy, proxyErr := websocketDialer.Proxy(proxyRequest)
+		if proxyErr != nil || resolvedProxy != nil {
+			// gorilla owns CONNECT proxy negotiation. Its aggregate upgrade budget
+			// remains the fallback because NetDialTLSContext cannot safely wrap the
+			// post-CONNECT TLS phase without reimplementing the proxy handshake.
+			return
+		}
+		websocketDialer.Proxy = nil
+	}
+	websocketDialer.NetDialTLSContext = withRelayWebSocketTLSHandshakeTimeout(
+		websocketDialer.NetDialContext,
+		websocketDialer.TLSClientConfig,
+		time.Duration(common2.RelayTLSHandshakeTimeout)*time.Second,
+	)
+}
+
+func DialWebSocketContext(ctx context.Context, requestURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	return dialWebSocketContext(ctx, ctx, requestURL, header)
+}
+
+// DialWebSocketContextWithHandshakeContext lets a provider impose a shorter
+// pre-first-event/upgrade budget without binding a successfully upgraded
+// socket to that temporary context. The socket lifetime always follows
+// requestCtx; only DNS, connect, TLS, and the HTTP upgrade use handshakeCtx.
+func DialWebSocketContextWithHandshakeContext(requestCtx context.Context, handshakeCtx context.Context, requestURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	return dialWebSocketContext(requestCtx, handshakeCtx, requestURL, header)
+}
+
+func dialWebSocketContext(requestCtx context.Context, handshakeCtx context.Context, requestURL string, header http.Header) (*websocket.Conn, *http.Response, error) {
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
+	if handshakeCtx == nil {
+		handshakeCtx = requestCtx
+	}
+	websocketDialer := newRelayWebSocketDialer()
+	baseDialContext := websocketDialer.NetDialContext
 	websocketDialer.NetDialContext = func(dialContext context.Context, network, address string) (net.Conn, error) {
 		conn, dialErr := baseDialContext(dialContext, network, address)
 		if dialErr != nil {
@@ -438,12 +591,16 @@ func DialWebSocketContext(ctx context.Context, requestURL string, header http.He
 		// Bind to the original request context, not gorilla's temporary
 		// handshake child context. This interrupts a stalled upgrade and keeps a
 		// successfully upgraded connection alive until the request is canceled.
-		context.AfterFunc(requestContext, func() {
+		context.AfterFunc(requestCtx, func() {
 			_ = conn.Close()
 		})
 		return conn, nil
 	}
-	conn, resp, err := websocketDialer.DialContext(ctx, requestURL, header)
+	// gorilla prefers NetDialTLSContext for wss://. Configure it only after the
+	// request-lifetime watcher wraps NetDialContext so direct TLS sockets cannot
+	// bypass cancellation after a successful upgrade.
+	configureDirectRelayWebSocketTLS(handshakeCtx, requestURL, &websocketDialer)
+	conn, resp, err := websocketDialer.DialContext(handshakeCtx, requestURL, header)
 	return conn, resp, err
 }
 
@@ -460,12 +617,118 @@ func ClassifyDoRequestError(c *gin.Context, err error) *types.NewAPIError {
 	return classifyDoRequestError(c, err, false)
 }
 
+const requestDeadlineClassificationGrace = 5 * time.Millisecond
+
+// requestContextError also recognizes a deadline that has just elapsed before
+// context.Err() becomes observable. Network pollers and context timers can wake
+// on the same absolute deadline; without this check a caller-owned deadline can
+// race into an upstream timeout classification and incorrectly penalize a
+// channel.
+func requestContextError(c *gin.Context) error {
+	if c == nil || c.Request == nil {
+		return nil
+	}
+	ctx := c.Request.Context()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= requestDeadlineClassificationGrace {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// ClassifyWebSocketHandshakeError maps a locally timed-out upstream HTTP
+// upgrade onto the same typed 504 used by ordinary response-header waits.
+// The upgrade request has already crossed the network by this point, so keep
+// the conservative no-replay and channel-penalty boundary. Caller-owned
+// cancellation/deadlines retain their existing 499/504 semantics and never
+// penalize the selected channel.
+func ClassifyWebSocketHandshakeError(c *gin.Context, err error) *types.NewAPIError {
+	if requestContextError(c) != nil {
+		return classifyDoRequestError(c, err, false)
+	}
+	var netErr net.Error
+	if !errors.Is(err, context.DeadlineExceeded) && (!errors.As(err, &netErr) || !netErr.Timeout()) {
+		return nil
+	}
+	phase := "response_headers"
+	timeoutSeconds := common2.RelayResponseHeaderTimeout
+	var phaseErr *relayWebSocketPhaseTimeoutError
+	if errors.As(err, &phaseErr) {
+		phase = phaseErr.phase
+		timeoutSeconds = phaseErr.timeoutSeconds
+	}
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, phase)
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, timeoutSeconds)
+	if phase == "connect" || phase == "tls_handshake" {
+		// No WebSocket upgrade request, model payload, or generation has crossed
+		// the connection yet. Another channel remains safe to try.
+		return classifyDoRequestError(c, err, false)
+	}
+	// The HTTP upgrade reached the selected channel, so record a channel
+	// penalty, but do not suppress retry: the model payload is sent only after a
+	// successful upgrade and cannot have been accepted at this point.
+	setRelayCancelOrigin(c, constant2.RelayCancelOriginUpstreamTimeout)
+	return types.NewErrorWithStatusCode(
+		errors.New("upstream WebSocket response headers timed out"),
+		types.ErrorCodeUpstreamResponseHeaderTimeout,
+		http.StatusGatewayTimeout,
+		types.ErrOptionWithChannelPenalty(),
+	)
+}
+
 type contextCancelReadCloser struct {
 	io.ReadCloser
-	cancel      context.CancelFunc
-	stopInbound func() bool
-	once        sync.Once
-	closeErr    error
+	cancel                       context.CancelFunc
+	stopInbound                  func() bool
+	requestCtx                   context.Context
+	ginCtx                       *gin.Context
+	nonStreamTimer               *cancelPhaseTimer
+	stopNonStreamObserver        func() bool
+	nonStreamTimeout             int
+	streamErrorBodyTimer         *cancelPhaseTimer
+	unsafeRequestReachedUpstream bool
+	once                         sync.Once
+	closeErr                     error
+}
+
+func (r *contextCancelReadCloser) Read(p []byte) (int, error) {
+	if r == nil || r.ReadCloser == nil {
+		return 0, io.EOF
+	}
+	n, err := r.ReadCloser.Read(p)
+	if err == nil {
+		return n, nil
+	}
+	// A natural EOF is a completed non-stream response. Disarm the timer before
+	// looking at the context so an EOF racing the deadline is not rewritten as a
+	// false timeout.
+	if errors.Is(err, io.EOF) {
+		if r.stopNonStreamObserver != nil {
+			r.stopNonStreamObserver()
+		}
+		if r.nonStreamTimer != nil {
+			r.nonStreamTimer.Disarm()
+		}
+		if r.streamErrorBodyTimer != nil {
+			r.streamErrorBodyTimer.Disarm()
+		}
+		return n, err
+	}
+	if r.nonStreamTimer != nil && r.nonStreamTimer.Expired() {
+		return n, nonStreamTotalTimeoutError(r.ginCtx, r.nonStreamTimeout, r.unsafeRequestReachedUpstream)
+	}
+	if r.streamErrorBodyTimer != nil && r.streamErrorBodyTimer.Expired() {
+		return n, firstValidEventBudgetError(r.ginCtx, r.unsafeRequestReachedUpstream)
+	}
+	// Preserve downstream cancellation/deadline semantics while a response body
+	// is being read. Returning a typed error here prevents provider adaptors from
+	// turning a gateway deadline into read_response_body_failed/500.
+	if r.requestCtx != nil && r.requestCtx.Err() != nil {
+		return n, classifyResponseBodyContextError(r.ginCtx, r.requestCtx.Err(), r.unsafeRequestReachedUpstream)
+	}
+	return n, err
 }
 
 func (r *contextCancelReadCloser) Close() error {
@@ -473,6 +736,15 @@ func (r *contextCancelReadCloser) Close() error {
 		return nil
 	}
 	r.once.Do(func() {
+		if r.stopNonStreamObserver != nil {
+			r.stopNonStreamObserver()
+		}
+		if r.nonStreamTimer != nil {
+			r.nonStreamTimer.Disarm()
+		}
+		if r.streamErrorBodyTimer != nil {
+			r.streamErrorBodyTimer.Disarm()
+		}
 		if r.stopInbound != nil {
 			r.stopInbound()
 		}
@@ -486,9 +758,73 @@ func (r *contextCancelReadCloser) Close() error {
 	return r.closeErr
 }
 
+const (
+	phaseTimerArmed uint32 = iota
+	phaseTimerDisarmed
+	phaseTimerExpired
+)
+
+// cancelPhaseTimer records which local phase budget canceled a shared request
+// context. A plain context deadline cannot distinguish response-header,
+// first-event, and full non-stream budgets when more than one is active.
+type cancelPhaseTimer struct {
+	state atomic.Uint32
+	timer *time.Timer
+}
+
+func newCancelPhaseTimer(duration time.Duration, cancel context.CancelFunc) *cancelPhaseTimer {
+	if duration <= 0 || cancel == nil {
+		return nil
+	}
+	phaseTimer := &cancelPhaseTimer{}
+	phaseTimer.timer = time.AfterFunc(duration, func() {
+		if phaseTimer.state.CompareAndSwap(phaseTimerArmed, phaseTimerExpired) {
+			cancel()
+		}
+	})
+	return phaseTimer
+}
+
+func (t *cancelPhaseTimer) Disarm() bool {
+	if t == nil {
+		return true
+	}
+	disarmed := t.state.CompareAndSwap(phaseTimerArmed, phaseTimerDisarmed)
+	if t.timer != nil {
+		t.timer.Stop()
+	}
+	return disarmed || t.state.Load() == phaseTimerDisarmed
+}
+
+func (t *cancelPhaseTimer) Expired() bool {
+	return t != nil && t.state.Load() == phaseTimerExpired
+}
+
+func classifyResponseBodyContextError(c *gin.Context, requestErr error, requestMayHaveBeenSent bool) *types.NewAPIError {
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return classifyDoRequestError(c, requestErr, requestMayHaveBeenSent)
+	}
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if requestMayHaveBeenSent {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	if errors.Is(requestErr, context.DeadlineExceeded) {
+		setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
+		common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "response_body_context")
+		return types.NewErrorWithStatusCode(
+			errors.New("response body context deadline exceeded"),
+			types.ErrorCodeDoRequestFailed,
+			http.StatusGatewayTimeout,
+			options...,
+		)
+	}
+	setRelayCancelOrigin(c, constant2.RelayCancelOriginInternalAbort)
+	return types.NewError(requestErr, types.ErrorCodeDoRequestFailed, options...)
+}
+
 func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bool) *types.NewAPIError {
 	if c != nil && c.Request != nil {
-		switch requestErr := c.Request.Context().Err(); {
+		switch requestErr := requestContextError(c); {
 		case errors.Is(requestErr, context.Canceled):
 			setRelayCancelOrigin(c, constant2.RelayCancelOriginDownstreamDisconnected)
 			return types.NewErrorWithStatusCode(
@@ -517,15 +853,56 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 	options := []types.NewAPIErrorOptions{
 		types.ErrOptionWithHideErrMsg("upstream error: do request failed"),
 	}
+	isTimeoutFailure := errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout()
+	if isTimeoutFailure {
+		phase := common2.GetContextKeyString(c, constant2.ContextKeyRelayTimeoutPhase)
+		if phase == "connect" || phase == "tls_handshake" {
+			phaseOptions := append([]types.NewAPIErrorOptions{}, options...)
+			if requestMayHaveBeenSent {
+				phaseOptions = append(phaseOptions, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+			}
+			errorCode := types.ErrorCodeUpstreamConnectionTimeout
+			message := "upstream connection timed out"
+			if phase == "tls_handshake" {
+				errorCode = types.ErrorCodeUpstreamTLSHandshakeTimeout
+				message = "upstream TLS handshake timed out"
+			}
+			return types.NewErrorWithStatusCode(
+				errors.New(message),
+				errorCode,
+				http.StatusGatewayTimeout,
+				phaseOptions...,
+			)
+		}
+	}
 	if requestMayHaveBeenSent {
 		// Once any request write has completed or failed part-way through, a
 		// timeout or connection error cannot prove that the provider rejected the
 		// request. Retrying could duplicate a generation, task, tool call, or bill.
 		options = append(options, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
-		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &netErr) && netErr.Timeout() {
+		if isTimeoutFailure {
+			phase := common2.GetContextKeyString(c, constant2.ContextKeyRelayTimeoutPhase)
+			if phase == "" {
+				phase = "response_headers"
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "response_headers")
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, common2.RelayResponseHeaderTimeout)
+			}
+			errorCode := types.ErrorCodeUpstreamResponseHeaderTimeout
+			message := "upstream response headers timed out before the first valid event"
+			switch phase {
+			case "connect":
+				errorCode = types.ErrorCodeUpstreamConnectionTimeout
+				message = "upstream connection timed out"
+			case "tls_handshake":
+				errorCode = types.ErrorCodeUpstreamTLSHandshakeTimeout
+				message = "upstream TLS handshake timed out"
+			case "request_write":
+				errorCode = types.ErrorCodeUpstreamRequestWriteTimeout
+				message = "upstream request write timed out after data may have been sent"
+			}
 			return types.NewErrorWithStatusCode(
-				errors.New("upstream response headers timed out before the first valid event"),
-				types.ErrorCodeUpstreamFirstEventTimeout,
+				errors.New(message),
+				errorCode,
 				http.StatusGatewayTimeout,
 				options...,
 			)
@@ -536,6 +913,8 @@ func classifyDoRequestError(c *gin.Context, err error, requestMayHaveBeenSent bo
 
 func firstValidEventBudgetError(c *gin.Context, requestMayHaveBeenSent bool) *types.NewAPIError {
 	setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "first_valid_event_total")
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, common2.RelayFirstEventTotalTimeout)
 	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
 	if requestMayHaveBeenSent {
 		options = append(options, types.ErrOptionWithChannelPenalty())
@@ -548,6 +927,35 @@ func firstValidEventBudgetError(c *gin.Context, requestMayHaveBeenSent bool) *ty
 	)
 }
 
+// NewFirstValidEventTotalTimeoutError exposes the shared request-wide
+// pre-output timeout to provider-specific WebSocket and SDK relay paths.
+func NewFirstValidEventTotalTimeoutError(c *gin.Context, requestMayHaveBeenSent bool) *types.NewAPIError {
+	return firstValidEventBudgetError(c, requestMayHaveBeenSent)
+}
+
+func nonStreamTotalTimeoutError(c *gin.Context, timeoutSeconds int, requestMayHaveBeenSent bool) *types.NewAPIError {
+	setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "non_stream_total")
+	common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, timeoutSeconds)
+	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
+	if requestMayHaveBeenSent {
+		options = append(options, types.ErrOptionWithChannelPenalty())
+	}
+	return types.NewErrorWithStatusCode(
+		errors.New("upstream non-stream response exceeded the total timeout"),
+		types.ErrorCodeUpstreamNonStreamTimeout,
+		http.StatusGatewayTimeout,
+		options...,
+	)
+}
+
+// NewNonStreamTotalTimeoutError exposes the shared non-stream timeout
+// classification to provider-specific multi-step relay flows that continue
+// after the initial HTTP response body has closed (for example task polling).
+func NewNonStreamTotalTimeoutError(c *gin.Context, timeoutSeconds int, requestMayHaveBeenSent bool) *types.NewAPIError {
+	return nonStreamTotalTimeoutError(c, timeoutSeconds, requestMayHaveBeenSent)
+}
+
 func setRelayCancelOrigin(c *gin.Context, origin string) {
 	if c == nil || strings.TrimSpace(origin) == "" {
 		return
@@ -555,49 +963,9 @@ func setRelayCancelOrigin(c *gin.Context, origin string) {
 	common2.SetContextKey(c, constant2.ContextKeyRelayCancelOrigin, origin)
 }
 
-// startPreResponseHeartbeat keeps streaming clients and transit proxies alive
-// while the upstream is still waiting to return response headers. It starts
-// only after a short compatibility delay so fast upstream failures can still
-// be returned with their original HTTP status. Stopping waits for the writer
-// goroutine, preventing it from racing the downstream stream handler.
-func startPreResponseHeartbeat(c *gin.Context, info *common.RelayInfo) func() {
-	interval := common2.RelayPreFirstEventHeartbeatInterval
-	if c == nil || c.Request == nil || c.Writer == nil || info == nil || !info.IsStream || info.DisablePing || interval <= 0 {
-		return func() {}
-	}
-
-	ctx, cancel := context.WithCancel(c.Request.Context())
-	done := make(chan struct{})
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				logger.LogError(c, fmt.Sprintf("pre-response heartbeat panic: %v", r))
-			}
-			close(done)
-		}()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				helper.ExtendWriteDeadline(c)
-				if err := helper.PingData(c); err != nil {
-					logger.LogDebug(c, "pre-response heartbeat stopped: "+err.Error())
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return func() {
-		cancel()
-		<-done
-	}
-}
-
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	common2.ResetRelayAttemptTimeoutContext(c)
+	relayRequestStartedAt := time.Now()
 	// Some provider adaptors build requests with their own timeout context before
 	// delegating here. Preserve that deadline/value context while also binding it
 	// to the inbound client lifetime. The combined context stays alive until the
@@ -605,6 +973,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// every stream immediately after response headers.
 	var combinedCancel context.CancelFunc
 	var stopInbound func() bool
+	nonStreamTimeout := 0
+	nonStreamRemaining := time.Duration(0)
+	var nonStreamTimer *cancelPhaseTimer
+	var stopNonStreamObserver func() bool
 	if req != nil && c != nil && c.Request != nil {
 		// Carry the validated edge request ID through NewAPI and compatible
 		// upstream relays (notably CPA) without overwriting an adaptor-provided
@@ -617,9 +989,43 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 				req.Header.Set("X-Request-Id", requestID)
 			}
 		}
-		combinedCtx, cancel := context.WithCancel(req.Context())
+		var combinedCtx context.Context
+		var cancel context.CancelFunc
+		callerDeadline, hasCallerDeadline := req.Context().Deadline()
+		if info != nil && !info.IsStream && common2.RelayNonStreamTimeout > 0 {
+			configuredTimeout := time.Duration(common2.RelayNonStreamTimeout) * time.Second
+			info.EnsureNonStreamDeadline(time.Time{}, configuredTimeout)
+			remaining, limited := info.RemainingNonStreamBudget()
+			if !limited {
+				remaining = configuredTimeout
+			}
+			if remaining <= 0 {
+				common2.ReleaseBodyAdmission(c)
+				return nil, nonStreamTotalTimeoutError(c, common2.RelayNonStreamTimeout, false)
+			}
+			// A later job/provider envelope must not disable the precise local
+			// request-wide budget. An earlier caller deadline still wins.
+			if !hasCallerDeadline || time.Until(callerDeadline) > remaining {
+				nonStreamTimeout = common2.RelayNonStreamTimeout
+				nonStreamRemaining = remaining
+			}
+		}
+		combinedCtx, cancel = context.WithCancel(req.Context())
 		combinedCancel = cancel
 		stopInbound = context.AfterFunc(c.Request.Context(), cancel)
+		if nonStreamTimeout > 0 {
+			nonStreamTimer = newCancelPhaseTimer(nonStreamRemaining, cancel)
+			observedTimer := nonStreamTimer
+			observedTimeout := nonStreamTimeout
+			stopNonStreamObserver = context.AfterFunc(combinedCtx, func() {
+				if observedTimer == nil || !observedTimer.Expired() || c.Request.Context().Err() != nil {
+					return
+				}
+				setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "non_stream_total")
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, observedTimeout)
+			})
+		}
 		req = req.WithContext(combinedCtx)
 	}
 
@@ -628,6 +1034,15 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	if info.ChannelSetting.Proxy != "" {
 		client, err = service.GetHttpClientWithProxy(info.ChannelSetting.Proxy)
 		if err != nil {
+			if nonStreamTimer != nil {
+				nonStreamTimer.Disarm()
+			}
+			if stopInbound != nil {
+				stopInbound()
+			}
+			if combinedCancel != nil {
+				combinedCancel()
+			}
 			return nil, fmt.Errorf("new proxy http client failed: %w", err)
 		}
 	} else {
@@ -639,13 +1054,33 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// and hide an upstream first-event timeout from the controller.
 
 	var requestMayHaveBeenSent atomic.Bool
+	var transportPhase atomic.Int32
+	const (
+		transportPhaseUnknown int32 = iota
+		transportPhaseConnect
+		transportPhaseTLSHandshake
+	)
 	unsafeToReplay := !isReplaySafeMethod(req.Method)
 	trace := &httptrace.ClientTrace{
+		ConnectStart: func(_, _ string) {
+			transportPhase.Store(transportPhaseConnect)
+		},
+		TLSHandshakeStart: func() {
+			transportPhase.Store(transportPhaseTLSHandshake)
+		},
 		GotConn: func(httptrace.GotConnInfo) {
+			transportPhase.Store(transportPhaseUnknown)
 			common2.SetContextKey(c, constant2.ContextKeyRelayConnectedUpstream, true)
 		},
-		WroteRequest: func(httptrace.WroteRequestInfo) {
-			common2.SetContextKey(c, constant2.ContextKeyRelayRequestWritten, true)
+		WroteRequest: func(wroteInfo httptrace.WroteRequestInfo) {
+			if wroteInfo.Err == nil {
+				common2.SetContextKey(c, constant2.ContextKeyRelayRequestWritten, true)
+			} else {
+				var writeNetErr net.Error
+				if errors.Is(wroteInfo.Err, context.DeadlineExceeded) || errors.As(wroteInfo.Err, &writeNetErr) && writeNetErr.Timeout() {
+					common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "request_write")
+				}
+			}
 			requestMayHaveBeenSent.Store(true)
 			if unsafeToReplay {
 				info.MarkUpstreamRequestMayHaveBeenAccepted()
@@ -663,6 +1098,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	if combinedCancel != nil {
 		if remaining, limited := info.RemainingFirstValidEventBudget(); limited {
 			if remaining <= 0 {
+				if nonStreamTimer != nil {
+					nonStreamTimer.Disarm()
+				}
 				if stopInbound != nil {
 					stopInbound()
 				}
@@ -682,9 +1120,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// boundary as an idempotent fallback, before waiting on response headers or
 	// a potentially long-lived stream.
 	common2.ReleaseBodyAdmission(c)
-	stopPreResponseHeartbeat := startPreResponseHeartbeat(c, info)
 	resp, err := client.Do(req)
-	stopPreResponseHeartbeat()
 	if budgetTimer != nil {
 		budgetState.CompareAndSwap(0, 1)
 		budgetTimer.Stop()
@@ -695,6 +1131,29 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		info.MarkUpstreamRequestMayHaveBeenAccepted()
 	}
 	if err != nil {
+		var transportNetErr net.Error
+		if !requestMayHaveBeenSent.Load() && (errors.Is(err, context.DeadlineExceeded) || errors.As(err, &transportNetErr) && transportNetErr.Timeout()) {
+			switch transportPhase.Load() {
+			case transportPhaseConnect:
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "connect")
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, common2.RelayDialTimeout)
+			case transportPhaseTLSHandshake:
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "tls_handshake")
+				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, common2.RelayTLSHandshakeTimeout)
+			}
+		}
+		if nonStreamTimer != nil && nonStreamTimer.Expired() && (c == nil || c.Request == nil || c.Request.Context().Err() == nil) {
+			if stopInbound != nil {
+				stopInbound()
+			}
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return nil, nonStreamTotalTimeoutError(c, nonStreamTimeout, unsafeRequestReachedUpstream)
+		}
+		if nonStreamTimer != nil {
+			nonStreamTimer.Disarm()
+		}
 		if stopInbound != nil {
 			stopInbound()
 		}
@@ -714,6 +1173,9 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, classifiedErr
 	}
 	if resp == nil {
+		if nonStreamTimer != nil {
+			nonStreamTimer.Disarm()
+		}
 		if stopInbound != nil {
 			stopInbound()
 		}
@@ -723,7 +1185,25 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, errors.New("resp is nil")
 	}
 	common2.SetContextKey(c, constant2.ContextKeyRelayResponseHeaders, true)
+	if nonStreamTimer != nil && nonStreamTimer.Expired() {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if stopInbound != nil {
+			stopInbound()
+		}
+		if combinedCancel != nil {
+			combinedCancel()
+		}
+		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+			return nil, classifyDoRequestError(c, c.Request.Context().Err(), unsafeRequestReachedUpstream)
+		}
+		return nil, nonStreamTotalTimeoutError(c, nonStreamTimeout, unsafeRequestReachedUpstream)
+	}
 	if budgetState.Load() == 2 {
+		if nonStreamTimer != nil {
+			nonStreamTimer.Disarm()
+		}
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -735,17 +1215,111 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		}
 		return nil, firstValidEventBudgetError(c, unsafeRequestReachedUpstream)
 	}
+	var streamErrorBodyTimer *cancelPhaseTimer
+	if combinedCancel != nil && info.IsStream && (resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices) {
+		if remaining, limited := info.RemainingFirstValidEventBudget(); limited {
+			if remaining <= 0 {
+				if resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				if stopInbound != nil {
+					stopInbound()
+				}
+				combinedCancel()
+				return nil, firstValidEventBudgetError(c, unsafeRequestReachedUpstream)
+			}
+			// A stream's non-2xx response body is still pre-output error data. Keep
+			// it inside the same request-wide first-event budget so a peer that
+			// flushes only the error headers cannot outlive the outer proxy and turn
+			// a gateway timeout into a downstream 499.
+			streamErrorBodyTimer = newCancelPhaseTimer(remaining, combinedCancel)
+		}
+	}
+	eventStreamResponse := isEventStreamContentType(resp.Header.Get("Content-Type"))
+	if eventStreamResponse && info != nil && !info.IsStream {
+		startTime := info.StartTime
+		if startTime.IsZero() {
+			startTime = relayRequestStartedAt
+		}
+		info.EnsureFirstValidEventDeadline(startTime, time.Duration(common2.RelayFirstEventTotalTimeout)*time.Second)
+		if remaining, limited := info.RemainingFirstValidEventBudget(); limited && remaining <= 0 {
+			if stopNonStreamObserver != nil {
+				stopNonStreamObserver()
+			}
+			if nonStreamTimer != nil {
+				nonStreamTimer.Disarm()
+			}
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if stopInbound != nil {
+				stopInbound()
+			}
+			if combinedCancel != nil {
+				combinedCancel()
+			}
+			return nil, firstValidEventBudgetError(c, unsafeRequestReachedUpstream)
+		}
+		info.IsStream = true
+		common2.SetContextKey(c, constant2.ContextKeyIsStream, true)
+	}
+	if nonStreamTimer != nil && eventStreamResponse {
+		// Some compatible providers ignore the request's stream flag and only
+		// reveal SSE in the response headers. Once that happens, the non-stream
+		// total budget must be removed; first-event and stream-idle guards own the
+		// remaining lifecycle.
+		if !nonStreamTimer.Disarm() {
+			if stopNonStreamObserver != nil {
+				stopNonStreamObserver()
+			}
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if stopInbound != nil {
+				stopInbound()
+			}
+			if combinedCancel != nil {
+				combinedCancel()
+			}
+			if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+				return nil, classifyDoRequestError(c, c.Request.Context().Err(), unsafeRequestReachedUpstream)
+			}
+			return nil, nonStreamTotalTimeoutError(c, nonStreamTimeout, unsafeRequestReachedUpstream)
+		}
+		if stopNonStreamObserver != nil {
+			stopNonStreamObserver()
+			stopNonStreamObserver = nil
+		}
+		nonStreamTimer = nil
+		nonStreamTimeout = 0
+	}
 	if combinedCancel != nil {
 		if resp.Body == nil {
+			if stopNonStreamObserver != nil {
+				stopNonStreamObserver()
+			}
+			if nonStreamTimer != nil {
+				nonStreamTimer.Disarm()
+			}
+			if streamErrorBodyTimer != nil {
+				streamErrorBodyTimer.Disarm()
+			}
 			if stopInbound != nil {
 				stopInbound()
 			}
 			combinedCancel()
 		} else {
 			resp.Body = &contextCancelReadCloser{
-				ReadCloser:  resp.Body,
-				cancel:      combinedCancel,
-				stopInbound: stopInbound,
+				ReadCloser:                   resp.Body,
+				cancel:                       combinedCancel,
+				stopInbound:                  stopInbound,
+				requestCtx:                   req.Context(),
+				ginCtx:                       c,
+				nonStreamTimer:               nonStreamTimer,
+				stopNonStreamObserver:        stopNonStreamObserver,
+				nonStreamTimeout:             nonStreamTimeout,
+				streamErrorBodyTimer:         streamErrorBodyTimer,
+				unsafeRequestReachedUpstream: unsafeRequestReachedUpstream,
 			}
 		}
 	}
@@ -761,6 +1335,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		_ = c.Request.Body.Close()
 	}
 	return resp, nil
+}
+
+func isEventStreamContentType(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")
 }
 
 func firstNonEmptyHeader(header http.Header, names ...string) string {

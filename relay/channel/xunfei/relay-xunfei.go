@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/types"
@@ -140,12 +141,18 @@ type xunfeiWebSocket interface {
 	Close() error
 }
 
-type xunfeiDialFunc func(ctx context.Context, authURL string) (xunfeiWebSocket, *http.Response, error)
+type xunfeiDialFunc func(requestCtx context.Context, handshakeCtx context.Context, authURL string) (xunfeiWebSocket, *http.Response, error)
 
-func dialXunfeiWebSocket(ctx context.Context, authURL string) (xunfeiWebSocket, *http.Response, error) {
-	d := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
-	return d.DialContext(ctx, authURL, nil)
+func dialXunfeiWebSocket(requestCtx context.Context, handshakeCtx context.Context, authURL string) (xunfeiWebSocket, *http.Response, error) {
+	return channel.DialWebSocketContextWithHandshakeContext(requestCtx, handshakeCtx, authURL, nil)
 }
+
+type xunfeiHandshakeError struct {
+	err error
+}
+
+func (e *xunfeiHandshakeError) Error() string { return e.err.Error() }
+func (e *xunfeiHandshakeError) Unwrap() error { return e.err }
 
 type xunfeiResponseEnvelope struct {
 	Header *struct {
@@ -169,13 +176,13 @@ func newXunfeiProtocolError(format string, args ...any) error {
 	return &xunfeiProtocolError{err: fmt.Errorf(format, args...)}
 }
 
-func xunfeiOpenSession(ctx context.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authURL, appID string, dial xunfeiDialFunc) (xunfeiWebSocket, func(), error) {
-	conn, resp, err := dial(ctx, authURL)
+func xunfeiOpenSession(requestCtx context.Context, handshakeCtx context.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, domain, authURL, appID string, dial xunfeiDialFunc) (xunfeiWebSocket, func(), error) {
+	conn, resp, err := dial(requestCtx, handshakeCtx, authURL)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		return nil, nil, err
+		return nil, nil, &xunfeiHandshakeError{err: err}
 	}
 	if conn == nil || resp == nil || resp.StatusCode != http.StatusSwitchingProtocols {
 		if resp != nil && resp.Body != nil {
@@ -186,11 +193,21 @@ func xunfeiOpenSession(ctx context.Context, info *relaycommon.RelayInfo, textReq
 		}
 		return nil, nil, fmt.Errorf("Xunfei websocket handshake failed")
 	}
-	if err := ctx.Err(); err != nil {
+	if err := requestCtx.Err(); err != nil {
 		_ = conn.Close()
 		return nil, nil, err
 	}
-	stopCancellationClose := context.AfterFunc(ctx, func() {
+	if err := handshakeCtx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	if info.IsStream {
+		if remaining, limited := info.RemainingFirstValidEventBudget(); limited && remaining <= 5*time.Millisecond {
+			_ = conn.Close()
+			return nil, nil, context.DeadlineExceeded
+		}
+	}
+	stopCancellationClose := context.AfterFunc(requestCtx, func() {
 		_ = conn.Close()
 	})
 	cleanup := func() {
@@ -216,6 +233,19 @@ func xunfeiOpenSession(ctx context.Context, info *relaycommon.RelayInfo, textReq
 		return nil, nil, err
 	}
 	return conn, cleanup, nil
+}
+
+func classifyXunfeiOpenSessionError(c *gin.Context, err error) *types.NewAPIError {
+	if c != nil && c.Request != nil && c.Request.Context().Err() != nil {
+		return channel.ClassifyDoRequestError(c, err)
+	}
+	var handshakeErr *xunfeiHandshakeError
+	if errors.As(err, &handshakeErr) {
+		if classifiedErr := channel.ClassifyWebSocketHandshakeError(c, handshakeErr.err); classifiedErr != nil {
+			return classifiedErr
+		}
+	}
+	return types.NewError(err, types.ErrorCodeDoRequestFailed)
 }
 
 func xunfeiReadResponse(conn xunfeiWebSocket, wait time.Duration) (XunfeiChatResponse, error) {
@@ -254,9 +284,19 @@ func xunfeiReadResponse(conn xunfeiWebSocket, wait time.Duration) (XunfeiChatRes
 	return response, nil
 }
 
-func xunfeiSetReadEnd(info *relaycommon.RelayInfo, ctx context.Context, firstEvent bool, err error) {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, ctxErr)
+func xunfeiSetRequestContextEnd(c *gin.Context, info *relaycommon.RelayInfo, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginGatewayDeadline)
+		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonRequestDeadline, err)
+		return
+	}
+	common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
+	info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+}
+
+func xunfeiSetReadEnd(c *gin.Context, info *relaycommon.RelayInfo, firstEvent bool, err error) {
+	if ctxErr := c.Request.Context().Err(); ctxErr != nil {
+		xunfeiSetRequestContextEnd(c, info, ctxErr)
 		return
 	}
 	var protocolErr *xunfeiProtocolError
@@ -305,7 +345,7 @@ func xunfeiWriteStreamObject(c *gin.Context, info *relaycommon.RelayInfo, object
 	helper.ExtendWriteDeadline(c)
 	if err := helper.ObjectData(c, object); err != nil {
 		if ctxErr := c.Request.Context().Err(); ctxErr != nil {
-			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, ctxErr)
+			xunfeiSetRequestContextEnd(c, info, ctxErr)
 		} else {
 			xunfeiSetHandlerEnd(info, err)
 		}
@@ -320,10 +360,37 @@ func xunfeiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, textReques
 
 func xunfeiStreamHandlerWithDial(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, appID string, apiSecret string, apiKey string, dial xunfeiDialFunc) (*dto.Usage, *types.NewAPIError) {
 	xunfeiInitStreamStatus(info)
+	info.IsStream = true
+	requestCtx := c.Request.Context()
+	handshakeCtx := requestCtx
+	cancelHandshake := func() {}
+	if common.RelayFirstEventTotalTimeout > 0 {
+		info.EnsureFirstValidEventDeadline(info.StartTime, time.Duration(common.RelayFirstEventTotalTimeout)*time.Second)
+		remaining, _ := info.RemainingFirstValidEventBudget()
+		if remaining <= 0 {
+			return nil, channel.NewFirstValidEventTotalTimeoutError(c, false)
+		}
+		handshakeCtx, cancelHandshake = context.WithTimeout(requestCtx, remaining)
+	}
 	domain, authURL := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	conn, cleanup, err := xunfeiOpenSession(c.Request.Context(), info, textRequest, domain, authURL, appID, dial)
+	conn, cleanup, err := xunfeiOpenSession(requestCtx, handshakeCtx, info, textRequest, domain, authURL, appID, dial)
+	firstEventBudgetExpired := false
+	if requestCtx.Err() == nil {
+		if errors.Is(handshakeCtx.Err(), context.DeadlineExceeded) {
+			firstEventBudgetExpired = true
+		} else if remaining, limited := info.RemainingFirstValidEventBudget(); limited && remaining <= 5*time.Millisecond {
+			firstEventBudgetExpired = true
+		}
+	}
+	cancelHandshake()
+	if firstEventBudgetExpired {
+		if cleanup != nil {
+			cleanup()
+		}
+		return nil, channel.NewFirstValidEventTotalTimeoutError(c, info.UpstreamRequestMayHaveBeenAccepted())
+	}
 	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+		return nil, classifyXunfeiOpenSessionError(c, err)
 	}
 	defer cleanup()
 
@@ -336,7 +403,7 @@ func xunfeiStreamHandlerWithDial(c *gin.Context, info *relaycommon.RelayInfo, te
 		}
 		xunfeiResponse, readErr := xunfeiReadResponse(conn, wait)
 		if readErr != nil {
-			xunfeiSetReadEnd(info, c.Request.Context(), firstEvent, readErr)
+			xunfeiSetReadEnd(c, info, firstEvent, readErr)
 			if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
 				return nil, streamErr
 			}
@@ -355,7 +422,7 @@ func xunfeiStreamHandlerWithDial(c *gin.Context, info *relaycommon.RelayInfo, te
 			helper.ExtendWriteDeadline(c)
 			if err := helper.StringData(c, "[DONE]"); err != nil {
 				if ctxErr := c.Request.Context().Err(); ctxErr != nil {
-					info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, ctxErr)
+					xunfeiSetRequestContextEnd(c, info, ctxErr)
 				} else {
 					xunfeiSetHandlerEnd(info, err)
 				}
@@ -373,10 +440,34 @@ func xunfeiHandler(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.
 
 func xunfeiHandlerWithDial(c *gin.Context, info *relaycommon.RelayInfo, textRequest dto.GeneralOpenAIRequest, appID string, apiSecret string, apiKey string, dial xunfeiDialFunc) (*dto.Usage, *types.NewAPIError) {
 	xunfeiInitStreamStatus(info)
+	requestCtx := c.Request.Context()
+	budgetCtx := requestCtx
+	cancelBudget := func() {}
+	if common.RelayNonStreamTimeout > 0 {
+		info.EnsureNonStreamDeadline(time.Time{}, time.Duration(common.RelayNonStreamTimeout)*time.Second)
+		remaining, _ := info.RemainingNonStreamBudget()
+		if remaining <= 0 {
+			return nil, channel.NewNonStreamTotalTimeoutError(c, common.RelayNonStreamTimeout, false)
+		}
+		budgetCtx, cancelBudget = context.WithTimeout(requestCtx, remaining)
+	}
+	defer cancelBudget()
+	classifyBudgetError := func(err error) *types.NewAPIError {
+		if errors.Is(budgetCtx.Err(), context.DeadlineExceeded) && requestCtx.Err() == nil {
+			return channel.NewNonStreamTotalTimeoutError(c, common.RelayNonStreamTimeout, info.UpstreamRequestMayHaveBeenAccepted())
+		}
+		if requestCtx.Err() != nil {
+			return channel.ClassifyDoRequestError(c, err)
+		}
+		return nil
+	}
 	domain, authURL := getXunfeiAuthUrl(c, apiKey, apiSecret, textRequest.Model)
-	conn, cleanup, err := xunfeiOpenSession(c.Request.Context(), info, textRequest, domain, authURL, appID, dial)
+	conn, cleanup, err := xunfeiOpenSession(budgetCtx, budgetCtx, info, textRequest, domain, authURL, appID, dial)
 	if err != nil {
-		return nil, types.NewError(err, types.ErrorCodeDoRequestFailed)
+		if budgetErr := classifyBudgetError(err); budgetErr != nil {
+			return nil, budgetErr
+		}
+		return nil, classifyXunfeiOpenSessionError(c, err)
 	}
 	defer cleanup()
 
@@ -389,9 +480,21 @@ func xunfeiHandlerWithDial(c *gin.Context, info *relaycommon.RelayInfo, textRequ
 		if firstEvent {
 			wait = info.BoundFirstValidEventWait(helper.StreamFirstEventTimeout())
 		}
+		if common.RelayNonStreamTimeout > 0 {
+			remaining, _ := info.RemainingNonStreamBudget()
+			if remaining <= 0 {
+				return nil, channel.NewNonStreamTotalTimeoutError(c, common.RelayNonStreamTimeout, true)
+			}
+			if remaining < wait {
+				wait = remaining
+			}
+		}
 		xunfeiResponse, readErr := xunfeiReadResponse(conn, wait)
 		if readErr != nil {
-			xunfeiSetReadEnd(info, c.Request.Context(), firstEvent, readErr)
+			if budgetErr := classifyBudgetError(readErr); budgetErr != nil {
+				return nil, budgetErr
+			}
+			xunfeiSetReadEnd(c, info, firstEvent, readErr)
 			if apiErr := helper.PreOutputStreamError(c, info); apiErr != nil {
 				return nil, apiErr
 			}
