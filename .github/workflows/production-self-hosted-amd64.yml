@@ -10,6 +10,14 @@ on:
         description: Immutable image tag; must match sha-<selected commit first 12 characters>
         required: true
         type: string
+      digest:
+        description: Existing OCI image index digest; when set, verify and sign without rebuilding
+        required: false
+        type: string
+      revision:
+        description: Full commit SHA recorded in the existing image label
+        required: false
+        type: string
 
 concurrency:
   group: new-api-production-ci-${{ github.ref }}
@@ -18,6 +26,7 @@ concurrency:
 jobs:
   test-build-publish:
     name: Test, build and publish amd64
+    if: ${{ github.event_name == 'push' || inputs.digest == '' }}
     runs-on: [self-hosted, ci-vps]
     timeout-minutes: 60
     permissions:
@@ -130,6 +139,81 @@ jobs:
           docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"
           {
             echo "### Published production candidate"
+            echo
+            echo "- Image: \`$IMAGE:$IMAGE_TAG\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Revision: \`$COMMIT_SHA\`"
+            echo "- Platform: \`linux/amd64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out from GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  verify-sign-existing:
+    name: Verify and sign existing amd64 image
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.digest != '' }}
+    runs-on: [self-hosted, ci-vps]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify immutable candidate
+        env:
+          IMAGE_TAG: ${{ inputs.tag }}
+          EXPECTED_DIGEST: ${{ inputs.digest }}
+          EXPECTED_REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          [[ "$EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "revision must be a full lowercase commit SHA" >&2
+            exit 1
+          }
+          expected_tag="sha-${EXPECTED_REVISION:0:12}"
+          test "$IMAGE_TAG" = "$expected_tag"
+          [[ "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "digest must be a sha256 OCI digest" >&2
+            exit 1
+          }
+
+          manifest_json="$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Manifest}}')"
+          labels_json="$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Image.Config.Labels}}')"
+          observed_digest="$(jq -r '.digest' <<<"$manifest_json")"
+          observed_revision="$(jq -r '.["org.opencontainers.image.revision"]' <<<"$labels_json")"
+          test "$observed_digest" = "$EXPECTED_DIGEST"
+          test "$observed_revision" = "$EXPECTED_REVISION"
+          jq -e '.manifests | any(.platform.os == "linux" and .platform.architecture == "amd64")' <<<"$manifest_json" >/dev/null
+
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "DIGEST=$EXPECTED_DIGEST" >> "$GITHUB_ENV"
+          echo "COMMIT_SHA=$EXPECTED_REVISION" >> "$GITHUB_ENV"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign and verify immutable image
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign verify \
+            --certificate-identity-regexp '^https://github.com/quqi1599/new-api/.github/workflows/production-self-hosted-amd64.yml@' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$IMAGE@$DIGEST"
+          docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"
+          {
+            echo "### Signed existing production candidate"
             echo
             echo "- Image: \`$IMAGE:$IMAGE_TAG\`"
             echo "- Digest: \`$DIGEST\`"
