@@ -88,6 +88,7 @@ const EditTokenModal = (props) => {
     allow_ips: '',
     group: '',
     cross_group_retry: false,
+    rpm_rate_limit: 0,
     tokenCount: 1,
   });
 
@@ -795,6 +796,18 @@ const EditTokenModal = (props) => {
                       style={{ width: '100%' }}
                     />
                   </Col>
+                  {isAdminUser && (
+                    <Col span={24}>
+                      <Form.InputNumber
+                        field='rpm_rate_limit'
+                        label={t('每分钟请求上限 (RPM)')}
+                        min={0}
+                        precision={0}
+                        extraText={t('0 表示不限制，保存后立即生效，无需重启服务')}
+                        style={{ width: '100%' }}
+                      />
+                    </Col>
+                  )}
                 </Row>
               </Card>
             </div>

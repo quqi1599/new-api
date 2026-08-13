@@ -20,6 +20,8 @@ func buildMaskedTokenResponse(token *model.Token) *model.Token {
 	}
 	maskedToken := *token
 	maskedToken.Key = token.GetMaskedKey()
+	effectiveRPMRateLimit := token.GetRPMRateLimit()
+	maskedToken.RPMRateLimit = &effectiveRPMRateLimit
 	return &maskedToken
 }
 
@@ -57,7 +59,15 @@ func buildCreatedTokenResponse(token *model.Token) gin.H {
 		"allow_ips":            token.AllowIps,
 		"group":                token.Group,
 		"cross_group_retry":    token.CrossGroupRetry,
+		"rpm_rate_limit":       token.GetRPMRateLimit(),
 	}
+}
+
+func validateTokenRPMRateLimit(rpmRateLimit *int) error {
+	if rpmRateLimit != nil && *rpmRateLimit < 0 {
+		return fmt.Errorf("令牌 RPM 限制不能为负数")
+	}
+	return nil
 }
 
 func resolveTokenOwnerUserID(c *gin.Context, requestedUserID int) (int, error) {
@@ -240,6 +250,10 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgTokenNameTooLong)
 		return
 	}
+	if err := validateTokenRPMRateLimit(token.RPMRateLimit); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	// 非无限额度时，检查额度值是否超出有效范围
 	if !token.UnlimitedQuota {
 		if token.RemainQuota < 0 {
@@ -292,6 +306,9 @@ func AddToken(c *gin.Context) {
 		AllowIps:           token.AllowIps,
 		Group:              token.Group,
 		CrossGroupRetry:    token.CrossGroupRetry,
+	}
+	if c.GetInt("role") >= common.RoleAdminUser {
+		cleanToken.RPMRateLimit = token.RPMRateLimit
 	}
 	err = cleanToken.Insert()
 	if err != nil {

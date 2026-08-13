@@ -321,6 +321,83 @@ func TestAdminUpdateTokenRouteRejectsAdminButAcceptsRoot(t *testing.T) {
 	}
 }
 
+func TestAdminUpdateTokenPersistsRPMRateLimit(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 2, common.RoleRootUser, "default", "root-rpm-access-token")
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user4-rpm-access-token")
+	token := seedInternalLookupToken(t, db, 4, "rpm-editable-token", "rpm-editable-real-key", "default", false)
+
+	router := newAdminTokenSearchRouter()
+	body, err := common.Marshal(map[string]any{
+		"id":                   token.Id,
+		"name":                 token.Name,
+		"remain_quota":         token.RemainQuota,
+		"expired_time":         token.ExpiredTime,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits":         "",
+		"model_limits_enabled": false,
+		"group":                token.Group,
+		"cross_group_retry":    false,
+		"rpm_rate_limit":       100,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal root update body: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/token/admin/", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer root-rpm-access-token")
+	request.Header.Set("New-Api-User", "2")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	response := decodeAPIResponse(t, recorder)
+	if !response.Success {
+		t.Fatalf("expected root RPM update to succeed, got %+v", response)
+	}
+	updatedToken, err := model.GetTokenById(token.Id)
+	if err != nil {
+		t.Fatalf("failed to reload updated token: %v", err)
+	}
+	if updatedToken.RPMRateLimit == nil || *updatedToken.RPMRateLimit != 100 {
+		t.Fatalf("expected RPM rate limit 100, got %+v", updatedToken.RPMRateLimit)
+	}
+}
+
+func TestAdminUpdateTokenRejectsNegativeRPMRateLimit(t *testing.T) {
+	db := setupInternalTokenControllerTestDB(t)
+	seedInternalUser(t, db, 2, common.RoleRootUser, "default", "root-negative-rpm-token")
+	seedInternalUser(t, db, 4, common.RoleCommonUser, "default", "user4-negative-rpm-token")
+	token := seedInternalLookupToken(t, db, 4, "negative-rpm-token", "negative-rpm-real-key", "default", false)
+
+	router := newAdminTokenSearchRouter()
+	body, err := common.Marshal(map[string]any{
+		"id":                   token.Id,
+		"name":                 token.Name,
+		"remain_quota":         token.RemainQuota,
+		"expired_time":         token.ExpiredTime,
+		"unlimited_quota":      token.UnlimitedQuota,
+		"model_limits":         "",
+		"model_limits_enabled": false,
+		"group":                token.Group,
+		"cross_group_retry":    false,
+		"rpm_rate_limit":       -1,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal root update body: %v", err)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/api/token/admin/", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer root-negative-rpm-token")
+	request.Header.Set("New-Api-User", "2")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+
+	response := decodeAPIResponse(t, recorder)
+	if response.Success {
+		t.Fatalf("expected negative RPM update to fail")
+	}
+}
+
 func TestAdminTokenSearchRouteAcceptsAdmin(t *testing.T) {
 	db := setupInternalTokenControllerTestDB(t)
 	seedInternalUser(t, db, 1, common.RoleAdminUser, "default", "admin-access-token")

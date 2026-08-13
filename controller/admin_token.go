@@ -133,6 +133,10 @@ func AdminUpdateToken(c *gin.Context) {
 		common.ApiErrorMsg(c, "令牌名称过长")
 		return
 	}
+	if err := validateTokenRPMRateLimit(token.RPMRateLimit); err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if !token.UnlimitedQuota {
 		if token.RemainQuota < 0 {
 			common.ApiErrorMsg(c, "令牌额度不能为负数")
@@ -171,6 +175,9 @@ func AdminUpdateToken(c *gin.Context) {
 		cleanToken.AllowIps = token.AllowIps
 		cleanToken.Group = token.Group
 		cleanToken.CrossGroupRetry = token.CrossGroupRetry
+		if token.RPMRateLimit != nil {
+			cleanToken.RPMRateLimit = token.RPMRateLimit
+		}
 	}
 	err = cleanToken.Update()
 	if err != nil {

@@ -1417,6 +1417,8 @@
     "常见问答管理，为用户提供常见问题的答案（最多50个，前端显示最新20条）": "Quản lý câu hỏi thường gặp, cung cấp câu trả lời cho các câu hỏi thường gặp của người dùng (tối đa 50, hiển thị 20 mới nhất ở giao diện người dùng)",
     "平台": "nền tảng",
     "平均RPM": "RPM trung bình",
+    "每分钟请求上限 (RPM)": "Giới hạn yêu cầu mỗi phút (RPM)",
+    "0 表示不限制，保存后立即生效，无需重启服务": "0 nghĩa là không giới hạn. Thay đổi có hiệu lực ngay mà không cần khởi động lại dịch vụ.",
     "平均TPM": "TPM trung bình",
     "平移": "Pan",
     "年": "năm",

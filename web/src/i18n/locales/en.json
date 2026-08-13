@@ -1439,6 +1439,8 @@
     "常见问答管理，为用户提供常见问题的答案（最多50个，前端显示最新20条）": "FAQ management, providing answers to common questions for users (maximum 50, display latest 20 on the front end)",
     "平台": "platform",
     "平均RPM": "Average RPM",
+    "每分钟请求上限 (RPM)": "Request limit per minute (RPM)",
+    "0 表示不限制，保存后立即生效，无需重启服务": "0 means unlimited. Changes take effect immediately without restarting the service.",
     "平均TPM": "Average TPM",
     "平移": "Pan",
     "年": "year",

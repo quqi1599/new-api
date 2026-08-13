@@ -43,3 +43,67 @@ func TestTokenRPMRateLimit(t *testing.T) {
 		t.Fatalf("request 101 returned %d, want %d", recorder.Code, http.StatusTooManyRequests)
 	}
 }
+
+func TestTokenRPMRateLimitUsesTokenConfigurationBeforeLegacyEnvironment(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldRedisEnabled := common.RedisEnabled
+	oldLimits := common.TokenRPMRateLimits
+	common.RedisEnabled = false
+	common.TokenRPMRateLimits = map[int]int{987654322: 5000}
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		common.TokenRPMRateLimits = oldLimits
+	})
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("token_id", 987654322)
+		c.Set("token_rpm_rate_limit", 1)
+	})
+	router.Use(ModelRequestRateLimit())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/", nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first request returned %d", first.Code)
+	}
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/", nil))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request returned %d, want %d", second.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestTokenRPMRateLimitZeroDisablesLegacyEnvironmentLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	oldRedisEnabled := common.RedisEnabled
+	oldLimits := common.TokenRPMRateLimits
+	common.RedisEnabled = false
+	common.TokenRPMRateLimits = map[int]int{987654323: 1}
+	t.Cleanup(func() {
+		common.RedisEnabled = oldRedisEnabled
+		common.TokenRPMRateLimits = oldLimits
+	})
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("token_id", 987654323)
+		c.Set("token_rpm_rate_limit", 0)
+	})
+	router.Use(ModelRequestRateLimit())
+	router.GET("/", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	for i := 0; i < 2; i++ {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("request %d returned %d", i+1, recorder.Code)
+		}
+	}
+}

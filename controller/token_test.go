@@ -490,6 +490,11 @@ func TestGetTokenMasksKeyInResponse(t *testing.T) {
 func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	token := seedToken(t, db, 1, "editable-token", "yzab1234cdef5678")
+	existingRPMRateLimit := 500
+	token.RPMRateLimit = &existingRPMRateLimit
+	if err := db.Save(token).Error; err != nil {
+		t.Fatalf("failed to seed RPM rate limit: %v", err)
+	}
 
 	body := map[string]any{
 		"id":                   token.Id,
@@ -501,6 +506,7 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 		"model_limits":         "",
 		"group":                "default",
 		"cross_group_retry":    false,
+		"rpm_rate_limit":       100,
 	}
 
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
@@ -520,6 +526,13 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	}
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("update response leaked raw token key: %s", recorder.Body.String())
+	}
+	updatedToken, err := model.GetTokenById(token.Id)
+	if err != nil {
+		t.Fatalf("failed to reload updated token: %v", err)
+	}
+	if updatedToken.RPMRateLimit == nil || *updatedToken.RPMRateLimit != existingRPMRateLimit {
+		t.Fatalf("regular token update changed admin RPM limit: %+v", updatedToken.RPMRateLimit)
 	}
 }
 

@@ -35,8 +35,12 @@ return 1
 
 func tokenRPMRateLimit(c *gin.Context) bool {
 	tokenID := c.GetInt("token_id")
-	rpm, limited := common.TokenRPMRateLimits[tokenID]
-	if !limited {
+	rpmValue, configured := c.Get("token_rpm_rate_limit")
+	rpm, ok := rpmValue.(int)
+	if !configured || !ok {
+		rpm = common.TokenRPMRateLimits[tokenID]
+	}
+	if rpm <= 0 {
 		return true
 	}
 

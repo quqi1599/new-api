@@ -31,6 +31,7 @@ type Token struct {
 	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
 	Group              string         `json:"group" gorm:"default:''"`
 	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	RPMRateLimit       *int           `json:"rpm_rate_limit"`
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 
@@ -57,6 +58,13 @@ func (token *Token) GetFullKey() string {
 
 func (token *Token) GetMaskedKey() string {
 	return MaskTokenKey(token.Key)
+}
+
+func (token *Token) GetRPMRateLimit() int {
+	if token.RPMRateLimit != nil {
+		return *token.RPMRateLimit
+	}
+	return common.TokenRPMRateLimits[token.Id]
 }
 
 func (token *Token) GetIpLimits() []string {
@@ -386,7 +394,7 @@ func (token *Token) Update() (err error) {
 		}
 	}()
 	err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry").Updates(token).Error
+		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "rpm_rate_limit").Updates(token).Error
 	return err
 }
 
