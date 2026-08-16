@@ -906,6 +906,30 @@ func (channel *Channel) GetSetting() dto.ChannelSettings {
 	return setting
 }
 
+// SupportsEndpointType is the strict capability gate used before a channel is
+// selected for endpoint-specific protocols. Alpha Search remains disabled for
+// ordinary OpenAI-compatible channels unless an administrator explicitly
+// declares that the upstream implements the standalone Codex endpoint.
+func (channel *Channel) SupportsEndpointType(endpointType constant.EndpointType) bool {
+	if channel == nil || endpointType == "" {
+		return channel != nil && endpointType == ""
+	}
+	if endpointType != constant.EndpointTypeOpenAIAlphaSearch {
+		return true
+	}
+	if channel.Type == constant.ChannelTypeCodex {
+		return true
+	}
+	if channel.Setting == nil || strings.TrimSpace(*channel.Setting) == "" {
+		return false
+	}
+	var setting dto.ChannelSettings
+	if err := common.Unmarshal([]byte(*channel.Setting), &setting); err != nil {
+		return false
+	}
+	return setting.AlphaSearchEnabled
+}
+
 func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
 	settingBytes, err := common.Marshal(setting)
 	if err != nil {

@@ -14,6 +14,7 @@ const (
 	RelayFormatGemini                                = "gemini"
 	RelayFormatOpenAIResponses                       = "openai_responses"
 	RelayFormatOpenAIResponsesCompaction             = "openai_responses_compaction"
+	RelayFormatOpenAIAlphaSearch                     = "openai_alpha_search"
 	RelayFormatOpenAIAudio                           = "openai_audio"
 	RelayFormatOpenAIImage                           = "openai_image"
 	RelayFormatOpenAIRealtime                        = "openai_realtime"
@@ -35,10 +36,19 @@ func RelayFormatToPreferredChannelTypes(format RelayFormat) []int {
 		return []int{constant.ChannelTypeAnthropic}
 	case RelayFormatGemini:
 		return []int{constant.ChannelTypeGemini}
-	case RelayFormatOpenAIResponses, RelayFormatOpenAIResponsesCompaction:
+	case RelayFormatOpenAIResponses, RelayFormatOpenAIResponsesCompaction, RelayFormatOpenAIAlphaSearch:
 		return []int{constant.ChannelTypeOpenAI, constant.ChannelTypeCodex}
 	}
 	return nil
+}
+
+// RelayFormatToRequiredEndpointType returns a strict channel capability. A
+// zero value means the existing preference-only selection behavior is used.
+func RelayFormatToRequiredEndpointType(format RelayFormat) constant.EndpointType {
+	if format == RelayFormatOpenAIAlphaSearch {
+		return constant.EndpointTypeOpenAIAlphaSearch
+	}
+	return ""
 }
 
 // PathToPreferredChannelTypes derives preferred channel types from the request URL path.
@@ -51,10 +61,19 @@ func PathToPreferredChannelTypes(path string) []int {
 		return []int{constant.ChannelTypeGemini}
 	case strings.HasPrefix(path, "/v1/responses"):
 		return []int{constant.ChannelTypeOpenAI, constant.ChannelTypeCodex}
+	case strings.HasPrefix(path, "/v1/alpha/search"):
+		return []int{constant.ChannelTypeOpenAI, constant.ChannelTypeCodex}
 	case isOpenAIPath(path):
 		return []int{constant.ChannelTypeOpenAI}
 	}
 	return nil
+}
+
+func PathToRequiredEndpointType(path string) constant.EndpointType {
+	if strings.HasPrefix(path, "/v1/alpha/search") {
+		return constant.EndpointTypeOpenAIAlphaSearch
+	}
+	return ""
 }
 
 func isOpenAIPath(path string) bool {

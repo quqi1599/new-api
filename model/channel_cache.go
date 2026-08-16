@@ -102,9 +102,13 @@ func SyncChannelCache(frequency int) {
 }
 
 func GetRandomSatisfiedChannel(group string, model string, retry int, preferredChannelTypes []int, excludedChannelIds []int) (*Channel, error) {
+	return GetRandomSatisfiedChannelForEndpoint(group, model, retry, preferredChannelTypes, "", excludedChannelIds)
+}
+
+func GetRandomSatisfiedChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannel(group, model, retry, preferredChannelTypes, excludedChannelIds)
+		return GetChannelForEndpoint(group, model, retry, preferredChannelTypes, requiredEndpointType, excludedChannelIds)
 	}
 
 	channelSyncLock.RLock()
@@ -121,6 +125,16 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, preferredC
 
 	if len(channels) == 0 {
 		return nil, nil
+	}
+
+	if requiredEndpointType != "" {
+		capable := make([]int, 0, len(channels))
+		for _, channelID := range channels {
+			if channel, ok := channelsIDM[channelID]; ok && channel.SupportsEndpointType(requiredEndpointType) {
+				capable = append(capable, channelID)
+			}
+		}
+		channels = capable
 	}
 
 	// If preferred channel types are set, filter channels to prioritize native types

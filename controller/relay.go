@@ -108,6 +108,8 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		err = relay.EmbeddingHelper(c, info)
 	case relayconstant.RelayModeResponses, relayconstant.RelayModeResponsesCompact:
 		err = relay.ResponsesHelper(c, info)
+	case relayconstant.RelayModeAlphaSearch:
+		err = relay.AlphaSearchHelper(c, info)
 	default:
 		err = relay.TextHelper(c, info)
 	}
@@ -234,6 +236,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		ModelName:             relayInfo.OriginModelName,
 		Retry:                 common.GetPointer(0),
 		PreferredChannelTypes: types.RelayFormatToPreferredChannelTypes(relayInfo.RelayFormat),
+		RequiredEndpointType:  types.RelayFormatToRequiredEndpointType(relayInfo.RelayFormat),
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
@@ -664,7 +667,7 @@ func canRetryAfterExplicitUpstreamFailure(relayFormat types.RelayFormat, relayEr
 	// Realtime upgrades and asynchronous task submissions need protocol-level
 	// idempotency/job recovery rather than replaying a possibly accepted request.
 	switch relayFormat {
-	case types.RelayFormatOpenAIRealtime, types.RelayFormatTask, types.RelayFormatMjProxy:
+	case types.RelayFormatOpenAIRealtime, types.RelayFormatOpenAIAlphaSearch, types.RelayFormatTask, types.RelayFormatMjProxy:
 		return false
 	default:
 		return true

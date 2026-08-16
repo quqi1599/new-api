@@ -21,8 +21,9 @@ type RetryParam struct {
 	ModelName             string
 	Retry                 *int
 	resetNextTry          bool
-	PreferredChannelTypes []int // native channel types to prioritize based on request path
-	ExcludedChannelIds    []int // channels that have already failed in this request
+	PreferredChannelTypes []int                 // native channel types to prioritize based on request path
+	RequiredEndpointType  constant.EndpointType // strict endpoint capability; empty keeps legacy selection
+	ExcludedChannelIds    []int                 // channels that have already failed in this request
 	CircuitRetryAfter     time.Duration
 	CircuitSkippedIds     []int
 }
@@ -176,7 +177,7 @@ func cacheGetRandomSatisfiedChannelOnce(param *RetryParam) (*model.Channel, stri
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannel(autoGroup, param.ModelName, priorityRetry, param.PreferredChannelTypes, excludedChannelIds)
+			channel, _ = model.GetRandomSatisfiedChannelForEndpoint(autoGroup, param.ModelName, priorityRetry, param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIds)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -214,7 +215,7 @@ func cacheGetRandomSatisfiedChannelOnce(param *RetryParam) (*model.Channel, stri
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannel(param.TokenGroup, param.ModelName, param.GetRetry(), param.PreferredChannelTypes, excludedChannelIds)
+		channel, err = model.GetRandomSatisfiedChannelForEndpoint(param.TokenGroup, param.ModelName, param.GetRetry(), param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIds)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}

@@ -112,6 +112,9 @@ func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, request
 }
 
 func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (usage any, err *types.NewAPIError) {
+	if info.RelayMode == relayconstant.RelayModeAlphaSearch {
+		return nil, types.NewError(errors.New("codex channel: alpha search response is handled by AlphaSearchHelper"), types.ErrorCodeInvalidRequest)
+	}
 	if info.RelayMode != relayconstant.RelayModeResponses && info.RelayMode != relayconstant.RelayModeResponsesCompact {
 		return nil, types.NewError(errors.New("codex channel: endpoint not supported"), types.ErrorCodeInvalidRequest)
 	}
@@ -135,12 +138,16 @@ func (a *Adaptor) GetChannelName() string {
 }
 
 func (a *Adaptor) GetRequestURL(info *relaycommon.RelayInfo) (string, error) {
-	if info.RelayMode != relayconstant.RelayModeResponses && info.RelayMode != relayconstant.RelayModeResponsesCompact {
-		return "", errors.New("codex channel: only /v1/responses and /v1/responses/compact are supported")
-	}
-	path := "/backend-api/codex/responses"
-	if info.RelayMode == relayconstant.RelayModeResponsesCompact {
+	var path string
+	switch info.RelayMode {
+	case relayconstant.RelayModeResponses:
+		path = "/backend-api/codex/responses"
+	case relayconstant.RelayModeResponsesCompact:
 		path = "/backend-api/codex/responses/compact"
+	case relayconstant.RelayModeAlphaSearch:
+		path = "/backend-api/codex/alpha/search"
+	default:
+		return "", errors.New("codex channel: only responses, compact and alpha search are supported")
 	}
 	return relaycommon.GetFullRequestURL(info.ChannelBaseUrl, path, info.ChannelType), nil
 }

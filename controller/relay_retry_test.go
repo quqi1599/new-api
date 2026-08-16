@@ -258,6 +258,21 @@ func TestRelayRetryStopsAfterAnyStreamProgress(t *testing.T) {
 			t.Fatal("a possibly accepted asynchronous task must not be replayed")
 		}
 	})
+
+	t.Run("explicit upstream failure does not replay alpha search", func(t *testing.T) {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		info := &relaycommon.RelayInfo{}
+		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		upstreamErr := types.NewErrorWithStatusCode(
+			errors.New("upstream 500"),
+			types.ErrorCodeBadResponseStatusCode,
+			http.StatusInternalServerError,
+			types.ErrOptionWithUpstreamResponse(),
+		)
+		if !relayRetryIsUnsafe(c, info, types.RelayFormatOpenAIAlphaSearch, upstreamErr) {
+			t.Fatal("a possibly accepted standalone search must not be replayed")
+		}
+	})
 }
 
 func TestExplicitUpstreamStatusesRetryAcrossSynchronousFormats(t *testing.T) {
