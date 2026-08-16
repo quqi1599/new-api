@@ -2,10 +2,12 @@ package helper
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -33,6 +35,20 @@ func TestGetAndValidateAlphaSearchRequest(t *testing.T) {
 
 	if _, err := GetAndValidateAlphaSearchRequest(newContext(`{"query":"weather"}`)); err == nil {
 		t.Fatal("expected missing model error")
+	} else {
+		var relayErr *types.NewAPIError
+		if !errors.As(err, &relayErr) {
+			t.Fatalf("missing model error type = %T, want *types.NewAPIError", err)
+		}
+		if relayErr.StatusCode != http.StatusBadRequest {
+			t.Fatalf("missing model status = %d, want %d", relayErr.StatusCode, http.StatusBadRequest)
+		}
+		if relayErr.GetErrorCode() != types.ErrorCodeInvalidRequest {
+			t.Fatalf("missing model error code = %q, want %q", relayErr.GetErrorCode(), types.ErrorCodeInvalidRequest)
+		}
+		if !types.IsSkipRetryError(relayErr) {
+			t.Fatal("missing model error must skip retry")
+		}
 	}
 	if _, err := GetAndValidateAlphaSearchRequest(newContext(`{"model":`)); err == nil {
 		t.Fatal("expected invalid JSON error")
