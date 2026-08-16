@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -165,7 +166,12 @@ func GetAndValidateAlphaSearchRequest(c *gin.Context) (*dto.AlphaSearchRequest, 
 		return nil, err
 	}
 	if strings.TrimSpace(request.Model) == "" {
-		return nil, errors.New("model is required")
+		return nil, types.NewErrorWithStatusCode(
+			errors.New("model is required"),
+			types.ErrorCodeInvalidRequest,
+			http.StatusBadRequest,
+			types.ErrOptionWithSkipRetry(),
+		)
 	}
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
