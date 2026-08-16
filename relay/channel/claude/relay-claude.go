@@ -20,6 +20,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relay/reasonmap"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/openaicompat"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
@@ -52,25 +53,25 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 	claudeTools := make([]any, 0, len(textRequest.Tools))
 
 	for _, tool := range textRequest.Tools {
-		if params, ok := tool.Function.Parameters.(map[string]any); ok {
-			claudeTool := dto.Tool{
-				Name:        tool.Function.Name,
-				Description: tool.Function.Description,
-			}
-			claudeTool.InputSchema = make(map[string]interface{})
-			if params["type"] != nil {
-				claudeTool.InputSchema["type"] = params["type"].(string)
-			}
-			claudeTool.InputSchema["properties"] = params["properties"]
-			claudeTool.InputSchema["required"] = params["required"]
-			for s, a := range params {
-				if s == "type" || s == "properties" || s == "required" {
-					continue
-				}
-				claudeTool.InputSchema[s] = a
-			}
-			claudeTools = append(claudeTools, &claudeTool)
+		params, hasParameters := tool.Function.Parameters.(map[string]any)
+		if !hasParameters && tool.Type != "function" {
+			continue
 		}
+		inputSchema := make(map[string]interface{}, len(params)+2)
+		for key, value := range params {
+			inputSchema[key] = value
+		}
+		if inputSchema["type"] == nil {
+			inputSchema["type"] = "object"
+		}
+		if inputSchema["properties"] == nil {
+			inputSchema["properties"] = map[string]interface{}{}
+		}
+		claudeTools = append(claudeTools, &dto.Tool{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			InputSchema: inputSchema,
+		})
 	}
 
 	// Web search tool
@@ -129,7 +130,9 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		Model:         textRequest.Model,
 		StopSequences: nil,
 		Temperature:   textRequest.Temperature,
-		Tools:         claudeTools,
+	}
+	if len(claudeTools) > 0 {
+		claudeRequest.Tools = claudeTools
 	}
 	if maxTokens := textRequest.GetMaxTokens(); maxTokens > 0 {
 		claudeRequest.MaxTokens = common.GetPointer(maxTokens)
@@ -421,7 +424,7 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 					for _, toolCall := range message.ParseToolCalls() {
 						inputObj := make(map[string]any)
 						if args := toolCall.Function.Arguments; args != "" {
-							if err := json.Unmarshal([]byte(args), &inputObj); err != nil {
+							if err := common.Unmarshal([]byte(args), &inputObj); err != nil {
 								common.SysLog("tool call function arguments is not a map[string]any: " + fmt.Sprintf("%v", toolCall.Function.Arguments))
 							}
 						}
@@ -617,22 +620,15 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 		Object:  "chat.completion",
 		Created: common.GetTimestamp(),
 	}
-	var responseText string
-	var responseThinking string
-	if len(claudeResponse.Content) > 0 {
-		responseText = claudeResponse.Content[0].GetText()
-		if claudeResponse.Content[0].Thinking != nil {
-			responseThinking = *claudeResponse.Content[0].Thinking
-		}
-	}
+	var responseText strings.Builder
 	tools := make([]dto.ToolCallResponse, 0)
-	thinkingContent := ""
+	var thinkingContent strings.Builder
 
 	fullTextResponse.Id = claudeResponse.Id
 	for _, message := range claudeResponse.Content {
 		switch message.Type {
 		case "tool_use":
-			args, _ := json.Marshal(message.Input)
+			args, _ := common.Marshal(message.Input)
 			tools = append(tools, dto.ToolCallResponse{
 				ID:   message.Id,
 				Type: "function", // compatible with other OpenAI derivative applications
@@ -644,10 +640,10 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 		case "thinking":
 			// 加密的不管， 只输出明文的推理过程
 			if message.Thinking != nil {
-				thinkingContent = *message.Thinking
+				thinkingContent.WriteString(*message.Thinking)
 			}
 		case "text":
-			responseText = message.GetText()
+			responseText.WriteString(message.GetText())
 		}
 	}
 	choice := dto.OpenAITextResponseChoice{
@@ -657,15 +653,13 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 		},
 		FinishReason: stopReasonClaude2OpenAI(claudeResponse.StopReason),
 	}
-	choice.SetStringContent(responseText)
-	if len(responseThinking) > 0 {
-		choice.ReasoningContent = &responseThinking
-	}
+	choice.SetStringContent(responseText.String())
 	if len(tools) > 0 {
 		choice.Message.SetToolCalls(tools)
 	}
-	if thinkingContent != "" {
-		choice.Message.ReasoningContent = &thinkingContent
+	if thinkingContent.Len() > 0 {
+		thinking := thinkingContent.String()
+		choice.Message.ReasoningContent = &thinking
 	}
 	fullTextResponse.Model = claudeResponse.Model
 	choices = append(choices, choice)
@@ -1033,6 +1027,117 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	return claudeInfo.Usage, nil
 }
 
+// ClaudeResponsesStreamHandler converts an Anthropic Messages stream back to
+// the OpenAI Responses event contract while preserving the fork's stream
+// acceptance, timeout and no-terminal-after-interruption guarantees.
+func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	defer service.CloseResponseBodyGracefully(resp)
+
+	claudeInfo := &ClaudeResponseInfo{
+		ResponseId:   helper.GetResponseID(c),
+		Created:      common.GetTimestamp(),
+		Model:        info.UpstreamModelName,
+		ResponseText: strings.Builder{},
+		Usage:        &dto.Usage{},
+	}
+	state := openaicompat.NewChatToResponsesStreamState(claudeInfo.ResponseId, info.UpstreamModelName)
+	var streamErr *types.NewAPIError
+
+	sendEvents := func(events []openaicompat.ChatToResponsesStreamEvent) bool {
+		for _, event := range events {
+			data, err := common.Marshal(event.Payload)
+			if err != nil {
+				streamErr = types.NewError(err, types.ErrorCodeJsonMarshalFailed)
+				return false
+			}
+			helper.ExtendWriteDeadline(c)
+			if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+				return false
+			}
+		}
+		return true
+	}
+
+	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if streamErr != nil {
+			sr.Stop(streamErr)
+			return
+		}
+		var claudeResponse dto.ClaudeResponse
+		if err := common.UnmarshalJsonStr(data, &claudeResponse); err != nil {
+			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+			sr.Stop(streamErr)
+			return
+		}
+		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
+			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+			sr.Stop(streamErr)
+			return
+		}
+		if claudeResponse.Type == "" {
+			streamErr = types.NewError(fmt.Errorf("claude stream event is missing type"), types.ErrorCodeBadResponseBody)
+			sr.Stop(streamErr)
+			return
+		}
+		if claudeResponse.Type == "ping" {
+			return
+		}
+		if !sr.Accept() {
+			return
+		}
+
+		if claudeResponse.StopReason != "" {
+			maybeMarkClaudeRefusal(c, claudeResponse.StopReason)
+		}
+		if claudeResponse.Delta != nil && claudeResponse.Delta.StopReason != nil {
+			maybeMarkClaudeRefusal(c, *claudeResponse.Delta.StopReason)
+		}
+		chatChunk := StreamResponseClaude2OpenAI(&claudeResponse)
+		FormatClaudeResponseInfo(&claudeResponse, chatChunk, claudeInfo)
+		if claudeResponse.Message != nil && claudeResponse.Message.Model != "" {
+			info.UpstreamModelName = claudeResponse.Message.Model
+		}
+		if claudeResponse.Usage != nil && claudeResponse.Usage.ServerToolUse != nil && claudeResponse.Usage.ServerToolUse.WebSearchRequests > 0 {
+			c.Set("claude_web_search_requests", claudeResponse.Usage.ServerToolUse.WebSearchRequests)
+		}
+		if chatChunk != nil {
+			events, err := openaicompat.ChatCompletionsStreamChunkToResponsesEvents(chatChunk, state)
+			if err != nil {
+				streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
+				sr.Stop(streamErr)
+				return
+			}
+			if !sendEvents(events) {
+				sr.Stop(streamErr)
+				return
+			}
+		}
+
+		if claudeResponse.Type == "message_stop" {
+			FinalizeClaudeUsage(c, info, claudeInfo)
+			usage := buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage)
+			state.SetUsage(&usage)
+			if !sendEvents(openaicompat.FinalizeChatCompletionsStreamToResponses(state)) {
+				sr.Stop(streamErr)
+				return
+			}
+			sr.Done()
+		}
+	})
+
+	if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
+		return nil, preOutputErr
+	}
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	if !helper.ShouldFinalizeStream(info) {
+		FinalizeClaudeUsage(c, info, claudeInfo)
+	}
+	return claudeInfo.Usage, nil
+}
+
 func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo, httpResp *http.Response, data []byte) *types.NewAPIError {
 	var claudeResponse dto.ClaudeResponse
 	err := common.Unmarshal(data, &claudeResponse)
@@ -1061,7 +1166,18 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	case types.RelayFormatOpenAI:
 		openaiResponse := ResponseClaude2OpenAI(&claudeResponse)
 		openaiResponse.Usage = buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage)
-		responseData, err = json.Marshal(openaiResponse)
+		responseData, err = common.Marshal(openaiResponse)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeBadResponseBody)
+		}
+	case types.RelayFormatOpenAIResponses:
+		openaiResponse := ResponseClaude2OpenAI(&claudeResponse)
+		openaiResponse.Usage = buildOpenAIStyleUsageFromClaudeUsage(claudeInfo.Usage)
+		responsesResponse, _, convertErr := service.ChatCompletionsResponseToResponsesResponse(openaiResponse, helper.GetResponseID(c))
+		if convertErr != nil {
+			return types.NewError(convertErr, types.ErrorCodeBadResponseBody)
+		}
+		responseData, err = common.Marshal(responsesResponse)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeBadResponseBody)
 		}
