@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 )
 
 func TestGetRandomSatisfiedChannelDoesNotReuseExcludedChannels(t *testing.T) {
@@ -43,5 +44,56 @@ func TestGetRandomSatisfiedChannelDoesNotReuseExcludedChannels(t *testing.T) {
 	channel, err = GetRandomSatisfiedChannel("default", "gpt-5.5", 0, nil, []int{9, 131})
 	if err != nil || channel != nil {
 		t.Fatalf("fully excluded channel = %#v, err = %v", channel, err)
+	}
+}
+
+func TestGetRandomSatisfiedChannelForAlphaSearchFiltersUnsupportedChannels(t *testing.T) {
+	oldMemoryCacheEnabled := common.MemoryCacheEnabled
+	oldGroups := group2model2channels
+	oldChannels := channelsIDM
+	oldProtectedChannelIds := apiKeyPolicyProtectedChannelIds
+	t.Cleanup(func() {
+		common.MemoryCacheEnabled = oldMemoryCacheEnabled
+		group2model2channels = oldGroups
+		channelsIDM = oldChannels
+		apiKeyPolicyProtectedChannelIds = oldProtectedChannelIds
+	})
+
+	common.MemoryCacheEnabled = true
+	group2model2channels = map[string]map[string][]int{
+		"default": {"gpt-5.5": {1, 9}},
+	}
+	highPriority := int64(100)
+	lowPriority := int64(0)
+	weight := uint(1)
+	alphaEnabled := `{"alpha_search_enabled":true}`
+	channelsIDM = map[int]*Channel{
+		1: {Id: 1, Type: constant.ChannelTypeOpenAI, Priority: &highPriority, Weight: &weight},
+		9: {Id: 9, Type: constant.ChannelTypeOpenAI, Setting: &alphaEnabled, Priority: &lowPriority, Weight: &weight},
+	}
+
+	channel, err := GetRandomSatisfiedChannelForEndpoint(
+		"default",
+		"gpt-5.5",
+		0,
+		[]int{constant.ChannelTypeOpenAI},
+		constant.EndpointTypeOpenAIAlphaSearch,
+		nil,
+	)
+	if err != nil || channel == nil || channel.Id != 9 {
+		t.Fatalf("selected channel = %#v, err = %v", channel, err)
+	}
+
+	channel.Setting = nil
+	channel, err = GetRandomSatisfiedChannelForEndpoint(
+		"default",
+		"gpt-5.5",
+		0,
+		[]int{constant.ChannelTypeOpenAI},
+		constant.EndpointTypeOpenAIAlphaSearch,
+		nil,
+	)
+	if err != nil || channel != nil {
+		t.Fatalf("unsupported channels must fail closed: channel = %#v, err = %v", channel, err)
 	}
 }

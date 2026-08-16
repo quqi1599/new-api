@@ -131,6 +131,13 @@ func Distribute() func(c *gin.Context) {
 				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
 					preferred, err := model.CacheGetChannel(preferredChannelID)
 					if err == nil && preferred != nil {
+						requiredEndpoint := types.PathToRequiredEndpointType(c.Request.URL.Path)
+						if !preferred.SupportsEndpointType(requiredEndpoint) {
+							service.ClearChannelAffinityForRequest(c)
+							preferred = nil
+						}
+					}
+					if preferred != nil {
 						if preferred.Status != common.ChannelStatusEnabled {
 							if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 								abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorAffinityChannelDisabled))
@@ -171,6 +178,7 @@ func Distribute() func(c *gin.Context) {
 						TokenGroup:            usingGroup,
 						Retry:                 common.GetPointer(0),
 						PreferredChannelTypes: types.PathToPreferredChannelTypes(c.Request.URL.Path),
+						RequiredEndpointType:  types.PathToRequiredEndpointType(c.Request.URL.Path),
 					})
 					if err != nil {
 						showGroup := usingGroup

@@ -195,6 +195,7 @@ const EditChannelModal = (props) => {
     pass_through_body_enabled: false,
     system_prompt: '',
     system_prompt_override: false,
+    alpha_search_enabled: false,
     settings: '',
     // 仅 Vertex: 密钥格式（存入 settings.vertex_key_type）
     vertex_key_type: 'json',
@@ -518,6 +519,7 @@ const EditChannelModal = (props) => {
     proxy: '',
     pass_through_body_enabled: false,
     system_prompt: '',
+    alpha_search_enabled: false,
   });
   const showApiConfigCard = true; // 控制是否显示 API 配置卡片
   const getInitValues = () => ({ ...originInputs });
@@ -871,6 +873,8 @@ const EditChannelModal = (props) => {
           data.system_prompt = parsedSettings.system_prompt || '';
           data.system_prompt_override =
             parsedSettings.system_prompt_override || false;
+          data.alpha_search_enabled =
+            parsedSettings.alpha_search_enabled === true;
         } catch (error) {
           console.error('解析渠道设置失败:', error);
           data.force_format = false;
@@ -879,6 +883,7 @@ const EditChannelModal = (props) => {
           data.pass_through_body_enabled = false;
           data.system_prompt = '';
           data.system_prompt_override = false;
+          data.alpha_search_enabled = false;
         }
       } else {
         data.force_format = false;
@@ -887,6 +892,7 @@ const EditChannelModal = (props) => {
         data.pass_through_body_enabled = false;
         data.system_prompt = '';
         data.system_prompt_override = false;
+        data.alpha_search_enabled = false;
       }
 
       if (data.settings) {
@@ -1000,6 +1006,7 @@ const EditChannelModal = (props) => {
         pass_through_body_enabled: data.pass_through_body_enabled,
         system_prompt: data.system_prompt,
         system_prompt_override: data.system_prompt_override || false,
+        alpha_search_enabled: data.alpha_search_enabled === true,
       });
       initialModelsRef.current = (data.models || [])
         .map((model) => (model || '').trim())
@@ -1041,6 +1048,7 @@ const EditChannelModal = (props) => {
         data.thinking_to_content ||
         data.pass_through_body_enabled ||
         data.force_format ||
+        data.alpha_search_enabled ||
         data.claude_beta_query ||
         data.system_prompt_override ||
         data.api_key_policy_protection_enabled;
@@ -1390,6 +1398,7 @@ const EditChannelModal = (props) => {
       pass_through_body_enabled: false,
       system_prompt: '',
       system_prompt_override: false,
+      alpha_search_enabled: false,
     });
     // 重置密钥模式状态
     setKeyMode('append');
@@ -1760,6 +1769,7 @@ const EditChannelModal = (props) => {
       pass_through_body_enabled: localInputs.pass_through_body_enabled || false,
       system_prompt: localInputs.system_prompt || '',
       system_prompt_override: localInputs.system_prompt_override || false,
+      alpha_search_enabled: localInputs.alpha_search_enabled === true,
     };
     localInputs.setting = JSON.stringify(channelExtraSettings);
 
@@ -1843,6 +1853,7 @@ const EditChannelModal = (props) => {
     delete localInputs.pass_through_body_enabled;
     delete localInputs.system_prompt;
     delete localInputs.system_prompt_override;
+    delete localInputs.alpha_search_enabled;
     delete localInputs.is_enterprise_account;
     // 顶层的 vertex_key_type 不应发送给后端
     delete localInputs.vertex_key_type;
@@ -2550,7 +2561,10 @@ const EditChannelModal = (props) => {
                   )}
 
                   {inputs.type === 1 && (
-                    <Form.Switch field='force_format' label={t('强制格式化')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('force_format', value)} extraText={t('强制将响应格式化为 OpenAI 标准格式（只适用于OpenAI渠道类型）')} />
+                    <>
+                      <Form.Switch field='force_format' label={t('强制格式化')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('force_format', value)} extraText={t('强制将响应格式化为 OpenAI 标准格式（只适用于OpenAI渠道类型）')} />
+                      <Form.Switch field='alpha_search_enabled' label={t('Codex 独立联网搜索')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('alpha_search_enabled', value)} extraText={t('仅在上游明确支持 /v1/alpha/search 时开启')} />
+                    </>
                   )}
 
                   <Form.Switch field='thinking_to_content' label={t('思考内容转换')} checkedText={t('开')} uncheckedText={t('关')} onChange={(value) => handleChannelSettingsChange('thinking_to_content', value)} extraText={t('将 reasoning_content 转换为 <think> 标签拼接到内容中')} />
