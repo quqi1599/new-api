@@ -84,6 +84,12 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 }
 
 func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+	defer func() {
+		localAuditBlocked := resp != nil && strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-CPA-Local-Guard")), "content-audit")
+		if newApiErr != nil && (localAuditBlocked || newApiErr.GetErrorCode() == types.ErrorCodeCPAContentAuditBlocked) {
+			newApiErr = types.NewError(newApiErr, newApiErr.GetErrorCode(), types.ErrOptionWithSkipRetry())
+		}
+	}()
 	defer CloseResponseBodyGracefully(resp)
 	newApiErr = types.InitOpenAIError(
 		types.ErrorCodeBadResponseStatusCode,

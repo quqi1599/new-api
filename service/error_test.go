@@ -204,6 +204,37 @@ func TestRelayErrorHandlerPreservesTypedBodyTimeout(t *testing.T) {
 	require.True(t, body.closed)
 }
 
+func TestRelayErrorHandlerTreatsCPAContentAuditBlockAsTerminalRequestError(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"blocked before upstream","type":"content_safety_blocked","code":"cpa_content_audit_blocked","audit_id":"aud_test"}}`)),
+	}
+
+	got := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, got)
+	require.Equal(t, types.ErrorCodeCPAContentAuditBlocked, got.GetErrorCode())
+	require.Equal(t, http.StatusBadRequest, got.StatusCode)
+	require.True(t, types.IsSkipRetryError(got))
+	require.False(t, ShouldDisableChannel(got))
+}
+
+func TestRelayErrorHandlerUsesCPALocalGuardHeaderAcrossProtocolErrorShapes(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"code":400,"message":"blocked before upstream","status":"INVALID_ARGUMENT"}}`)),
+	}
+	resp.Header.Set("X-CPA-Local-Guard", "content-audit")
+
+	got := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, got)
+	require.Equal(t, http.StatusBadRequest, got.StatusCode)
+	require.True(t, types.IsSkipRetryError(got))
+	require.False(t, ShouldDisableChannel(got))
+}
+
 func TestTaskErrorWrapperPreservesTypedTimeout(t *testing.T) {
 	typedTimeout := types.NewErrorWithStatusCode(
 		errors.New("upstream response headers timed out"),
