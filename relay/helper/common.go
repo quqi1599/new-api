@@ -58,6 +58,40 @@ func SetEventStreamHeaders(c *gin.Context) {
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 }
 
+// StreamStarted reports whether the downstream HTTP response has already been
+// committed. Once this is true, callers must keep all further delivery inside
+// the negotiated stream framing instead of falling back to an HTTP JSON error.
+func StreamStarted(c *gin.Context) bool {
+	return c != nil && c.Writer != nil && c.Writer.Written()
+}
+
+// SendInBandStreamError delivers an error without corrupting an already-started
+// SSE response. Pre-output errors must remain controller-visible so the
+// controller can still choose the HTTP status code and response envelope.
+func SendInBandStreamError(c *gin.Context, relayFormat types.RelayFormat, relayErr *types.NewAPIError) error {
+	if relayErr == nil {
+		return errors.New("relay error is nil")
+	}
+	if !StreamStarted(c) {
+		return errors.New("stream has not started")
+	}
+
+	ExtendWriteDeadline(c)
+	switch relayFormat {
+	case types.RelayFormatClaude:
+		return ClaudeData(c, dto.ClaudeResponse{
+			Type:  "error",
+			Error: relayErr.ToClaudeError(),
+		})
+	case types.RelayFormatOpenAI:
+		return ObjectData(c, struct {
+			Error types.OpenAIError `json:"error"`
+		}{Error: relayErr.ToOpenAIError()})
+	default:
+		return fmt.Errorf("unsupported relay format for in-band stream error: %s", relayFormat)
+	}
+}
+
 func ClaudeData(c *gin.Context, resp dto.ClaudeResponse) error {
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())

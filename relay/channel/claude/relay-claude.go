@@ -883,7 +883,13 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		return "", types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		return claudeResponse.Type, types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		apiErr := types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		if helper.StreamStarted(c) {
+			if writeErr := helper.SendInBandStreamError(c, info.RelayFormat, apiErr); writeErr != nil {
+				logger.LogError(c, "send in-band stream error failed: "+writeErr.Error())
+			}
+		}
+		return claudeResponse.Type, apiErr
 	}
 	if claudeResponse.Type == "" {
 		return "", types.NewError(fmt.Errorf("claude stream event is missing type"), types.ErrorCodeBadResponseBody)
