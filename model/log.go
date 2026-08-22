@@ -245,6 +245,73 @@ func GetLogByTokenIdCursor(ctx context.Context, tokenId int, startTimestamp int6
 	return logs, nextBeforeId, nil
 }
 
+type TokenLogKeysetCursor struct {
+	CreatedAt int64  `json:"created_at"`
+	Id        int    `json:"id,omitempty"`
+	RequestId string `json:"request_id,omitempty"`
+}
+
+// GetLogByTokenIdKeyset reads a bounded token-log page in the same order as
+// the existing token/created_at/id index. Unlike OFFSET pagination, the next
+// page starts after the last row from the previous page and never performs an
+// exact COUNT(*). The caller must provide a bounded time range so PostgreSQL
+// can prune unrelated created_at partitions.
+func GetLogByTokenIdKeyset(ctx context.Context, tokenId int, startTimestamp int64, endTimestamp int64, cursor *TokenLogKeysetCursor, num int, startIdx int) (logs []*Log, nextCursor *TokenLogKeysetCursor, hasMore bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if num <= 0 {
+		num = common.ItemsPerPage
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	tx := LOG_DB.WithContext(ctx).
+		Model(&Log{}).
+		Where("token_id = ?", tokenId).
+		Where("created_at >= ?", startTimestamp).
+		Where("created_at <= ?", endTimestamp)
+	order := "created_at desc, id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("")
+		if cursor != nil {
+			tx = tx.Where(
+				"(created_at < ?) OR (created_at = ? AND request_id < ?)",
+				cursor.CreatedAt,
+				cursor.CreatedAt,
+				cursor.RequestId,
+			)
+		}
+	} else if cursor != nil {
+		tx = tx.Where(
+			"(created_at < ?) OR (created_at = ? AND id < ?)",
+			cursor.CreatedAt,
+			cursor.CreatedAt,
+			cursor.Id,
+		)
+	}
+
+	err = tx.Order(order).Limit(num + 1).Find(&logs).Error
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(logs) > num {
+		hasMore = true
+		logs = logs[:num]
+	}
+	if hasMore && len(logs) > 0 {
+		lastLog := logs[len(logs)-1]
+		nextCursor = &TokenLogKeysetCursor{
+			CreatedAt: lastLog.CreatedAt,
+			Id:        lastLog.Id,
+			RequestId: lastLog.RequestId,
+		}
+	}
+	formatUserLogs(logs, startIdx)
+	return logs, nextCursor, hasMore, nil
+}
+
 func CountLogByTokenIdRange(tokenId int, startTimestamp int64, endTimestamp int64) (total int64, err error) {
 	tx := LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId)
 	if startTimestamp != 0 {

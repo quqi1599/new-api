@@ -1,10 +1,12 @@
 package controller
 
 import (
+	"encoding/base64"
 	"encoding/csv"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,11 +16,25 @@ import (
 )
 
 const tokenLogMaxPageSize = 1000
+const tokenLogCursorDefaultPageSize = 100
+const tokenLogCursorMaxPageSize = 200
+const tokenLogCursorVersion = 1
+const tokenLogCursorMaxLength = 1024
 const tokenLogExportBatchSize = 1000
 const tokenLogExportMaxConcurrent = 2
 const tokenLogExportMaxRangeSeconds int64 = 31 * 24 * 60 * 60
 
 var tokenLogExportSlots = make(chan struct{}, tokenLogExportMaxConcurrent)
+
+type tokenLogCursorPayload struct {
+	Version        int    `json:"v"`
+	StartTimestamp int64  `json:"start_timestamp"`
+	EndTimestamp   int64  `json:"end_timestamp"`
+	CreatedAt      int64  `json:"created_at"`
+	Id             int    `json:"id,omitempty"`
+	RequestId      string `json:"request_id,omitempty"`
+	Offset         int    `json:"offset"`
+}
 
 func GetAllLogs(c *gin.Context) {
 	pageInfo := common.GetPageQuery(c)
@@ -91,6 +107,11 @@ func GetLogByKey(c *gin.Context) {
 		return
 	}
 
+	if hasTokenLogCursorQuery(c) {
+		getLogByKeyCursor(c, tokenId)
+		return
+	}
+
 	if hasTokenLogPageQuery(c) {
 		pageInfo := getTokenLogPageQuery(c)
 		startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
@@ -119,6 +140,203 @@ func GetLogByKey(c *gin.Context) {
 		"message": "",
 		"data":    logs,
 	})
+}
+
+func hasTokenLogCursorQuery(c *gin.Context) bool {
+	return strings.EqualFold(strings.TrimSpace(c.Query("pagination")), "cursor") ||
+		strings.TrimSpace(c.Query("cursor")) != ""
+}
+
+func getLogByKeyCursor(c *gin.Context, tokenId int) {
+	pageSize, err := getTokenLogCursorPageSize(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	startTimestamp, err := parseOptionalTimestamp(c.Query("start_timestamp"), "start_timestamp")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+	endTimestamp, err := parseOptionalTimestamp(c.Query("end_timestamp"), "end_timestamp")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": err.Error(),
+		})
+		return
+	}
+
+	cursorValue := strings.TrimSpace(c.Query("cursor"))
+	var cursorPayload *tokenLogCursorPayload
+	if cursorValue != "" {
+		cursorPayload, err = decodeTokenLogCursor(cursorValue)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+		if (startTimestamp != 0 && startTimestamp != cursorPayload.StartTimestamp) ||
+			(endTimestamp != 0 && endTimestamp != cursorPayload.EndTimestamp) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "游标与时间范围不匹配，请重新查询",
+			})
+			return
+		}
+		startTimestamp = cursorPayload.StartTimestamp
+		endTimestamp = cursorPayload.EndTimestamp
+	} else {
+		startTimestamp, endTimestamp, err = normalizeTokenLogCursorRange(startTimestamp, endTimestamp)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
+	}
+
+	startIdx := 0
+	var modelCursor *model.TokenLogKeysetCursor
+	if cursorPayload != nil {
+		startIdx = cursorPayload.Offset
+		modelCursor = &model.TokenLogKeysetCursor{
+			CreatedAt: cursorPayload.CreatedAt,
+			Id:        cursorPayload.Id,
+			RequestId: cursorPayload.RequestId,
+		}
+	}
+	logs, nextModelCursor, hasMore, err := model.GetLogByTokenIdKeyset(
+		c.Request.Context(),
+		tokenId,
+		startTimestamp,
+		endTimestamp,
+		modelCursor,
+		pageSize,
+		startIdx,
+	)
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
+
+	nextCursor := ""
+	if hasMore && nextModelCursor != nil {
+		nextCursor, err = encodeTokenLogCursor(tokenLogCursorPayload{
+			Version:        tokenLogCursorVersion,
+			StartTimestamp: startTimestamp,
+			EndTimestamp:   endTimestamp,
+			CreatedAt:      nextModelCursor.CreatedAt,
+			Id:             nextModelCursor.Id,
+			RequestId:      nextModelCursor.RequestId,
+			Offset:         startIdx + len(logs),
+		})
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	}
+
+	common.ApiSuccess(c, gin.H{
+		"items":           logs,
+		"page_size":       pageSize,
+		"has_more":        hasMore,
+		"next_cursor":     nextCursor,
+		"start_timestamp": startTimestamp,
+		"end_timestamp":   endTimestamp,
+	})
+}
+
+func getTokenLogCursorPageSize(c *gin.Context) (int, error) {
+	raw := ""
+	for _, key := range []string{"page_size", "ps", "size"} {
+		if value := strings.TrimSpace(c.Query(key)); value != "" {
+			raw = value
+			break
+		}
+	}
+	if raw == "" {
+		return tokenLogCursorDefaultPageSize, nil
+	}
+	pageSize, err := strconv.Atoi(raw)
+	if err != nil || pageSize <= 0 {
+		return 0, fmt.Errorf("page_size 参数无效")
+	}
+	if pageSize > tokenLogCursorMaxPageSize {
+		pageSize = tokenLogCursorMaxPageSize
+	}
+	return pageSize, nil
+}
+
+func normalizeTokenLogCursorRange(startTimestamp int64, endTimestamp int64) (int64, int64, error) {
+	now := time.Now().Unix()
+	if startTimestamp == 0 && endTimestamp == 0 {
+		endTimestamp = now
+		startTimestamp = endTimestamp - tokenLogExportMaxRangeSeconds
+	} else if startTimestamp == 0 {
+		startTimestamp = endTimestamp - tokenLogExportMaxRangeSeconds
+	} else if endTimestamp == 0 {
+		endTimestamp = now
+	}
+	if startTimestamp < 0 {
+		startTimestamp = 0
+	}
+	if endTimestamp < startTimestamp {
+		return 0, 0, fmt.Errorf("结束时间不能早于开始时间")
+	}
+	if endTimestamp-startTimestamp > tokenLogExportMaxRangeSeconds {
+		return 0, 0, fmt.Errorf("日志查询时间范围不能超过31天，请分段查询")
+	}
+	return startTimestamp, endTimestamp, nil
+}
+
+func encodeTokenLogCursor(payload tokenLogCursorPayload) (string, error) {
+	data, err := common.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func decodeTokenLogCursor(value string) (*tokenLogCursorPayload, error) {
+	if value == "" || len(value) > tokenLogCursorMaxLength {
+		return nil, fmt.Errorf("cursor 参数无效")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(data) == 0 || len(data) > tokenLogCursorMaxLength {
+		return nil, fmt.Errorf("cursor 参数无效")
+	}
+	var payload tokenLogCursorPayload
+	if err := common.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("cursor 参数无效")
+	}
+	if payload.Version != tokenLogCursorVersion ||
+		payload.StartTimestamp < 0 ||
+		payload.EndTimestamp < payload.StartTimestamp ||
+		payload.EndTimestamp-payload.StartTimestamp > tokenLogExportMaxRangeSeconds ||
+		payload.CreatedAt < payload.StartTimestamp ||
+		payload.CreatedAt > payload.EndTimestamp ||
+		payload.Offset < 0 {
+		return nil, fmt.Errorf("cursor 参数无效")
+	}
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		if payload.RequestId == "" {
+			return nil, fmt.Errorf("cursor 参数无效")
+		}
+	} else if payload.Id <= 0 {
+		return nil, fmt.Errorf("cursor 参数无效")
+	}
+	return &payload, nil
 }
 
 func hasTokenLogPageQuery(c *gin.Context) bool {

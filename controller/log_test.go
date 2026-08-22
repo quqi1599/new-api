@@ -181,6 +181,133 @@ func TestGetLogByKeySupportsPagedRangeResponse(t *testing.T) {
 	}
 }
 
+func TestGetLogByKeySupportsBoundedCursorResponse(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	seedTokenLogsForGetLogByKey(t, 7)
+
+	first := performGetLogByKey(t, "/api/log/token?pagination=cursor&page_size=2&start_timestamp=10&end_timestamp=40", 7)
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected first cursor page http 200, got %d: %s", first.Code, first.Body.String())
+	}
+
+	var firstResponse struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items          []model.Log `json:"items"`
+			PageSize       int         `json:"page_size"`
+			HasMore        bool        `json:"has_more"`
+			NextCursor     string      `json:"next_cursor"`
+			StartTimestamp int64       `json:"start_timestamp"`
+			EndTimestamp   int64       `json:"end_timestamp"`
+		} `json:"data"`
+	}
+	if err := common.Unmarshal(first.Body.Bytes(), &firstResponse); err != nil {
+		t.Fatalf("failed to decode first cursor response: %v", err)
+	}
+	if !firstResponse.Success || firstResponse.Data.PageSize != 2 || !firstResponse.Data.HasMore || firstResponse.Data.NextCursor == "" {
+		t.Fatalf("unexpected first cursor metadata: %+v", firstResponse.Data)
+	}
+	if firstResponse.Data.StartTimestamp != 10 || firstResponse.Data.EndTimestamp != 40 {
+		t.Fatalf("unexpected cursor range: %+v", firstResponse.Data)
+	}
+	if len(firstResponse.Data.Items) != 2 ||
+		firstResponse.Data.Items[0].Content != "newest" ||
+		firstResponse.Data.Items[1].Content != "newer" ||
+		firstResponse.Data.Items[0].Id != 1 ||
+		firstResponse.Data.Items[1].Id != 2 {
+		t.Fatalf("unexpected first cursor items: %+v", firstResponse.Data.Items)
+	}
+	if strings.Contains(first.Body.String(), `"total"`) {
+		t.Fatalf("cursor response must not expose an exact total: %s", first.Body.String())
+	}
+
+	second := performGetLogByKey(t, "/api/log/token?pagination=cursor&page_size=2&cursor="+firstResponse.Data.NextCursor, 7)
+	if second.Code != http.StatusOK {
+		t.Fatalf("expected second cursor page http 200, got %d: %s", second.Code, second.Body.String())
+	}
+	var secondResponse struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Items      []model.Log `json:"items"`
+			HasMore    bool        `json:"has_more"`
+			NextCursor string      `json:"next_cursor"`
+		} `json:"data"`
+	}
+	if err := common.Unmarshal(second.Body.Bytes(), &secondResponse); err != nil {
+		t.Fatalf("failed to decode second cursor response: %v", err)
+	}
+	if !secondResponse.Success || secondResponse.Data.HasMore || secondResponse.Data.NextCursor != "" {
+		t.Fatalf("unexpected second cursor metadata: %+v", secondResponse.Data)
+	}
+	if len(secondResponse.Data.Items) != 2 ||
+		secondResponse.Data.Items[0].Content != "middle" ||
+		secondResponse.Data.Items[1].Content != "older" ||
+		secondResponse.Data.Items[0].Id != 3 ||
+		secondResponse.Data.Items[1].Id != 4 {
+		t.Fatalf("unexpected second cursor items: %+v", secondResponse.Data.Items)
+	}
+}
+
+func TestGetLogByKeyCursorRejectsInvalidRangeAndCursor(t *testing.T) {
+	setupTokenControllerTestDB(t)
+	seedTokenLogsForGetLogByKey(t, 7)
+
+	tooLargeRange := performGetLogByKey(t, "/api/log/token?pagination=cursor&start_timestamp=1&end_timestamp=2678402", 7)
+	if tooLargeRange.Code != http.StatusBadRequest || !strings.Contains(tooLargeRange.Body.String(), "不能超过31天") {
+		t.Fatalf("unexpected oversized range response: code=%d body=%s", tooLargeRange.Code, tooLargeRange.Body.String())
+	}
+
+	invalidCursor := performGetLogByKey(t, "/api/log/token?pagination=cursor&cursor=not-a-valid-cursor", 7)
+	if invalidCursor.Code != http.StatusBadRequest || !strings.Contains(invalidCursor.Body.String(), "cursor 参数无效") {
+		t.Fatalf("unexpected invalid cursor response: code=%d body=%s", invalidCursor.Code, invalidCursor.Body.String())
+	}
+
+	first := performGetLogByKey(t, "/api/log/token?pagination=cursor&page_size=2&start_timestamp=10&end_timestamp=40", 7)
+	var firstResponse struct {
+		Data struct {
+			NextCursor string `json:"next_cursor"`
+		} `json:"data"`
+	}
+	if err := common.Unmarshal(first.Body.Bytes(), &firstResponse); err != nil {
+		t.Fatalf("failed to decode cursor response: %v", err)
+	}
+	mismatchedRange := performGetLogByKey(t, "/api/log/token?pagination=cursor&start_timestamp=11&cursor="+firstResponse.Data.NextCursor, 7)
+	if mismatchedRange.Code != http.StatusBadRequest || !strings.Contains(mismatchedRange.Body.String(), "游标与时间范围不匹配") {
+		t.Fatalf("unexpected mismatched range response: code=%d body=%s", mismatchedRange.Code, mismatchedRange.Body.String())
+	}
+}
+
+func TestGetLogByKeyCursorDefaultsToBoundedRangeAndCapsPageSize(t *testing.T) {
+	setupTokenControllerTestDB(t)
+
+	w := performGetLogByKey(t, "/api/log/token?pagination=cursor&page_size=1000", 7)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected http 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Success bool `json:"success"`
+		Data    struct {
+			PageSize       int   `json:"page_size"`
+			StartTimestamp int64 `json:"start_timestamp"`
+			EndTimestamp   int64 `json:"end_timestamp"`
+		} `json:"data"`
+	}
+	if err := common.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode bounded cursor response: %v", err)
+	}
+	if !response.Success || response.Data.PageSize != tokenLogCursorMaxPageSize {
+		t.Fatalf("unexpected bounded cursor metadata: %+v", response.Data)
+	}
+	if response.Data.EndTimestamp-response.Data.StartTimestamp != tokenLogExportMaxRangeSeconds {
+		t.Fatalf("cursor range must default to 31 days: %+v", response.Data)
+	}
+
+	invalidPageSize := performGetLogByKey(t, "/api/log/token?pagination=cursor&page_size=invalid", 7)
+	if invalidPageSize.Code != http.StatusBadRequest || !strings.Contains(invalidPageSize.Body.String(), "page_size 参数无效") {
+		t.Fatalf("unexpected invalid page size response: code=%d body=%s", invalidPageSize.Code, invalidPageSize.Body.String())
+	}
+}
+
 func TestExportLogByKeyStreamsCSVForMatchingRange(t *testing.T) {
 	setupTokenControllerTestDB(t)
 	seedTokenLogsForGetLogByKey(t, 7)
