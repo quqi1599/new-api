@@ -159,7 +159,24 @@ func formatUserLogs(logs []*Log, startIdx int) {
 }
 
 func GetLogByTokenId(tokenId int) (logs []*Log, err error) {
-	logs, _, err = GetLogByTokenIdPage(tokenId, 0, 0, 0, common.MaxRecentItems)
+	// The legacy endpoint returns only the recent log array and discards page
+	// metadata. Calling GetLogByTokenIdPage here used to issue a full-history
+	// COUNT(*) before reading the latest rows, making cache-busting polls slower
+	// as the token's log history grew. Keep the legacy response contract while
+	// executing only the bounded recent-row query.
+	order := "id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("")
+	}
+	err = LOG_DB.Model(&Log{}).
+		Where("token_id = ?", tokenId).
+		Order(order).
+		Limit(common.MaxRecentItems).
+		Find(&logs).Error
+	if err != nil {
+		return nil, err
+	}
+	formatUserLogs(logs, 0)
 	return logs, err
 }
 
