@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: ${{ runner.environment == 'github-hosted' }}
       - name: Prepare embedded frontend placeholder
         run: mkdir -p web/dist && touch web/dist/index.html
       - run: go test ./... -count=1 -timeout=20m
