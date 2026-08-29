@@ -339,7 +339,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
 
-		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
+		excludeFailedChannelForRetry(retryParam, relayInfo, channel.Id)
 
 		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
@@ -592,6 +592,19 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
+func excludeFailedChannelForRetry(retryParam *service.RetryParam, info *relaycommon.RelayInfo, channelID int) {
+	if retryParam == nil {
+		return
+	}
+	retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channelID)
+	if info != nil && info.ChannelMeta != nil && info.ChannelOtherSettings.ModelRoutingFirstEnabled {
+		// A model-routing-first channel is a one-shot attempt for this request.
+		// Keep it excluded even if a later retry round resets the ordinary
+		// per-round exclusion list.
+		retryParam.AddPersistentExcludedChannel(channelID)
+	}
+}
+
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, relayFormats ...types.RelayFormat) bool {
 	if openaiErr == nil {
 		return false
@@ -770,6 +783,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			adminInfo["multi_key_index"] = common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
 		}
 		service.AppendChannelAffinityAdminInfo(c, adminInfo)
+		service.AppendModelRoutingFirstAdminInfo(c, adminInfo)
 		other["admin_info"] = adminInfo
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {

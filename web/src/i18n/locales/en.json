@@ -3813,6 +3813,11 @@
     "共 {{count}} 条": "{{count}} total",
     "名单以 API Key 为单位，与用户账号无关。名单中的 Key 会跳过当前和未来所有已启用内容策略保护的渠道。": "The list is keyed by API Key, not user account. Listed keys skip all current and future channels with content policy protection enabled.",
     "搜索令牌 ID、名称、用户、触发渠道或 Moderation ID": "Search token ID, name, owner, trigger channel, or Moderation ID",
-    "暂无被封禁的 API Key": "No blocked API Keys"
+    "暂无被封禁的 API Key": "No blocked API Keys",
+    "模型路由策略": "Model routing strategy",
+    "启用模型强优先路由": "Enable strict model-first routing",
+    "开启后，自动路由请求只要命中该渠道已有模型和接口能力，就会在会话亲和性、普通优先级和权重之前先尝试此渠道。API Key 保护名单、渠道禁用和熔断仍会跳过；请求在未向用户输出前失败时，会立即按现有安全重试规则回退其他渠道。建议同一模型只给一个渠道开启。": "When enabled, an automatically routed request whose model and endpoint are supported by this channel tries it before session affinity, normal priority, and weight. API Key protection, disabled channels, and circuit breakers can still skip it. If it fails before any output is sent to the user, the request immediately falls back to another channel under the existing safe-retry rules. Enable this on only one channel per model.",
+    "该渠道已启用模型强优先路由，会在会话亲和性、普通优先级和权重之前先尝试；失败时仍按安全重试规则回退其他渠道。": "Strict model-first routing is enabled for this channel. It is tried before session affinity, normal priority, and weight, while failures still fall back under the safe-retry rules.",
+    "强优先": "Strict first"
   }
 }

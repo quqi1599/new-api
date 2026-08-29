@@ -18,6 +18,7 @@ import (
 var group2model2channels map[string]map[string][]int // enabled channel
 var channelsIDM map[int]*Channel                     // all channels include disabled
 var apiKeyPolicyProtectedChannelIds []int
+var modelRoutingFirstChannelIds map[int]struct{}
 var channelSyncLock sync.RWMutex
 
 func InitChannelCache() {
@@ -26,12 +27,17 @@ func InitChannelCache() {
 	}
 	newChannelId2channel := make(map[int]*Channel)
 	newProtectedChannelIds := make([]int, 0)
+	newModelRoutingFirstChannelIds := make(map[int]struct{})
 	var channels []*Channel
 	DB.Find(&channels)
 	for _, channel := range channels {
 		newChannelId2channel[channel.Id] = channel
-		if channel.GetOtherSettings().APIKeyPolicyProtectionEnabled {
+		otherSettings := channel.GetOtherSettings()
+		if otherSettings.APIKeyPolicyProtectionEnabled {
 			newProtectedChannelIds = append(newProtectedChannelIds, channel.Id)
+		}
+		if otherSettings.ModelRoutingFirstEnabled {
+			newModelRoutingFirstChannelIds[channel.Id] = struct{}{}
 		}
 	}
 	sort.Ints(newProtectedChannelIds)
@@ -89,8 +95,119 @@ func InitChannelCache() {
 	}
 	channelsIDM = newChannelId2channel
 	apiKeyPolicyProtectedChannelIds = newProtectedChannelIds
+	modelRoutingFirstChannelIds = newModelRoutingFirstChannelIds
 	channelSyncLock.Unlock()
 	common.SysLog("channels synced from database")
+}
+
+// GetModelRoutingFirstSatisfiedChannelForEndpoint returns a channel whose
+// per-channel model-first switch is enabled. It deliberately bypasses ordinary
+// affinity, priority and weight selection; group/model membership, endpoint
+// capability and request exclusions remain hard gates.
+func GetModelRoutingFirstSatisfiedChannelForEndpoint(group string, modelName string, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
+	if !common.MemoryCacheEnabled {
+		return getModelRoutingFirstChannelFromDB(group, modelName, requiredEndpointType, excludedChannelIds)
+	}
+
+	channelSyncLock.RLock()
+	defer channelSyncLock.RUnlock()
+
+	channels := group2model2channels[group][modelName]
+	if len(channels) == 0 {
+		normalizedModel := ratio_setting.FormatMatchingModelName(modelName)
+		channels = group2model2channels[group][normalizedModel]
+	}
+	if len(channels) == 0 {
+		return nil, nil
+	}
+
+	excluded := make(map[int]struct{}, len(excludedChannelIds))
+	for _, channelID := range excludedChannelIds {
+		excluded[channelID] = struct{}{}
+	}
+
+	var selected *Channel
+	for _, channelID := range channels {
+		if _, ok := modelRoutingFirstChannelIds[channelID]; !ok {
+			continue
+		}
+		if _, ok := excluded[channelID]; ok {
+			continue
+		}
+		channel, ok := channelsIDM[channelID]
+		if !ok {
+			return nil, fmt.Errorf("数据库一致性错误，渠道# %d 不存在，请联系管理员修复", channelID)
+		}
+		if !channel.SupportsEndpointType(requiredEndpointType) {
+			continue
+		}
+		if selected == nil || modelRoutingFirstChannelLess(selected, channel) {
+			selected = channel
+		}
+	}
+	return selected, nil
+}
+
+func getModelRoutingFirstChannelFromDB(group string, modelName string, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
+	modelNames := []string{modelName}
+	normalizedModel := ratio_setting.FormatMatchingModelName(modelName)
+	if normalizedModel != modelName {
+		modelNames = append(modelNames, normalizedModel)
+	}
+
+	var abilities []Ability
+	for _, candidateModel := range modelNames {
+		query := DB.Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, candidateModel, true)
+		if len(excludedChannelIds) > 0 {
+			query = query.Where("channel_id NOT IN ?", excludedChannelIds)
+		}
+		if err := query.Find(&abilities).Error; err != nil {
+			return nil, err
+		}
+		if len(abilities) > 0 {
+			break
+		}
+	}
+	if len(abilities) == 0 {
+		return nil, nil
+	}
+
+	channelIDs := make([]int, 0, len(abilities))
+	for _, ability := range abilities {
+		channelIDs = append(channelIDs, ability.ChannelId)
+	}
+	var channels []*Channel
+	if err := DB.Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+		return nil, err
+	}
+
+	var selected *Channel
+	for _, channel := range channels {
+		if channel.Status != common.ChannelStatusEnabled || !channel.GetOtherSettings().ModelRoutingFirstEnabled {
+			continue
+		}
+		if !channel.SupportsEndpointType(requiredEndpointType) {
+			continue
+		}
+		if selected == nil || modelRoutingFirstChannelLess(selected, channel) {
+			selected = channel
+		}
+	}
+	return selected, nil
+}
+
+// modelRoutingFirstChannelLess reports whether candidate should replace
+// current. Multiple switched-on channels are supported defensively, but the UI
+// recommends enabling only one; existing priority/weight and then channel ID
+// provide deterministic tie-breaking.
+func modelRoutingFirstChannelLess(current *Channel, candidate *Channel) bool {
+	if candidate.GetPriority() != current.GetPriority() {
+		return candidate.GetPriority() > current.GetPriority()
+	}
+	if candidate.GetWeight() != current.GetWeight() {
+		return candidate.GetWeight() > current.GetWeight()
+	}
+	return candidate.Id < current.Id
 }
 
 func SyncChannelCache(frequency int) {

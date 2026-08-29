@@ -118,6 +118,28 @@ func TestGPTChannelFallbackStopsAfterOutputButAllowsDistinctChannels(t *testing.
 	}
 }
 
+func TestModelRoutingFirstFailureRemainsExcludedAcrossRetryRounds(t *testing.T) {
+	retryParam := &service.RetryParam{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{ModelRoutingFirstEnabled: true},
+		},
+	}
+
+	excludeFailedChannelForRetry(retryParam, info, 131)
+	if len(retryParam.ExcludedChannelIds) != 1 || retryParam.ExcludedChannelIds[0] != 131 {
+		t.Fatalf("round exclusions = %#v", retryParam.ExcludedChannelIds)
+	}
+	if len(retryParam.PersistentExcludedIds) != 1 || retryParam.PersistentExcludedIds[0] != 131 {
+		t.Fatalf("persistent exclusions = %#v", retryParam.PersistentExcludedIds)
+	}
+
+	retryParam.ExcludedChannelIds = nil
+	if len(retryParam.PersistentExcludedIds) != 1 || retryParam.PersistentExcludedIds[0] != 131 {
+		t.Fatalf("persistent exclusions after round reset = %#v", retryParam.PersistentExcludedIds)
+	}
+}
+
 func TestGPT524AllowsFallback(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
 	err := types.NewErrorWithStatusCode(errors.New("proxy read timeout"), types.ErrorCodeBadResponse, statusCodeCloudflareTimeout)

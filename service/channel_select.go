@@ -24,6 +24,7 @@ type RetryParam struct {
 	PreferredChannelTypes []int                 // native channel types to prioritize based on request path
 	RequiredEndpointType  constant.EndpointType // strict endpoint capability; empty keeps legacy selection
 	ExcludedChannelIds    []int                 // channels that have already failed in this request
+	PersistentExcludedIds []int                 // request-lifetime exclusions retained across retry rounds
 	CircuitRetryAfter     time.Duration
 	CircuitSkippedIds     []int
 }
@@ -68,7 +69,105 @@ func isTokenChannelExcluded(c *gin.Context, channelId int) bool {
 
 func excludedChannelIdsForRequest(param *RetryParam) []int {
 	excluded := append([]int(nil), param.ExcludedChannelIds...)
+	excluded = append(excluded, param.PersistentExcludedIds...)
 	return append(excluded, tokenExcludedChannelIds(param.Ctx)...)
+}
+
+func (p *RetryParam) AddPersistentExcludedChannel(channelID int) {
+	if p == nil || slices.Contains(p.PersistentExcludedIds, channelID) {
+		return
+	}
+	p.PersistentExcludedIds = append(p.PersistentExcludedIds, channelID)
+}
+
+// CacheGetModelRoutingFirstSatisfiedChannel applies the per-channel
+// model-routing-first switch before channel affinity. It only returns channels
+// with that switch enabled; callers may continue with affinity/normal selection
+// when the result is nil. Protected API keys, request exclusions, endpoint
+// capability and circuit state remain authoritative.
+func CacheGetModelRoutingFirstSatisfiedChannel(param *RetryParam) (*model.Channel, string, error) {
+	if param == nil {
+		return nil, "", errors.New("retry param is nil")
+	}
+	param.CircuitRetryAfter = 0
+	param.CircuitSkippedIds = nil
+	for {
+		channel, selectGroup, err := cacheGetModelRoutingFirstSatisfiedChannelOnce(param)
+		if err != nil || channel == nil {
+			return channel, selectGroup, err
+		}
+		requestCtx := context.Background()
+		if param.Ctx != nil && param.Ctx.Request != nil {
+			requestCtx = param.Ctx.Request.Context()
+		}
+		decision := ChannelCircuitAllowAttempt(requestCtx, channel.Id, param.ModelName)
+		if decision.Allowed {
+			if param.Ctx != nil {
+				common.SetContextKey(param.Ctx, constant.ContextKeyModelRoutingFirstChannel, channel.Id)
+			}
+			return channel, selectGroup, nil
+		}
+		if !slices.Contains(param.ExcludedChannelIds, channel.Id) {
+			param.ExcludedChannelIds = append(param.ExcludedChannelIds, channel.Id)
+		}
+		param.CircuitSkippedIds = append(param.CircuitSkippedIds, channel.Id)
+		if decision.RetryAfter > 0 && (param.CircuitRetryAfter == 0 || decision.RetryAfter < param.CircuitRetryAfter) {
+			param.CircuitRetryAfter = decision.RetryAfter
+		}
+		message := fmt.Sprintf("channel circuit skipped model-routing-first channel #%d for model %s: state=%s retry_after=%s", channel.Id, param.ModelName, decision.State, decision.RetryAfter)
+		if param.Ctx != nil {
+			logger.LogInfo(param.Ctx, message)
+		} else {
+			common.SysLog(message)
+		}
+	}
+}
+
+func cacheGetModelRoutingFirstSatisfiedChannelOnce(param *RetryParam) (*model.Channel, string, error) {
+	selectGroup := param.TokenGroup
+	excludedChannelIds := excludedChannelIdsForRequest(param)
+	if param.TokenGroup != "auto" {
+		channel, err := model.GetModelRoutingFirstSatisfiedChannelForEndpoint(
+			param.TokenGroup,
+			param.ModelName,
+			param.RequiredEndpointType,
+			excludedChannelIds,
+		)
+		return channel, selectGroup, err
+	}
+
+	if len(setting.GetAutoGroups()) == 0 {
+		return nil, selectGroup, errors.New("auto groups is not enabled")
+	}
+	userGroup := common.GetContextKeyString(param.Ctx, constant.ContextKeyUserGroup)
+	for index, autoGroup := range GetUserAutoGroup(userGroup) {
+		channel, err := model.GetModelRoutingFirstSatisfiedChannelForEndpoint(
+			autoGroup,
+			param.ModelName,
+			param.RequiredEndpointType,
+			excludedChannelIds,
+		)
+		if err != nil {
+			return nil, autoGroup, err
+		}
+		if channel == nil {
+			continue
+		}
+		common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroup, autoGroup)
+		common.SetContextKey(param.Ctx, constant.ContextKeyAutoGroupIndex, index)
+		return channel, autoGroup, nil
+	}
+	return nil, selectGroup, nil
+}
+
+func AppendModelRoutingFirstAdminInfo(c *gin.Context, adminInfo map[string]interface{}) {
+	if c == nil || adminInfo == nil {
+		return
+	}
+	channelID := common.GetContextKeyInt(c, constant.ContextKeyModelRoutingFirstChannel)
+	if channelID > 0 {
+		adminInfo["model_routing_first_channel_id"] = channelID
+	}
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.

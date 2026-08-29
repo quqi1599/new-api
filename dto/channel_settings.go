@@ -42,6 +42,7 @@ type ChannelOtherSettings struct {
 	UpstreamModelUpdateLastDetectedModels []string      `json:"upstream_model_update_last_detected_models,omitempty"` // 上次检测到的可加入模型
 	UpstreamModelUpdateLastRemovedModels  []string      `json:"upstream_model_update_last_removed_models,omitempty"`  // 上次检测到的可删除模型
 	UpstreamModelUpdateIgnoredModels      []string      `json:"upstream_model_update_ignored_models,omitempty"`       // 手动忽略的模型
+	ModelRoutingFirstEnabled              bool          `json:"model_routing_first_enabled,omitempty"`                // 自动路由时优先尝试该渠道，失败后回退其他渠道
 	APIKeyPolicyProtectionEnabled         bool          `json:"api_key_policy_protection_enabled,omitempty"`          // 上游策略封禁后保护当前 API Key
 	CPAAuditIdentityEnabled               bool          `json:"cpa_audit_identity_enabled,omitempty"`                 // 仅向 CPA 渠道注入已签名的客户审计身份
 }
