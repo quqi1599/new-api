@@ -36,6 +36,7 @@ import (
 const (
 	statusCodeCloudflareTimeout      = 524
 	authUnavailableRetryAfterSeconds = "30"
+	compactionRouteRetryAfterSeconds = "30"
 	authUnavailableMessagePrefix     = "auth_unavailable:"
 )
 
@@ -436,7 +437,13 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
 		c.Writer.Header().Del(header)
 	}
-	if isAuthUnavailableError(relayErr) {
+	if isCompactionRouteUnavailableError(relayErr) {
+		retryAfter := relayErr.GetRetryAfter()
+		if retryAfter == "" {
+			retryAfter = compactionRouteRetryAfterSeconds
+		}
+		c.Header("Retry-After", retryAfter)
+	} else if isAuthUnavailableError(relayErr) {
 		c.Header("Retry-After", authUnavailableRetryAfterSeconds)
 	}
 
@@ -467,6 +474,13 @@ func isAuthUnavailableError(relayErr *types.NewAPIError) bool {
 	return relayErr.StatusCode == http.StatusServiceUnavailable &&
 		relayErr.HasUpstreamResponse() &&
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(relayErr.Error())), authUnavailableMessagePrefix)
+}
+
+func isCompactionRouteUnavailableError(relayErr *types.NewAPIError) bool {
+	return relayErr != nil &&
+		relayErr.StatusCode == http.StatusServiceUnavailable &&
+		relayErr.HasUpstreamResponse() &&
+		relayErr.GetErrorCode() == types.ErrorCodeCompactionRouteUnavailable
 }
 
 func canStartNextRelayRetryRound(
@@ -618,6 +632,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, r
 	if types.IsSkipRetryError(openaiErr) {
 		return false
 	}
+	if isCompactionRouteUnavailableError(openaiErr) {
+		return false
+	}
 	if types.IsChannelError(openaiErr) {
 		return true
 	}
@@ -692,6 +709,9 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 		return false
 	}
 	if types.IsSkipRetryError(openaiErr) || operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
+		return false
+	}
+	if isCompactionRouteUnavailableError(openaiErr) {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {

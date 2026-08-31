@@ -37,6 +37,27 @@ func TestAuthUnavailableDoesNotReplayAggregateChannelAcrossRounds(t *testing.T) 
 	}
 }
 
+func TestCompactionRouteUnavailableDoesNotRetryOrFallback(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayErr := types.WithOpenAIError(
+		types.OpenAIError{
+			Message: "all compatible remote-compaction routes are temporarily unavailable",
+			Type:    "server_error",
+			Code:    string(types.ErrorCodeCompactionRouteUnavailable),
+		},
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
+
+	if shouldRetry(c, relayErr, 3, types.RelayFormatOpenAI) {
+		t.Fatal("typed compaction route unavailability must not be retried immediately")
+	}
+	if isGPTChannelFallbackError(info, relayErr) {
+		t.Fatal("typed compaction route unavailability must not enter generic GPT fallback")
+	}
+}
+
 func TestCPAAuthUnavailableCompatibilityEnvelopeDoesNotReplayAcrossRounds(t *testing.T) {
 	body := `{"error":{"message":"auth_unavailable: requested route is temporarily unavailable","type":"server_error","code":"internal_server_error"}}`
 	resp := &http.Response{
