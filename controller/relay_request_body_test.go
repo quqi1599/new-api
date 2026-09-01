@@ -86,3 +86,10 @@ func TestRequestBodyFailureStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidRequestErrorReturnsBadRequestWithoutRetry(t *testing.T) {
+	apiErr := newInvalidRequestError(errors.New("missing required field"))
+	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeInvalidRequest, apiErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiErr))
+}

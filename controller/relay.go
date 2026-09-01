@@ -91,6 +91,15 @@ func newRequestBodyFailure(c *gin.Context, err error) *types.NewAPIError {
 	)
 }
 
+func newInvalidRequestError(err error) *types.NewAPIError {
+	return types.NewError(
+		err,
+		types.ErrorCodeInvalidRequest,
+		types.ErrOptionWithStatusCode(http.StatusBadRequest),
+		types.ErrOptionWithSkipRetry(),
+	)
+}
+
 func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
 	var err *types.NewAPIError
 	switch info.RelayMode {
@@ -164,7 +173,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if _, isBodyReadFailure := requestBodyFailureStatus(err); isBodyReadFailure {
 			newAPIError = newRequestBodyFailure(c, err)
 		} else {
-			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest)
+			newAPIError = newInvalidRequestError(err)
 		}
 		return
 	}

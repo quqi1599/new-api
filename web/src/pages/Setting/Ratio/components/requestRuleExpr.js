@@ -30,6 +30,22 @@ export const COMMON_TIMEZONES = [
 export const NUMERIC_LITERAL_REGEX =
   /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
 
+const TIME_FUNC_RANGES = {
+  hour: [0, 23],
+  minute: [0, 59],
+  weekday: [0, 6],
+  month: [1, 12],
+  day: [1, 31],
+};
+
+function isTimeValueInRange(timeFunc, text) {
+  if (!NUMERIC_LITERAL_REGEX.test(text)) return false;
+  const value = Number(text);
+  if (!Number.isInteger(value)) return false;
+  const [min, max] = TIME_FUNC_RANGES[timeFunc];
+  return value >= min && value <= max;
+}
+
 // ---------------------------------------------------------------------------
 // Condition creators (no multiplier — multiplier lives on the group)
 // ---------------------------------------------------------------------------
@@ -214,11 +230,13 @@ function buildTimeConditionExpr(cond) {
   if (mode === MATCH_RANGE) {
     const s = normalized.rangeStart.trim();
     const e = normalized.rangeEnd.trim();
-    if (!NUMERIC_LITERAL_REGEX.test(s) || !NUMERIC_LITERAL_REGEX.test(e)) return '';
-    return `${fn} >= ${s} || ${fn} < ${e}`;
+    if (!isTimeValueInRange(timeFunc, s) || !isTimeValueInRange(timeFunc, e)) return '';
+    return Number(s) > Number(e)
+      ? `${fn} >= ${s} || ${fn} < ${e}`
+      : `${fn} >= ${s} && ${fn} < ${e}`;
   }
   const v = normalized.value.trim();
-  if (!NUMERIC_LITERAL_REGEX.test(v)) return '';
+  if (!isTimeValueInRange(timeFunc, v)) return '';
   const opMap = { [MATCH_EQ]: '==', [MATCH_GTE]: '>=', [MATCH_LT]: '<' };
   return `${fn} ${opMap[mode] || '=='} ${v}`;
 }
@@ -280,21 +298,16 @@ export function buildRequestRuleExpr(groups) {
 // ---------------------------------------------------------------------------
 
 function tryParseTimeCondition(expr) {
-  // Range: hour("tz") >= s || hour("tz") < e
   let m = expr.match(
-    /^(hour|minute|weekday|month|day)\("([^"]+)"\) >= ([\d.eE+-]+) \|\| \1\("\2"\) < ([\d.eE+-]+)$/,
+    /^(hour|minute|weekday|month|day)\("([^"]+)"\) >= ([\d.eE+-]+) (?:&&|\|\|) \1\("\2"\) < ([\d.eE+-]+)$/,
   );
-  if (m) {
-    return {
-      source: SOURCE_TIME, timeFunc: m[1], timezone: m[2],
-      mode: MATCH_RANGE, value: '', rangeStart: m[3], rangeEnd: m[4],
-    };
+  if (!m) {
+    m = expr.match(
+      /^\((hour|minute|weekday|month|day)\("([^"]+)"\) >= ([\d.eE+-]+) (?:&&|\|\|) \1\("\2"\) < ([\d.eE+-]+)\)$/,
+    );
   }
-  // Wrapped range: (hour("tz") >= s || hour("tz") < e)
-  m = expr.match(
-    /^\((hour|minute|weekday|month|day)\("([^"]+)"\) >= ([\d.eE+-]+) \|\| \1\("\2"\) < ([\d.eE+-]+)\)$/,
-  );
   if (m) {
+    if (!isTimeValueInRange(m[1], m[3]) || !isTimeValueInRange(m[1], m[4])) return null;
     return {
       source: SOURCE_TIME, timeFunc: m[1], timezone: m[2],
       mode: MATCH_RANGE, value: '', rangeStart: m[3], rangeEnd: m[4],
@@ -305,6 +318,7 @@ function tryParseTimeCondition(expr) {
     /^(hour|minute|weekday|month|day)\("([^"]+)"\) (==|>=|<) ([\d.eE+-]+)$/,
   );
   if (m) {
+    if (!isTimeValueInRange(m[1], m[4])) return null;
     const opMap = { '==': MATCH_EQ, '>=': MATCH_GTE, '<': MATCH_LT };
     return {
       source: SOURCE_TIME, timeFunc: m[1], timezone: m[2],
@@ -312,6 +326,23 @@ function tryParseTimeCondition(expr) {
     };
   }
   return null;
+}
+
+function tryParseTimeRangePair(lower, upper) {
+  const a = tryParseTimeCondition(lower);
+  const b = tryParseTimeCondition(upper);
+  if (!a || !b || a.source !== SOURCE_TIME || b.source !== SOURCE_TIME) return null;
+  if (a.timeFunc !== b.timeFunc || a.timezone !== b.timezone) return null;
+  if (a.mode !== MATCH_GTE || b.mode !== MATCH_LT) return null;
+  return {
+    source: SOURCE_TIME,
+    timeFunc: a.timeFunc,
+    timezone: a.timezone,
+    mode: MATCH_RANGE,
+    value: '',
+    rangeStart: a.value,
+    rangeEnd: b.value,
+  };
 }
 
 function tryParseRequestCondition(expr) {
@@ -358,10 +389,23 @@ function tryParseRuleGroupFactor(part) {
   const conditionStr = m[1];
   const multiplier = m[2];
 
+  const wholeTimeCondition = tryParseTimeCondition(conditionStr.trim());
+  if (wholeTimeCondition) {
+    return { conditions: [normalizeCondition(wholeTimeCondition)], multiplier };
+  }
+
   const andParts = splitTopLevelAnd(conditionStr);
   const conditions = [];
-  for (const ap of andParts) {
-    const cond = tryParseRequestCondition(ap.trim());
+  for (let i = 0; i < andParts.length; i += 1) {
+    const part = andParts[i].trim();
+    const next = i + 1 < andParts.length ? andParts[i + 1].trim() : '';
+    const merged = next ? tryParseTimeRangePair(part, next) : null;
+    if (merged) {
+      conditions.push(normalizeCondition(merged));
+      i += 1;
+      continue;
+    }
+    const cond = tryParseRequestCondition(part);
     if (!cond) return null;
     conditions.push(normalizeCondition(cond));
   }
