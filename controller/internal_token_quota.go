@@ -64,7 +64,7 @@ func grantTokenQuota(c *gin.Context, enforceSaaSTopupExclusion bool) {
 		return
 	}
 
-	token, err := model.GetTokenById(req.TokenID)
+	token, err := model.GetTokenByIdForQuotaGrant(req.TokenID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			common.ApiErrorMsg(c, "token not found")

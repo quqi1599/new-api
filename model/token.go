@@ -13,6 +13,10 @@ import (
 )
 
 type Token struct {
+	// SaaSCreditedQuota is a cumulative credit watermark for cache reconciliation.
+	SaaSCreditedQuota int64 `json:"-" gorm:"column:saas_credited_quota;not null;default:0"`
+	// SaaSQuotaRevision orders explicit balance assignments separately from credits.
+	SaaSQuotaRevision  int64          `json:"-" gorm:"column:saas_quota_revision;not null;default:0"`
 	Id                 int            `json:"id"`
 	UserId             int            `json:"user_id" gorm:"index"`
 	Username           string         `json:"username,omitempty" gorm:"->"`
@@ -333,6 +337,17 @@ func GetTokenByIds(id int, userId int) (*Token, error) {
 	return &token, err
 }
 
+// GetTokenByIdForQuotaGrant validates a grant without scheduling an old balance
+// snapshot into the live cache before the credit transaction starts.
+func GetTokenByIdForQuotaGrant(id int) (*Token, error) {
+	if id == 0 {
+		return nil, errors.New("id 为空！")
+	}
+	var token Token
+	err := DB.Where("id = ?", id).First(&token).Error
+	return &token, err
+}
+
 func GetTokenById(id int) (*Token, error) {
 	if id == 0 {
 		return nil, errors.New("id 为空！")
@@ -386,15 +401,38 @@ func (token *Token) Update() (err error) {
 	defer func() {
 		if shouldUpdateRedis(true, err) {
 			gopool.Go(func() {
-				err := cacheSetToken(*token)
+				updated, err := GetTokenByIdForQuotaGrant(token.Id)
+				if err == nil {
+					err = cacheSetToken(*updated)
+				}
 				if err != nil {
 					common.SysLog("failed to update token cache: " + err.Error())
 				}
 			})
 		}
 	}()
-	err = DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "rpm_rate_limit").Updates(token).Error
+	result := DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
+		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "rpm_rate_limit", "saas_quota_revision").
+		Where("saas_quota_revision < ?", MaxSaaSCreditQuota).
+		Updates(map[string]interface{}{
+			"name": token.Name, "status": token.Status, "expired_time": token.ExpiredTime,
+			"remain_quota": token.RemainQuota, "unlimited_quota": token.UnlimitedQuota,
+			"model_limits_enabled": token.ModelLimitsEnabled, "model_limits": token.ModelLimits,
+			"allow_ips": token.AllowIps, "group": token.Group, "cross_group_retry": token.CrossGroupRetry,
+			"rpm_rate_limit": token.RPMRateLimit, "saas_quota_revision": gorm.Expr("CASE WHEN saas_credited_quota > 0 THEN saas_quota_revision + 1 ELSE saas_quota_revision END"),
+		})
+	err = result.Error
+	if err == nil && result.RowsAffected == 0 {
+		// MySQL may report zero for an unchanged, uncredited token. Preserve that
+		// no-op behavior while reporting a real exhausted revision counter.
+		var current Token
+		readErr := DB.Select("saas_quota_revision").Where("id = ?", token.Id).First(&current).Error
+		if readErr != nil && !errors.Is(readErr, gorm.ErrRecordNotFound) {
+			err = readErr
+		} else if current.SaaSQuotaRevision >= MaxSaaSCreditQuota {
+			err = ErrSaaSCreditOverflow
+		}
+	}
 	return err
 }
 
@@ -491,30 +529,22 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 }
 
 // GrantTokenRemainQuota is used by top-up flows to increase remain_quota only.
-func GrantTokenRemainQuota(tokenId int, key string, quota int) (err error) {
+func GrantTokenRemainQuota(tokenId int, key string, quota int) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheIncrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to grant token remain quota: " + err.Error())
-			}
-			token, getErr := GetTokenById(tokenId)
-			if getErr != nil {
-				common.SysLog("failed to reload token after granting remain quota: " + getErr.Error())
-				return
-			}
-			if token.Status == common.TokenStatusEnabled {
-				setErr := cacheSetTokenField(key, "Status", fmt.Sprintf("%d", common.TokenStatusEnabled))
-				if setErr != nil {
-					common.SysLog("failed to restore token status cache after granting remain quota: " + setErr.Error())
-				}
-			}
-		})
+	token, err := grantTokenRemainQuota(tokenId, quota)
+	if err != nil {
+		return err
 	}
-	return grantTokenRemainQuota(tokenId, quota)
+	// The database commits before delivery. A cumulative total makes an old
+	// delivery harmless after a cold DB refill or a newer SaaS operation.
+	if common.RedisEnabled {
+		if err := cacheApplySaaSTokenCredit(token.Key, token.SaaSCreditedQuota); err != nil {
+			common.SysLog("failed to grant token remain quota cache: " + err.Error())
+		}
+	}
+	return nil
 }
 func increaseTokenQuota(id int, quota int) (err error) {
 	err = DB.Model(&Token{}).Where("id = ?", id).Updates(
@@ -527,21 +557,40 @@ func increaseTokenQuota(id int, quota int) (err error) {
 	return err
 }
 
-func grantTokenRemainQuota(id int, quota int) (err error) {
+func grantTokenRemainQuota(id int, quota int) (*Token, error) {
 	var token Token
-	err = DB.Select("id", "status").Where("id = ?", id).First(&token).Error
-	if err != nil {
-		return err
+	if int64(quota) > MaxSaaSCreditQuota {
+		return nil, ErrSaaSCreditOverflow
 	}
-	updates := map[string]interface{}{
-		"remain_quota":  gorm.Expr("remain_quota + ?", quota),
-		"accessed_time": common.GetTimestamp(),
-	}
-	if token.Status == common.TokenStatusExhausted {
-		updates["status"] = common.TokenStatusEnabled
-	}
-	err = DB.Model(&Token{}).Where("id = ?", id).Updates(updates).Error
-	return err
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		// Write first also serializes SQLite without upgrading a read transaction.
+		result := tx.Model(&Token{}).Where("id = ?", id).
+			Where("remain_quota >= ? AND remain_quota <= ?", -MaxSaaSCreditQuota, MaxSaaSCreditQuota-int64(quota)).
+			Where("saas_credited_quota >= 0 AND saas_credited_quota <= ?", MaxSaaSCreditQuota-int64(quota)).
+			Updates(map[string]interface{}{
+				"remain_quota":        gorm.Expr("remain_quota + ?", quota),
+				"saas_credited_quota": gorm.Expr("saas_credited_quota + ?", quota),
+				"accessed_time":       common.GetTimestamp(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if err := tx.Where("id = ?", id).First(&token).Error; err != nil {
+			return err
+		}
+		if result.RowsAffected != 1 && quota != 0 {
+			return ErrSaaSCreditOverflow
+		}
+		// Retain legacy recovery behavior and eligibility checks in its callers.
+		if token.Status == common.TokenStatusExhausted {
+			if err := tx.Model(&Token{}).Where("id = ?", id).Update("status", common.TokenStatusEnabled).Error; err != nil {
+				return err
+			}
+			token.Status = common.TokenStatusEnabled
+		}
+		return nil
+	})
+	return &token, err
 }
 func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 	if quota < 0 {
