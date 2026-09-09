@@ -246,6 +246,10 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		}
 	}
 
+	if err := applyOpenAIThinkingControls(textRequest, &claudeRequest); err != nil {
+		return nil, err
+	}
+
 	if textRequest.Stop != nil {
 		// stop maybe string/array string, convert to array string
 		switch textRequest.Stop.(type) {

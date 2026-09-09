@@ -884,6 +884,7 @@ type OpenAIResponsesRequest struct {
 	// qwen
 	EnableThinking json.RawMessage `json:"enable_thinking,omitempty"`
 	ThinkingBudget json.RawMessage `json:"thinking_budget,omitempty"`
+	THINKING       json.RawMessage `json:"thinking,omitempty"`
 	// perplexity
 	Preset json.RawMessage `json:"preset,omitempty"`
 }
