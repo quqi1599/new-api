@@ -133,6 +133,9 @@ func shouldSkipPassthroughHeader(name string) bool {
 		return true
 	}
 	lower := strings.ToLower(name)
+	if strings.HasPrefix(lower, cpaAuditHeaderPrefix) {
+		return true
+	}
 	if _, ok := passthroughSkipHeaderNamesLower[lower]; ok {
 		return true
 	}
@@ -404,6 +407,9 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	}
 	for key, value := range headerOverride {
 		targetHeader.Set(key, value)
+	}
+	if err = applyCPAAuditIdentityHeaders(targetHeader, c.Request.Method, fullRequestURL, info, time.Now(), common2.CPAAuditIdentitySecret); err != nil {
+		return nil, fmt.Errorf("apply CPA audit identity: %w", err)
 	}
 	targetHeader.Set("Content-Type", c.Request.Header.Get("Content-Type"))
 	common2.ReleaseBodyAdmission(c)
@@ -964,6 +970,9 @@ func setRelayCancelOrigin(c *gin.Context, origin string) {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	if err := applyCPAAuditIdentity(req, info); err != nil {
+		return nil, fmt.Errorf("apply CPA audit identity: %w", err)
+	}
 	common2.ResetRelayAttemptTimeoutContext(c)
 	relayRequestStartedAt := time.Now()
 	// Some provider adaptors build requests with their own timeout context before

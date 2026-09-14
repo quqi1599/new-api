@@ -38,12 +38,15 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 	}
 
 	out := &dto.GeneralOpenAIRequest{
-		Model:       req.Model,
-		Stream:      req.Stream,
-		MaxTokens:   req.MaxOutputTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Metadata:    req.Metadata,
+		Model:          req.Model,
+		Stream:         req.Stream,
+		MaxTokens:      req.MaxOutputTokens,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
+		Metadata:       req.Metadata,
+		EnableThinking: req.EnableThinking,
+		ThinkingBudget: req.ThinkingBudget,
+		THINKING:       req.THINKING,
 	}
 	if req.Reasoning != nil {
 		out.ReasoningEffort = req.Reasoning.Effort

@@ -162,6 +162,7 @@ func InitEnv() {
 	} else {
 		CryptoSecret = SessionSecret
 	}
+	CPAAuditIdentitySecret = strings.TrimSpace(os.Getenv("CPA_AUDIT_IDENTITY_SECRET"))
 	if err := InitSessionCookieSettings(); err != nil {
 		log.Fatal(err)
 	}

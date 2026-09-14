@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
@@ -50,4 +51,60 @@ func TestStreamWritersPropagateDownstreamWriteErrors(t *testing.T) {
 			require.Contains(t, err.Error(), "downstream write failed")
 		})
 	}
+}
+
+func TestStreamStartedAndSendInBandStreamError(t *testing.T) {
+	tests := []struct {
+		name        string
+		relayFormat types.RelayFormat
+		start       string
+		want        string
+	}{
+		{
+			name:        "claude error event",
+			relayFormat: types.RelayFormatClaude,
+			start:       "event: message_start\ndata: {}\n\n",
+			want:        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream overloaded\"}}\n\n",
+		},
+		{
+			name:        "openai error object",
+			relayFormat: types.RelayFormatOpenAI,
+			start:       "data: {}\n\n",
+			want:        "data: {\"error\":{\"message\":\"upstream overloaded\",\"type\":\"overloaded_error\",\"param\":\"\",\"code\":\"overloaded_error\"}}\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			require.False(t, StreamStarted(c))
+
+			_, err := c.Writer.Write([]byte(tt.start))
+			require.NoError(t, err)
+			require.True(t, StreamStarted(c))
+
+			relayErr := types.WithClaudeError(types.ClaudeError{
+				Type:    "overloaded_error",
+				Message: "upstream overloaded",
+			}, http.StatusInternalServerError)
+			require.NoError(t, SendInBandStreamError(c, tt.relayFormat, relayErr))
+			require.Equal(t, tt.start+tt.want, recorder.Body.String())
+		})
+	}
+}
+
+func TestSendInBandStreamErrorRejectsUnstartedStream(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	relayErr := types.WithClaudeError(types.ClaudeError{
+		Type:    "overloaded_error",
+		Message: "upstream overloaded",
+	}, http.StatusInternalServerError)
+
+	require.ErrorContains(t, SendInBandStreamError(c, types.RelayFormatClaude, relayErr), "stream has not started")
+	require.Empty(t, recorder.Body.String())
+	require.False(t, recorder.Flushed)
 }

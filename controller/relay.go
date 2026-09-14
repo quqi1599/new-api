@@ -639,7 +639,7 @@ func isRetryableExplicitUpstreamStatus(statusCode int) bool {
 }
 
 func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
-	if c != nil && c.Writer != nil && c.Writer.Written() {
+	if helper.StreamStarted(c) {
 		return true
 	}
 	if info == nil {

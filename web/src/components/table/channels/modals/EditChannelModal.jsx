@@ -217,6 +217,7 @@ const EditChannelModal = (props) => {
     upstream_model_update_last_detected_models: [],
     upstream_model_update_ignored_models: '',
     api_key_policy_protection_enabled: false,
+    cpa_audit_identity_enabled: false,
   };
   const [batch, setBatch] = useState(false);
   const [multiToSingle, setMultiToSingle] = useState(false);
@@ -936,6 +937,8 @@ const EditChannelModal = (props) => {
             : '';
           data.api_key_policy_protection_enabled =
             parsedSettings.api_key_policy_protection_enabled === true;
+          data.cpa_audit_identity_enabled =
+            parsedSettings.cpa_audit_identity_enabled === true;
         } catch (error) {
           console.error('解析其他设置失败:', error);
           data.azure_responses_version = '';
@@ -956,6 +959,7 @@ const EditChannelModal = (props) => {
           data.upstream_model_update_last_detected_models = [];
           data.upstream_model_update_ignored_models = '';
           data.api_key_policy_protection_enabled = false;
+          data.cpa_audit_identity_enabled = false;
         }
       } else {
         // 兼容历史数据：老渠道没有 settings 时，默认按 json 展示
@@ -975,6 +979,7 @@ const EditChannelModal = (props) => {
         data.upstream_model_update_last_detected_models = [];
         data.upstream_model_update_ignored_models = '';
         data.api_key_policy_protection_enabled = false;
+        data.cpa_audit_identity_enabled = false;
       }
 
       if (
@@ -1051,7 +1056,8 @@ const EditChannelModal = (props) => {
         data.alpha_search_enabled ||
         data.claude_beta_query ||
         data.system_prompt_override ||
-        data.api_key_policy_protection_enabled;
+        data.api_key_policy_protection_enabled ||
+        data.cpa_audit_identity_enabled;
       if (hasAdvancedValues) {
         setAdvancedSettingsOpen(true);
       }
@@ -1843,6 +1849,8 @@ const EditChannelModal = (props) => {
     }
     settings.api_key_policy_protection_enabled =
       localInputs.api_key_policy_protection_enabled === true;
+    settings.cpa_audit_identity_enabled =
+      localInputs.cpa_audit_identity_enabled === true;
 
     localInputs.settings = JSON.stringify(settings);
 
@@ -1873,6 +1881,7 @@ const EditChannelModal = (props) => {
     delete localInputs.upstream_model_update_last_detected_models;
     delete localInputs.upstream_model_update_ignored_models;
     delete localInputs.api_key_policy_protection_enabled;
+    delete localInputs.cpa_audit_identity_enabled;
 
     let res;
     localInputs.auto_ban = localInputs.auto_ban ? 1 : 0;
@@ -2233,8 +2242,23 @@ const EditChannelModal = (props) => {
               <div className='space-y-4'>
                 <div className='pb-3 border-b border-gray-100'>
                   <Text className='text-sm font-medium text-gray-500 mb-3 block'>
-                    {t('API Key 策略保护')}
+                    {t('审计与 API Key 策略')}
                   </Text>
+                  <Form.Switch
+                    field='cpa_audit_identity_enabled'
+                    label={t('启用 CPA 审计身份签名')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleChannelOtherSettingsChange(
+                        'cpa_audit_identity_enabled',
+                        value,
+                      )
+                    }
+                    extraText={t(
+                      '仅对指向 CPA 的渠道开启。开启后 NewAPI 会向 CPA 传递经 HMAC 签名的用户 ID、令牌 ID、令牌名称和请求 ID，不传递客户 API Key。',
+                    )}
+                  />
                   <Form.Switch
                     field='api_key_policy_protection_enabled'
                     label={t('启用内容策略保护')}

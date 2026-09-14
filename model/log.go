@@ -159,7 +159,24 @@ func formatUserLogs(logs []*Log, startIdx int) {
 }
 
 func GetLogByTokenId(tokenId int) (logs []*Log, err error) {
-	logs, _, err = GetLogByTokenIdPage(tokenId, 0, 0, 0, common.MaxRecentItems)
+	// The legacy endpoint returns only the recent log array and discards page
+	// metadata. Calling GetLogByTokenIdPage here used to issue a full-history
+	// COUNT(*) before reading the latest rows, making cache-busting polls slower
+	// as the token's log history grew. Keep the legacy response contract while
+	// executing only the bounded recent-row query.
+	order := "id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("")
+	}
+	err = LOG_DB.Model(&Log{}).
+		Where("token_id = ?", tokenId).
+		Order(order).
+		Limit(common.MaxRecentItems).
+		Find(&logs).Error
+	if err != nil {
+		return nil, err
+	}
+	formatUserLogs(logs, 0)
 	return logs, err
 }
 
@@ -226,6 +243,73 @@ func GetLogByTokenIdCursor(ctx context.Context, tokenId int, startTimestamp int6
 	}
 	formatUserLogs(logs, startIdx)
 	return logs, nextBeforeId, nil
+}
+
+type TokenLogKeysetCursor struct {
+	CreatedAt int64  `json:"created_at"`
+	Id        int    `json:"id,omitempty"`
+	RequestId string `json:"request_id,omitempty"`
+}
+
+// GetLogByTokenIdKeyset reads a bounded token-log page in the same order as
+// the existing token/created_at/id index. Unlike OFFSET pagination, the next
+// page starts after the last row from the previous page and never performs an
+// exact COUNT(*). The caller must provide a bounded time range so PostgreSQL
+// can prune unrelated created_at partitions.
+func GetLogByTokenIdKeyset(ctx context.Context, tokenId int, startTimestamp int64, endTimestamp int64, cursor *TokenLogKeysetCursor, num int, startIdx int) (logs []*Log, nextCursor *TokenLogKeysetCursor, hasMore bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if num <= 0 {
+		num = common.ItemsPerPage
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	tx := LOG_DB.WithContext(ctx).
+		Model(&Log{}).
+		Where("token_id = ?", tokenId).
+		Where("created_at >= ?", startTimestamp).
+		Where("created_at <= ?", endTimestamp)
+	order := "created_at desc, id desc"
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		order = clickHouseLogOrder("")
+		if cursor != nil {
+			tx = tx.Where(
+				"(created_at < ?) OR (created_at = ? AND request_id < ?)",
+				cursor.CreatedAt,
+				cursor.CreatedAt,
+				cursor.RequestId,
+			)
+		}
+	} else if cursor != nil {
+		tx = tx.Where(
+			"(created_at < ?) OR (created_at = ? AND id < ?)",
+			cursor.CreatedAt,
+			cursor.CreatedAt,
+			cursor.Id,
+		)
+	}
+
+	err = tx.Order(order).Limit(num + 1).Find(&logs).Error
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(logs) > num {
+		hasMore = true
+		logs = logs[:num]
+	}
+	if hasMore && len(logs) > 0 {
+		lastLog := logs[len(logs)-1]
+		nextCursor = &TokenLogKeysetCursor{
+			CreatedAt: lastLog.CreatedAt,
+			Id:        lastLog.Id,
+			RequestId: lastLog.RequestId,
+		}
+	}
+	formatUserLogs(logs, startIdx)
+	return logs, nextCursor, hasMore, nil
 }
 
 func CountLogByTokenIdRange(tokenId int, startTimestamp int64, endTimestamp int64) (total int64, err error) {
@@ -468,11 +552,19 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 }
 
 func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	return GetAllLogsWithContext(context.Background(), logType, startTimestamp, endTimestamp, modelName, username, tokenName, startIdx, num, channel, group, requestId, upstreamRequestId)
+}
+
+func GetAllLogsWithContext(ctx context.Context, logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
-		tx = LOG_DB
+		tx = logDB
 	} else {
-		tx = LOG_DB.Where("logs.type = ?", logType)
+		tx = logDB.Where("logs.type = ?", logType)
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -561,11 +653,19 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 const logSearchCountLimit = 10000
 
 func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	return GetUserLogsWithContext(context.Background(), userId, logType, startTimestamp, endTimestamp, modelName, tokenName, startIdx, num, group, requestId, upstreamRequestId)
+}
+
+func GetUserLogsWithContext(ctx context.Context, userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
-		tx = LOG_DB.Where("logs.user_id = ?", userId)
+		tx = logDB.Where("logs.user_id = ?", userId)
 	} else {
-		tx = LOG_DB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
+		tx = logDB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -591,6 +691,9 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	}
 	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, err
+		}
 		common.SysError("failed to count user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
 	}
@@ -600,6 +703,9 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	}
 	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, err
+		}
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
 	}
@@ -615,10 +721,18 @@ type Stat struct {
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
+	return SumUsedQuotaWithContext(context.Background(), logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+}
+
+func SumUsedQuotaWithContext(ctx context.Context, logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
+	tx := logDB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
 
 	// 为rpm和tpm创建单独的查询
-	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
+	rpmTpmQuery := logDB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err
@@ -659,10 +773,16 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 
 	// 执行查询
 	if err := tx.Scan(&stat).Error; err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return stat, err
+		}
 		common.SysError("failed to query log stat: " + err.Error())
 		return stat, errors.New("查询统计数据失败")
 	}
 	if err := rpmTpmQuery.Scan(&stat).Error; err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return stat, err
+		}
 		common.SysError("failed to query rpm/tpm stat: " + err.Error())
 		return stat, errors.New("查询统计数据失败")
 	}

@@ -52,13 +52,14 @@ const (
 	ErrorCodeGenRelayInfoFailed ErrorCode = "gen_relay_info_failed"
 
 	// channel error
-	ErrorCodeChannelNoAvailableKey        ErrorCode = "channel:no_available_key"
-	ErrorCodeChannelParamOverrideInvalid  ErrorCode = "channel:param_override_invalid"
-	ErrorCodeChannelHeaderOverrideInvalid ErrorCode = "channel:header_override_invalid"
-	ErrorCodeChannelModelMappedError      ErrorCode = "channel:model_mapped_error"
-	ErrorCodeChannelAwsClientError        ErrorCode = "channel:aws_client_error"
-	ErrorCodeChannelInvalidKey            ErrorCode = "channel:invalid_key"
-	ErrorCodeChannelResponseTimeExceeded  ErrorCode = "channel:response_time_exceeded"
+	ErrorCodeChannelNoAvailableKey          ErrorCode = "channel:no_available_key"
+	ErrorCodeChannelParamOverrideInvalid    ErrorCode = "channel:param_override_invalid"
+	ErrorCodeChannelHeaderOverrideInvalid   ErrorCode = "channel:header_override_invalid"
+	ErrorCodeChannelModelMappedError        ErrorCode = "channel:model_mapped_error"
+	ErrorCodeChannelAwsClientError          ErrorCode = "channel:aws_client_error"
+	ErrorCodeChannelInvalidKey              ErrorCode = "channel:invalid_key"
+	ErrorCodeChannelResponseTimeExceeded    ErrorCode = "channel:response_time_exceeded"
+	ErrorCodeChannelCPAAuditIdentityInvalid ErrorCode = "channel:cpa_audit_identity_invalid"
 
 	// client request error
 	ErrorCodeReadRequestBodyFailed ErrorCode = "read_request_body_failed"
@@ -89,6 +90,7 @@ const (
 	ErrorCodeModelNotFound                 ErrorCode = "model_not_found"
 	ErrorCodePromptBlocked                 ErrorCode = "prompt_blocked"
 	ErrorCodeAuthUnavailable               ErrorCode = "auth_unavailable"
+	ErrorCodeCPAContentAuditBlocked        ErrorCode = "cpa_content_audit_blocked"
 
 	// sql error
 	ErrorCodeQueryDataError  ErrorCode = "query_data_error"
