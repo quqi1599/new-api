@@ -97,6 +97,7 @@ export const useLogsData = () => {
   const [formApi, setFormApi] = useState(null);
   const listRequestRef = useRef({ seq: 0, controller: null });
   const statRequestRef = useRef({ seq: 0, controller: null });
+  const initialListPromiseRef = useRef(Promise.resolve(false));
   let now = new Date();
   const formInitValues = {
     username: '',
@@ -849,13 +850,16 @@ export const useLogsData = () => {
         setLogCount(data.total);
 
         setLogsFormat(newPageData);
+        return true;
       } else {
         showError(message);
+        return false;
       }
     } catch (error) {
       if (!isCanceledRequest(error) && isCurrentRequest(listRequestRef, seq)) {
         showError(error.message || error);
       }
+      return false;
     } finally {
       if (isCurrentRequest(listRequestRef, seq)) {
         setLoading(false);
@@ -880,8 +884,10 @@ export const useLogsData = () => {
   const refresh = async () => {
     const filters = getFilterSnapshot();
     setActivePage(1);
-    handleEyeClick(filters);
-    await loadLogs(1, pageSize, null, filters);
+    const loaded = await loadLogs(1, pageSize, null, filters);
+    if (loaded) {
+      await handleEyeClick(filters);
+    }
   };
 
   // Copy text function
@@ -906,14 +912,26 @@ export const useLogsData = () => {
     const localPageSize =
       parseInt(localStorage.getItem('page-size')) || ITEMS_PER_PAGE;
     setPageSize(localPageSize);
-    loadLogs(activePage, localPageSize);
+    initialListPromiseRef.current = loadLogs(activePage, localPageSize);
   }, []);
 
   // Initialize statistics when formApi is available
   useEffect(() => {
-    if (formApi) {
-      handleEyeClick();
+    if (!formApi) {
+      return;
     }
+
+    let active = true;
+    const loadInitialStat = async () => {
+      const loaded = await initialListPromiseRef.current;
+      if (active && loaded) {
+        await handleEyeClick();
+      }
+    };
+    loadInitialStat();
+    return () => {
+      active = false;
+    };
   }, [formApi]);
 
   // Check if any record has expandable content

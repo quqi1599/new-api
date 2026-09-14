@@ -552,11 +552,19 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 }
 
 func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	return GetAllLogsWithContext(context.Background(), logType, startTimestamp, endTimestamp, modelName, username, tokenName, startIdx, num, channel, group, requestId, upstreamRequestId)
+}
+
+func GetAllLogsWithContext(ctx context.Context, logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
-		tx = LOG_DB
+		tx = logDB
 	} else {
-		tx = LOG_DB.Where("logs.type = ?", logType)
+		tx = logDB.Where("logs.type = ?", logType)
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -645,11 +653,19 @@ func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName
 const logSearchCountLimit = 10000
 
 func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	return GetUserLogsWithContext(context.Background(), userId, logType, startTimestamp, endTimestamp, modelName, tokenName, startIdx, num, group, requestId, upstreamRequestId)
+}
+
+func GetUserLogsWithContext(ctx context.Context, userId int, logType int, startTimestamp int64, endTimestamp int64, modelName string, tokenName string, startIdx int, num int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
 	var tx *gorm.DB
 	if logType == LogTypeUnknown {
-		tx = LOG_DB.Where("logs.user_id = ?", userId)
+		tx = logDB.Where("logs.user_id = ?", userId)
 	} else {
-		tx = LOG_DB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
+		tx = logDB.Where("logs.user_id = ? and logs.type = ?", userId, logType)
 	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "logs.model_name", modelName); err != nil {
@@ -675,6 +691,9 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	}
 	err = tx.Model(&Log{}).Limit(logSearchCountLimit).Count(&total).Error
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, err
+		}
 		common.SysError("failed to count user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
 	}
@@ -684,6 +703,9 @@ func GetUserLogs(userId int, logType int, startTimestamp int64, endTimestamp int
 	}
 	err = tx.Order(order).Limit(num).Offset(startIdx).Find(&logs).Error
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, 0, err
+		}
 		common.SysError("failed to search user logs: " + err.Error())
 		return nil, 0, errors.New("查询日志失败")
 	}
@@ -699,10 +721,18 @@ type Stat struct {
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
+	return SumUsedQuotaWithContext(context.Background(), logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+}
+
+func SumUsedQuotaWithContext(ctx context.Context, logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	logDB := LOG_DB.WithContext(ctx)
+	tx := logDB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
 
 	// 为rpm和tpm创建单独的查询
-	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
+	rpmTpmQuery := logDB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err
@@ -743,10 +773,16 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 
 	// 执行查询
 	if err := tx.Scan(&stat).Error; err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return stat, err
+		}
 		common.SysError("failed to query log stat: " + err.Error())
 		return stat, errors.New("查询统计数据失败")
 	}
 	if err := rpmTpmQuery.Scan(&stat).Error; err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return stat, err
+		}
 		common.SysError("failed to query rpm/tpm stat: " + err.Error())
 		return stat, errors.New("查询统计数据失败")
 	}
