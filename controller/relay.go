@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -255,6 +256,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				lastRetryAllowed,
 				len(retryParam.CircuitSkippedIds) > 0,
 				relayInfo.LastError,
+				retryParam,
 			)
 			if canStartNextRound {
 				delay := retryState.NextRoundDelay(retryParam.CircuitRetryAfter)
@@ -339,7 +341,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
 
-		retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channel.Id)
+		recordRelayChannelFailure(retryParam, channel.Id, newAPIError)
 
 		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
@@ -475,18 +477,45 @@ func canStartNextRelayRetryRound(
 	lastRetryAllowed bool,
 	circuitSkipped bool,
 	lastErr *types.NewAPIError,
+	retryParam *service.RetryParam,
 ) bool {
 	if state == nil {
 		return false
 	}
-	// auth_unavailable means the selected upstream proxy already exhausted its
-	// own credential/route pool. Keep failover within the current NewAPI round,
-	// but do not reset exclusions and replay the same aggregate channel again.
-	if isAuthUnavailableError(lastErr) {
+	// An exhausted proxy remains excluded for this request, but unrelated
+	// entrances with transient failures may still recover in another round.
+	if isAuthUnavailableError(lastErr) && !hasRetryRoundAlternative(state, retryParam) {
 		state.StopReason = service.RetryStopReasonAuthUnavailable
 		return false
 	}
 	return (lastRetryAllowed || circuitSkipped) && state.CanStartNextRound(ctx)
+}
+
+func recordRelayChannelFailure(retryParam *service.RetryParam, channelID int, relayErr *types.NewAPIError) {
+	if retryParam == nil {
+		return
+	}
+	retryParam.ExcludedChannelIds = append(retryParam.ExcludedChannelIds, channelID)
+	if isAuthUnavailableError(relayErr) {
+		retryParam.AddPersistentExcludedChannel(channelID)
+	}
+}
+
+func hasRetryRoundAlternative(state *service.RelayRetryState, retryParam *service.RetryParam) bool {
+	if state == nil || retryParam == nil {
+		return false
+	}
+	for channelID := range state.DistinctChannel {
+		if !slices.Contains(retryParam.PersistentExcludedIds, channelID) {
+			return true
+		}
+	}
+	for _, channelID := range retryParam.CircuitSkippedIds {
+		if !slices.Contains(retryParam.PersistentExcludedIds, channelID) {
+			return true
+		}
+	}
+	return false
 }
 
 var upgrader = websocket.Upgrader{

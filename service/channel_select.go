@@ -24,6 +24,7 @@ type RetryParam struct {
 	PreferredChannelTypes []int                 // native channel types to prioritize based on request path
 	RequiredEndpointType  constant.EndpointType // strict endpoint capability; empty keeps legacy selection
 	ExcludedChannelIds    []int                 // channels that have already failed in this request
+	PersistentExcludedIds []int                 // request-lifetime exclusions retained across retry rounds
 	CircuitRetryAfter     time.Duration
 	CircuitSkippedIds     []int
 }
@@ -68,7 +69,15 @@ func isTokenChannelExcluded(c *gin.Context, channelId int) bool {
 
 func excludedChannelIdsForRequest(param *RetryParam) []int {
 	excluded := append([]int(nil), param.ExcludedChannelIds...)
+	excluded = append(excluded, param.PersistentExcludedIds...)
 	return append(excluded, tokenExcludedChannelIds(param.Ctx)...)
+}
+
+func (p *RetryParam) AddPersistentExcludedChannel(channelID int) {
+	if p == nil || channelID <= 0 || slices.Contains(p.PersistentExcludedIds, channelID) {
+		return
+	}
+	p.PersistentExcludedIds = append(p.PersistentExcludedIds, channelID)
 }
 
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.

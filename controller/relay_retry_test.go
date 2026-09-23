@@ -29,7 +29,7 @@ func TestAuthUnavailableDoesNotReplayAggregateChannelAcrossRounds(t *testing.T) 
 		types.ErrOptionWithUpstreamResponse(),
 	)
 
-	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr) {
+	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr, nil) {
 		t.Fatal("auth_unavailable must not reset exclusions and replay the same aggregate channel")
 	}
 	if state.StopReason != service.RetryStopReasonAuthUnavailable {
@@ -56,7 +56,7 @@ func TestCPAAuthUnavailableCompatibilityEnvelopeDoesNotReplayAcrossRounds(t *tes
 
 	state := service.NewRelayRetryState(types.RelayFormatOpenAI, 16)
 	state.RecordAttempt(9)
-	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr) {
+	if canStartNextRelayRetryRound(context.Background(), state, true, false, authErr, nil) {
 		t.Fatal("legacy CPA auth_unavailable must not replay the aggregate channel")
 	}
 	if state.StopReason != service.RetryStopReasonAuthUnavailable {
@@ -84,7 +84,7 @@ func TestOtherRetryableFailureMayStartAnotherRound(t *testing.T) {
 		types.ErrOptionWithUpstreamResponse(),
 	)
 
-	if !canStartNextRelayRetryRound(context.Background(), state, true, false, upstreamErr) {
+	if !canStartNextRelayRetryRound(context.Background(), state, true, false, upstreamErr, nil) {
 		t.Fatal("ordinary retryable upstream failures must preserve bounded cross-round retry")
 	}
 }

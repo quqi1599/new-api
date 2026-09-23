@@ -90,6 +90,7 @@ const (
 	ErrorCodeModelNotFound                 ErrorCode = "model_not_found"
 	ErrorCodePromptBlocked                 ErrorCode = "prompt_blocked"
 	ErrorCodeAuthUnavailable               ErrorCode = "auth_unavailable"
+	ErrorCodeRequestFeatureUnsupported     ErrorCode = "request_feature_unsupported"
 	ErrorCodeCPAContentAuditBlocked        ErrorCode = "cpa_content_audit_blocked"
 
 	// sql error
