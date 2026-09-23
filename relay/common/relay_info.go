@@ -203,6 +203,10 @@ type RelayInfo struct {
 	FinalRequestRelayFormat types.RelayFormat
 
 	StreamStatus *StreamStatus
+	// PartialStreamError marks a failed, already-started stream whose measured
+	// partial usage still follows the existing settlement policy. It is never a
+	// successful completion or permission to replay the upstream operation.
+	PartialStreamError *types.NewAPIError
 
 	ThinkingContentInfo
 	TokenCountMeta

@@ -124,13 +124,20 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		info.ClaudeConvertInfo = &relaycommon.ClaudeConvertInfo{LastMessagesType: relaycommon.LastMessageTypeNone}
 	}
 
+	classifyDeliveryError := func(err error) *types.NewAPIError {
+		if deliveryErr := helper.DownstreamStreamError(c, info, err); deliveryErr != nil {
+			return deliveryErr
+		}
+		return types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+	}
+
 	sendChatChunk := func(chunk *dto.ChatCompletionsStreamResponse) bool {
 		if chunk == nil {
 			return true
 		}
 		if info.RelayFormat == types.RelayFormatOpenAI {
 			if err := helper.ObjectData(c, chunk); err != nil {
-				streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+				streamErr = classifyDeliveryError(err)
 				return false
 			}
 			return true
@@ -142,7 +149,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			return false
 		}
 		if err := HandleStreamFormat(c, info, string(chunkData), false, false); err != nil {
-			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			streamErr = classifyDeliveryError(err)
 			return false
 		}
 		return true
@@ -511,12 +518,14 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		case "error", "response.error", "response.failed", "response.incomplete":
 			if streamResp.Response != nil {
 				if oaiErr := streamResp.Response.GetOpenAIError(); oaiErr != nil && oaiErr.Type != "" {
-					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError)
+					streamErr = types.WithOpenAIError(*oaiErr, http.StatusInternalServerError,
+						types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
 					sr.Stop(streamErr)
 					return
 				}
 			}
-			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			streamErr = types.NewOpenAIError(fmt.Errorf("responses stream error: %s", streamResp.Type), types.ErrorCodeBadResponse, http.StatusInternalServerError,
+				types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
 			sr.Stop(streamErr)
 			return
 
@@ -527,20 +536,32 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, firstEventErr
 	}
 
-	if streamErr != nil {
+	if streamErr != nil && info.PartialStreamError != streamErr {
+		if helper.StreamStarted(c) {
+			_ = helper.SendInBandStreamError(c, info.RelayFormat, streamErr)
+		}
 		return nil, streamErr
 	}
 
 	if usage.TotalTokens == 0 {
 		usage = service.ResponseText2Usage(c, usageText.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 	}
+	if streamErr != nil {
+		// Preserve measured partial usage without writing another frame to a
+		// downstream connection that has already failed.
+		return usage, streamErr
+	}
 	if !helper.ShouldFinalizeStream(info) {
+		if streamErr := helper.PostOutputStreamError(c, info); streamErr != nil {
+			_ = helper.SendInBandStreamError(c, info.RelayFormat, streamErr)
+			return usage, streamErr
+		}
 		return usage, nil
 	}
 
 	if !sentStart {
 		if !sendChatChunk(helper.GenerateStartEmptyResponse(responseId, createAt, model, nil)) {
-			return nil, streamErr
+			return usage, streamErr
 		}
 	}
 	if !sentStop {
@@ -553,17 +574,19 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 		stop := helper.GenerateStopResponse(responseId, createAt, model, finishReason)
 		if !sendChatChunk(stop) {
-			return nil, streamErr
+			return usage, streamErr
 		}
 	}
 	if info.RelayFormat == types.RelayFormatOpenAI && info.ShouldIncludeUsage && usage != nil {
 		if err := helper.ObjectData(c, helper.GenerateFinalUsageResponse(responseId, createAt, model, *usage)); err != nil {
-			return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
+			return usage, classifyDeliveryError(err)
 		}
 	}
 
 	if info.RelayFormat == types.RelayFormatOpenAI {
-		helper.Done(c)
+		if err := helper.StringData(c, "[DONE]"); err != nil {
+			return usage, classifyDeliveryError(err)
+		}
 	}
 	return usage, nil
 }

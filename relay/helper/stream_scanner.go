@@ -93,6 +93,24 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 	if info.ReceivedResponseCount != 0 && (c == nil || c.Writer == nil || c.Writer.Written() || info.StreamStatus.EndReason == relaycommon.StreamEndReasonDone) {
 		return nil
 	}
+	return streamTerminationError(c, info, false)
+}
+
+// PostOutputStreamError keeps completion and settlement independent: callers
+// return this error with the partial usage they already calculated. The relay
+// settles that usage once, but reports failure and never restores channel health.
+func PostOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIError {
+	if info == nil || info.StreamStatus == nil || info.ReceivedResponseCount == 0 || !StreamStarted(c) {
+		return nil
+	}
+	err := streamTerminationError(c, info, true)
+	if err != nil {
+		info.PartialStreamError = err
+	}
+	return err
+}
+
+func streamTerminationError(c *gin.Context, info *relaycommon.RelayInfo, afterOutput bool) *types.NewAPIError {
 
 	statusCode := http.StatusBadGateway
 	errorCode := types.ErrorCodeUpstreamStreamIncomplete
@@ -121,6 +139,7 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 	case relaycommon.StreamEndReasonPingFail:
 		common.SetContextKey(c, constant.ContextKeyRelayCancelOrigin, constant.RelayCancelOriginDownstreamDisconnected)
 		message = "downstream stream heartbeat failed before a response could be delivered"
+		allowChannelPenalty = false
 	case relaycommon.StreamEndReasonClientGone:
 		statusCode = 499
 		message = "downstream connection closed before the first valid event"
@@ -137,6 +156,9 @@ func PreOutputStreamError(c *gin.Context, info *relaycommon.RelayInfo) *types.Ne
 		return nil
 	default:
 		return nil
+	}
+	if afterOutput {
+		message = fmt.Sprintf("stream ended before completion (%s)", info.StreamStatus.EndReason)
 	}
 
 	options := []types.NewAPIErrorOptions{types.ErrOptionWithSkipRetry()}
@@ -579,6 +601,7 @@ func StreamScannerHandlerWithDecoder(c *gin.Context, resp *http.Response, info *
 	}
 
 	cleanup()
+	markStreamScannerCompleted(c, info)
 	if info.StreamStatus.IsNormalEnd() && !info.StreamStatus.HasErrors() {
 		logger.LogInfo(c, fmt.Sprintf("stream ended: %s", info.StreamStatus.Summary()))
 	} else {

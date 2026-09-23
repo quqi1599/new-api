@@ -131,48 +131,49 @@ func GetChannel(group string, model string, retry int, preferredChannelTypes []i
 
 func GetChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
 	var abilities []Ability
-	var eligibleChannelIDs []int
-	if requiredEndpointType != "" {
-		var channels []Channel
-		if err := DB.Select("id", "type", "setting").Find(&channels).Error; err != nil {
-			return nil, err
+	// Resolve hard eligibility before either type preference or priority. In
+	// particular, an excluded/disabled native channel must not retain a priority
+	// tier or contaminate the fallback query with its type filter.
+	abilityIDs := DB.Model(&Ability{}).Select("channel_id").
+		Where(commonGroupCol+" = ? and model = ? and enabled = ?", group, model, true)
+	if len(excludedChannelIds) > 0 {
+		abilityIDs = abilityIDs.Where("channel_id NOT IN ?", excludedChannelIds)
+	}
+	var channels []Channel
+	if err := DB.Select("id", "type", "setting").
+		Where("status = ? AND id IN (?)", common.ChannelStatusEnabled, abilityIDs).
+		Find(&channels).Error; err != nil {
+		return nil, err
+	}
+	typeSet := make(map[int]bool, len(preferredChannelTypes))
+	for _, channelType := range preferredChannelTypes {
+		typeSet[channelType] = true
+	}
+	eligibleChannelIDs := make([]int, 0, len(channels))
+	preferredChannelIDs := make([]int, 0, len(channels))
+	for index := range channels {
+		channel := &channels[index]
+		if !channel.SupportsEndpointType(requiredEndpointType) {
+			continue
 		}
-		for index := range channels {
-			if channels[index].SupportsEndpointType(requiredEndpointType) {
-				eligibleChannelIDs = append(eligibleChannelIDs, channels[index].Id)
-			}
+		eligibleChannelIDs = append(eligibleChannelIDs, channel.Id)
+		if typeSet[channel.Type] {
+			preferredChannelIDs = append(preferredChannelIDs, channel.Id)
 		}
-		if len(eligibleChannelIDs) == 0 {
-			return nil, nil
-		}
+	}
+	if len(eligibleChannelIDs) == 0 {
+		return nil, nil
+	}
+	if len(preferredChannelIDs) > 0 {
+		eligibleChannelIDs = preferredChannelIDs
 	}
 
 	channelQuery, err := getChannelQueryForChannels(group, model, retry, eligibleChannelIDs)
 	if err != nil {
 		return nil, err
 	}
-
-	if len(excludedChannelIds) > 0 {
-		channelQuery = channelQuery.Where("channel_id NOT IN ?", excludedChannelIds)
-	}
-
-	orderClause := "weight DESC"
-
-	// Try with preferred channel types filter first
-	if len(preferredChannelTypes) > 0 {
-		subQuery := DB.Model(&Channel{}).Select("id").Where("type IN ?", preferredChannelTypes)
-		err = channelQuery.Where("channel_id IN (?)", subQuery).Order(orderClause).Find(&abilities).Error
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// If no abilities found with filter, try without filter
-	if len(abilities) == 0 {
-		err = channelQuery.Order(orderClause).Find(&abilities).Error
-		if err != nil {
-			return nil, err
-		}
+	if err = channelQuery.Order("weight DESC").Find(&abilities).Error; err != nil {
+		return nil, err
 	}
 	channel := Channel{}
 	if len(abilities) > 0 {

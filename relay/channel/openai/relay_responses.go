@@ -85,6 +85,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	var usage = &dto.Usage{}
 	var responseTextBuilder strings.Builder
 	var terminalFailure *types.NewAPIError
+	var deliveryFailure *types.NewAPIError
 	imageCounter := &relaycommon.ImageGenerationCallCounter{}
 	imageCommitted := false
 
@@ -108,7 +109,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		if !sr.Accept() {
 			return
 		}
-		sendResponsesStreamData(c, streamResponse, data)
+		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+			deliveryFailure = helper.DownstreamStreamError(c, info, err)
+			sr.Stop(err)
+			// This frame was already accepted upstream. Preserve its usage/text
+			// below even if delivery failed. Stop prevents another frame (and
+			// makes a later sr.Done a no-op), without discarding known usage.
+		}
 
 		// Adapted from official PR #6549: Responses error events are valid SSE
 		// payloads, so transport-level success must not erase their business error.
@@ -221,6 +228,13 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 	}
 
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	if deliveryFailure != nil {
+		return usage, deliveryFailure
+	}
+	if streamErr := helper.PostOutputStreamError(c, info); streamErr != nil {
+		_ = helper.SendInBandStreamError(c, types.RelayFormatOpenAIResponses, streamErr)
+		return usage, streamErr
+	}
 
 	return usage, nil
 }

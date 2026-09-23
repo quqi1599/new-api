@@ -17,7 +17,7 @@ import (
 func FlushWriter(c *gin.Context) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("flush panic recovered: %v", r)
+			err = wrapDownstreamWriteError(fmt.Errorf("flush panic recovered: %v", r))
 		}
 	}()
 
@@ -26,7 +26,7 @@ func FlushWriter(c *gin.Context) (err error) {
 	}
 
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	flusher, ok := c.Writer.(http.Flusher)
@@ -87,6 +87,13 @@ func SendInBandStreamError(c *gin.Context, relayFormat types.RelayFormat, relayE
 		return ObjectData(c, struct {
 			Error types.OpenAIError `json:"error"`
 		}{Error: relayErr.ToOpenAIError()})
+	case types.RelayFormatOpenAIResponses:
+		public := relayErr.ToOpenAIError()
+		body, err := common.Marshal(gin.H{"type": "error", "code": public.Code, "message": public.Message, "param": public.Param})
+		if err != nil {
+			return err
+		}
+		return ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "error"}, string(body))
 	default:
 		return fmt.Errorf("unsupported relay format for in-band stream error: %s", relayFormat)
 	}
@@ -94,7 +101,7 @@ func SendInBandStreamError(c *gin.Context, relayFormat types.RelayFormat, relayE
 
 func ClaudeData(c *gin.Context, resp dto.ClaudeResponse) error {
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	jsonData, err := common.Marshal(resp)
@@ -109,24 +116,24 @@ func ClaudeChunkData(c *gin.Context, resp dto.ClaudeResponse, data string) error
 		return errors.New("context or writer is nil")
 	}
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	SetEventStreamHeaders(c)
 	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", resp.Type, data); err != nil {
-		return fmt.Errorf("write claude stream data failed: %w", err)
+		return wrapDownstreamWriteError(fmt.Errorf("write claude stream data failed: %w", err))
 	}
 	return FlushWriter(c)
 }
 
 func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data string) error {
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	SetEventStreamHeaders(c)
 	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", resp.Type, data); err != nil {
-		return fmt.Errorf("write responses stream data failed: %w", err)
+		return wrapDownstreamWriteError(fmt.Errorf("write responses stream data failed: %w", err))
 	}
 	return FlushWriter(c)
 }
@@ -137,12 +144,12 @@ func StringData(c *gin.Context, str string) error {
 	}
 
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	SetEventStreamHeaders(c)
 	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", str); err != nil {
-		return fmt.Errorf("write stream data failed: %w", err)
+		return wrapDownstreamWriteError(fmt.Errorf("write stream data failed: %w", err))
 	}
 	return FlushWriter(c)
 }
@@ -153,12 +160,12 @@ func PingData(c *gin.Context) error {
 	}
 
 	if requestContextDone(c) {
-		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
+		return wrapDownstreamWriteError(fmt.Errorf("request context done: %w", c.Request.Context().Err()))
 	}
 
 	SetEventStreamHeaders(c)
 	if _, err := c.Writer.Write([]byte(": PING\n\n")); err != nil {
-		return fmt.Errorf("write ping data failed: %w", err)
+		return wrapDownstreamWriteError(fmt.Errorf("write ping data failed: %w", err))
 	}
 	return FlushWriter(c)
 }

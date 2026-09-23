@@ -139,7 +139,9 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-		return newAPIError
+		if !canSettlePartialStreamUsage(c, info, usage, newAPIError) {
+			return newAPIError
+		}
 	}
 
 	usageDto := usage.(*dto.Usage)
@@ -157,7 +159,7 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 
 		info.OriginModelName = originModelName
 		info.PriceData = originPriceData
-		return nil
+		return newAPIError
 	}
 
 	if strings.HasPrefix(info.OriginModelName, "gpt-4o-audio") {
@@ -165,5 +167,5 @@ func ResponsesHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *
 	} else {
 		service.PostTextConsumeQuota(c, info, usageDto, nil)
 	}
-	return nil
+	return newAPIError
 }

@@ -254,7 +254,23 @@ func GetRandomSatisfiedChannelForEndpoint(group string, model string, retry int,
 		channels = capable
 	}
 
-	// If preferred channel types are set, filter channels to prioritize native types
+	// Request exclusions are hard gates. Apply them before the native-type
+	// preference so a failed native route cannot hide a usable compatible route.
+	if len(excludedChannelIds) > 0 {
+		excludeSet := make(map[int]bool, len(excludedChannelIds))
+		for _, id := range excludedChannelIds {
+			excludeSet[id] = true
+		}
+		var filtered []int
+		for _, id := range channels {
+			if !excludeSet[id] {
+				filtered = append(filtered, id)
+			}
+		}
+		channels = filtered
+	}
+
+	// Prefer native types only among candidates that remain eligible.
 	if len(preferredChannelTypes) > 0 {
 		typeSet := make(map[int]bool, len(preferredChannelTypes))
 		for _, t := range preferredChannelTypes {
@@ -270,21 +286,6 @@ func GetRandomSatisfiedChannelForEndpoint(group string, model string, retry int,
 		if len(preferred) > 0 {
 			channels = preferred
 		}
-	}
-
-	// Exclude channels that have already failed in this request
-	if len(excludedChannelIds) > 0 {
-		excludeSet := make(map[int]bool, len(excludedChannelIds))
-		for _, id := range excludedChannelIds {
-			excludeSet[id] = true
-		}
-		var filtered []int
-		for _, id := range channels {
-			if !excludeSet[id] {
-				filtered = append(filtered, id)
-			}
-		}
-		channels = filtered
 	}
 
 	if len(channels) == 0 {

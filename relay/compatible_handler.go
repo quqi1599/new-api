@@ -78,7 +78,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		service.ShouldChatCompletionsUseResponsesGlobal(info.ChannelId, info.ChannelType, info.OriginModelName) {
 		applySystemPromptIfNeeded(c, info, request)
 		usage, newApiErr := chatCompletionsViaResponses(c, info, adaptor, request)
-		if newApiErr != nil {
+		if newApiErr != nil && !canSettlePartialStreamUsage(c, info, usage, newApiErr) {
 			return newApiErr
 		}
 
@@ -90,7 +90,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		} else {
 			service.PostTextConsumeQuota(c, info, usage, nil)
 		}
-		return nil
+		return newApiErr
 	}
 
 	var requestBody io.Reader
@@ -221,7 +221,9 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	if newApiErr != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
-		return newApiErr
+		if !canSettlePartialStreamUsage(c, info, usage, newApiErr) {
+			return newApiErr
+		}
 	}
 
 	var containAudioTokens = usage.(*dto.Usage).CompletionTokenDetails.AudioTokens > 0 || usage.(*dto.Usage).PromptTokensDetails.AudioTokens > 0
@@ -232,5 +234,5 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 	} else {
 		service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), nil)
 	}
-	return nil
+	return newApiErr
 }

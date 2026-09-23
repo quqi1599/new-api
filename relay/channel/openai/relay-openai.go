@@ -121,6 +121,8 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var responseTextBuilder strings.Builder
 	var toolCount int
 	var usage = &dto.Usage{}
+	var terminalFailure *types.NewAPIError
+	var deliveryFailure *types.NewAPIError
 	var streamItems []string // store stream items
 	var lastStreamData string
 	var secondLastStreamData string // 存储倒数第二个stream data，用于音频模型
@@ -147,6 +149,13 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			// A syntactically valid error envelope is not a chat chunk. Accepting it
 			// as the first event would let a following [DONE] turn an upstream failure
 			// into a false success and a normal settlement.
+			var envelope dto.GeneralErrorResponse
+			if common.UnmarshalJsonStr(data, &envelope) == nil {
+				if publicError := envelope.TryToOpenAIError(); publicError != nil {
+					terminalFailure = types.WithOpenAIError(*publicError, http.StatusBadGateway,
+						types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+				}
+			}
 			sr.Stop(fmt.Errorf("upstream OpenAI stream returned an error event"))
 			return
 		}
@@ -156,24 +165,28 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				return
 			}
 		}
-		if lastStreamData != "" {
-			if err := HandleStreamFormat(c, info, lastStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
-				common.SysLog("error handling stream format: " + err.Error())
-				sr.Stop(err)
-				return
-			}
-		}
 		if !sr.Accept() {
 			return
 		}
+		// Retain the current accepted frame before flushing the prior buffered
+		// one. A downstream failure must not discard usage that already arrived.
+		previousStreamData := lastStreamData
 		if len(data) > 0 {
 			// 对音频模型，保存倒数第二个stream data
-			if isAudioModel && lastStreamData != "" {
-				secondLastStreamData = lastStreamData
+			if isAudioModel && previousStreamData != "" {
+				secondLastStreamData = previousStreamData
 			}
 
 			lastStreamData = data
 			streamItems = append(streamItems, data)
+		}
+		if previousStreamData != "" {
+			if err := HandleStreamFormat(c, info, previousStreamData, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+				common.SysLog("error handling stream format: " + err.Error())
+				deliveryFailure = helper.DownstreamStreamError(c, info, err)
+				sr.Stop(err)
+				return
+			}
 		}
 	})
 	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
@@ -208,11 +221,13 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		logger.LogError(c, fmt.Sprintf("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
 	}
 
-	if info.RelayFormat == types.RelayFormatOpenAI {
+	if info.RelayFormat == types.RelayFormatOpenAI && deliveryFailure == nil {
 		if shouldSendLastResp {
 			lastStreamPayload, done := helper.NormalizeSSEPayload(lastStreamData)
 			if !done && lastStreamPayload != "" {
-				_ = sendStreamData(c, info, lastStreamPayload, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent)
+				if err := sendStreamData(c, info, lastStreamPayload, info.ChannelSetting.ForceFormat, info.ChannelSetting.ThinkingToContent); err != nil {
+					deliveryFailure = helper.DownstreamStreamError(c, info, err)
+				}
 			}
 		}
 	}
@@ -232,9 +247,25 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		lastStreamPayload = ""
 	}
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(lastStreamPayload))
+	if deliveryFailure != nil {
+		return usage, deliveryFailure
+	}
+	if streamErr := helper.PostOutputStreamError(c, info); streamErr != nil {
+		if terminalFailure != nil {
+			streamErr = terminalFailure
+			info.PartialStreamError = streamErr
+		}
+		_ = helper.SendInBandStreamError(c, info.RelayFormat, streamErr)
+		return usage, streamErr
+	}
 
 	if helper.ShouldFinalizeStream(info) {
-		HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage)
+		if err := HandleFinalResponse(c, info, lastStreamData, responseId, createAt, model, systemFingerprint, usage, containStreamUsage); err != nil {
+			if deliveryFailure := helper.DownstreamStreamError(c, info, err); deliveryFailure != nil {
+				return usage, deliveryFailure
+			}
+			return usage, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusBadGateway, types.ErrOptionWithSkipRetry())
+		}
 	}
 
 	return usage, nil
