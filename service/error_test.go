@@ -151,6 +151,22 @@ func TestRelayErrorHandlerPreservesAuthUnavailableCode(t *testing.T) {
 	require.Equal(t, types.ErrorCodeAuthUnavailable, newAPIError.GetErrorCode())
 }
 
+func TestRelayErrorHandlerPreservesRetryAfter(t *testing.T) {
+	body := `{"error":{"message":"all compatible remote-compaction routes are temporarily unavailable","type":"server_error","code":"compaction_route_unavailable"}}`
+	resp := &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Header:     http.Header{"Retry-After": []string{"19"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	newAPIError := RelayErrorHandler(context.Background(), resp, false)
+
+	require.NotNil(t, newAPIError)
+	require.True(t, newAPIError.HasUpstreamResponse())
+	require.Equal(t, types.ErrorCodeCompactionRouteUnavailable, newAPIError.GetErrorCode())
+	require.Equal(t, "19", newAPIError.GetRetryAfter())
+}
+
 func TestRelayErrorHandlerKeepsInvalidJSONBodyInDebugLog(t *testing.T) {
 	withDebugEnabled(t, true)
 

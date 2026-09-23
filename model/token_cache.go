@@ -2,20 +2,13 @@ package model
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 )
 
 func cacheSetToken(token Token) error {
-	key := common.GenerateHMAC(token.Key)
-	token.Clean()
-	err := common.RedisHSetObj(fmt.Sprintf("token:%s", key), &token, time.Duration(common.RedisKeyCacheSeconds())*time.Second)
-	if err != nil {
-		return err
-	}
-	return nil
+	return cachePopulateTokenForCredit(token)
 }
 
 func cacheDeleteToken(key string) error {
@@ -55,10 +48,16 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}
+	if _, dirty := dirtySaaSTokenCaches.Load(fmt.Sprintf("token:%s", hmacKey)); dirty {
+		return nil, fmt.Errorf("token cache credit refresh is pending")
+	}
 	var token Token
 	err := common.RedisHGetObj(fmt.Sprintf("token:%s", hmacKey), &token)
 	if err != nil {
 		return nil, err
+	}
+	if token.Id <= 0 || token.UserId <= 0 {
+		return nil, fmt.Errorf("incomplete token cache")
 	}
 	token.Key = key
 	return &token, nil

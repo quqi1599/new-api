@@ -291,6 +291,20 @@ const isAPIKeyPolicyProtectionEnabled = (record) => {
   }
 };
 
+const isModelRoutingFirstEnabled = (record) => {
+  if (!record || record.children !== undefined || !record.settings) {
+    return false;
+  }
+  if (typeof record.settings === 'object') {
+    return record.settings.model_routing_first_enabled === true;
+  }
+  try {
+    return JSON.parse(record.settings)?.model_routing_first_enabled === true;
+  } catch (error) {
+    return false;
+  }
+};
+
 const getUpstreamUpdateMeta = (record) => {
   const supported =
     !!record &&
@@ -357,6 +371,7 @@ export const getChannelsColumns = ({
       render: (text, record, index) => {
         const passThroughEnabled = isRequestPassThroughEnabled(record);
         const policyProtectionEnabled = isAPIKeyPolicyProtectionEnabled(record);
+        const modelRoutingFirstEnabled = isModelRoutingFirstEnabled(record);
         const upstreamUpdateMeta = getUpstreamUpdateMeta(record);
         const pendingAddCount = upstreamUpdateMeta.pendingAddModels.length;
         const pendingRemoveCount =
@@ -403,6 +418,7 @@ export const getChannelsColumns = ({
         if (
           !passThroughEnabled &&
           !policyProtectionEnabled &&
+          !modelRoutingFirstEnabled &&
           !showUpstreamUpdateTag
         ) {
           return nameNode;
@@ -411,6 +427,18 @@ export const getChannelsColumns = ({
         return (
           <Space spacing={6} align='center'>
             {nameNode}
+            {modelRoutingFirstEnabled && (
+              <Tooltip
+                content={t(
+                  '该渠道已启用模型强优先路由，会在会话亲和性、普通优先级和权重之前先尝试；失败时仍按安全重试规则回退其他渠道。',
+                )}
+                position='topLeft'
+              >
+                <Tag color='green' type='light' size='small' shape='circle'>
+                  {t('强优先')}
+                </Tag>
+              </Tooltip>
+            )}
             {policyProtectionEnabled && (
               <Tooltip
                 content={t(

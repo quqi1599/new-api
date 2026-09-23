@@ -37,6 +37,7 @@ import (
 const (
 	statusCodeCloudflareTimeout      = 524
 	authUnavailableRetryAfterSeconds = "30"
+	compactionRouteRetryAfterSeconds = "30"
 	authUnavailableMessagePrefix     = "auth_unavailable:"
 )
 
@@ -341,7 +342,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
 
-		recordRelayChannelFailure(retryParam, channel.Id, newAPIError)
+		excludeFailedChannelForRetry(retryParam, relayInfo, channel.Id)
 
 		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
@@ -438,7 +439,13 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
 		c.Writer.Header().Del(header)
 	}
-	if isAuthUnavailableError(relayErr) {
+	if isCompactionRouteUnavailableError(relayErr) {
+		retryAfter := relayErr.GetRetryAfter()
+		if retryAfter == "" {
+			retryAfter = compactionRouteRetryAfterSeconds
+		}
+		c.Header("Retry-After", retryAfter)
+	} else if isAuthUnavailableError(relayErr) {
 		c.Header("Retry-After", authUnavailableRetryAfterSeconds)
 	}
 
@@ -469,6 +476,13 @@ func isAuthUnavailableError(relayErr *types.NewAPIError) bool {
 	return relayErr.StatusCode == http.StatusServiceUnavailable &&
 		relayErr.HasUpstreamResponse() &&
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(relayErr.Error())), authUnavailableMessagePrefix)
+}
+
+func isCompactionRouteUnavailableError(relayErr *types.NewAPIError) bool {
+	return relayErr != nil &&
+		relayErr.StatusCode == http.StatusServiceUnavailable &&
+		relayErr.HasUpstreamResponse() &&
+		relayErr.GetErrorCode() == types.ErrorCodeCompactionRouteUnavailable
 }
 
 func canStartNextRelayRetryRound(
@@ -621,6 +635,23 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 	return channel, nil
 }
 
+func excludeFailedChannelForRetry(retryParam *service.RetryParam, info *relaycommon.RelayInfo, channelID int) {
+	if retryParam == nil {
+		return
+	}
+	var relayErr *types.NewAPIError
+	if info != nil {
+		relayErr = info.LastError
+	}
+	recordRelayChannelFailure(retryParam, channelID, relayErr)
+	if info != nil && info.ChannelMeta != nil && info.ChannelOtherSettings.ModelRoutingFirstEnabled {
+		// A model-routing-first channel is a one-shot attempt for this request.
+		// Keep it excluded even if a later retry round resets the ordinary
+		// per-round exclusion list.
+		retryParam.AddPersistentExcludedChannel(channelID)
+	}
+}
+
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, relayFormats ...types.RelayFormat) bool {
 	if openaiErr == nil {
 		return false
@@ -632,6 +663,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, r
 		return false
 	}
 	if types.IsSkipRetryError(openaiErr) {
+		return false
+	}
+	if isCompactionRouteUnavailableError(openaiErr) {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {
@@ -708,6 +742,9 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 		return false
 	}
 	if types.IsSkipRetryError(openaiErr) || operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
+		return false
+	}
+	if isCompactionRouteUnavailableError(openaiErr) {
 		return false
 	}
 	if types.IsChannelError(openaiErr) {
@@ -799,6 +836,7 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			adminInfo["multi_key_index"] = common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
 		}
 		service.AppendChannelAffinityAdminInfo(c, adminInfo)
+		service.AppendModelRoutingFirstAdminInfo(c, adminInfo)
 		other["admin_info"] = adminInfo
 		startTime := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 		if startTime.IsZero() {

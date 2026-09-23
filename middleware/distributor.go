@@ -128,58 +128,72 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 
-				if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
-					preferred, err := model.CacheGetChannel(preferredChannelID)
-					if err == nil && preferred != nil {
-						requiredEndpoint := types.PathToRequiredEndpointType(c.Request.URL.Path)
-						if !preferred.SupportsEndpointType(requiredEndpoint) {
-							service.ClearChannelAffinityForRequest(c)
-							preferred = nil
-						}
-					}
-					if preferred != nil {
-						if preferred.Status != common.ChannelStatusEnabled {
-							if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
-								abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorAffinityChannelDisabled))
-								return
+				selectionParam := &service.RetryParam{
+					Ctx:                   c,
+					ModelName:             modelRequest.Model,
+					TokenGroup:            usingGroup,
+					Retry:                 common.GetPointer(0),
+					PreferredChannelTypes: types.PathToPreferredChannelTypes(c.Request.URL.Path),
+					RequiredEndpointType:  types.PathToRequiredEndpointType(c.Request.URL.Path),
+				}
+
+				// A channel-level model-first switch is intentionally evaluated before
+				// affinity. The selector still enforces protected-key exclusions,
+				// group/model membership, endpoint capability and circuit state.
+				channel, selectGroup, err = service.CacheGetModelRoutingFirstSatisfiedChannel(selectionParam)
+				if err != nil {
+					message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": usingGroup, "Model": modelRequest.Model, "Error": err.Error()})
+					abortWithOpenAiMessage(c, http.StatusServiceUnavailable, message, types.ErrorCodeModelNotFound)
+					return
+				}
+
+				if channel == nil {
+					if preferredChannelID, found := service.GetPreferredChannelByAffinity(c, modelRequest.Model, usingGroup); found {
+						preferred, err := model.CacheGetChannel(preferredChannelID)
+						if err == nil && preferred != nil {
+							requiredEndpoint := types.PathToRequiredEndpointType(c.Request.URL.Path)
+							if !preferred.SupportsEndpointType(requiredEndpoint) {
+								service.ClearChannelAffinityForRequest(c)
+								preferred = nil
 							}
-						} else if usingGroup == "auto" {
-							userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
-							autoGroups := service.GetUserAutoGroup(userGroup)
-							for _, g := range autoGroups {
-								if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
-									selectGroup = g
-									common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
-									channel = preferred
-									break
+						}
+						if preferred != nil {
+							if preferred.Status != common.ChannelStatusEnabled {
+								if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
+									abortWithOpenAiMessage(c, http.StatusForbidden, i18n.T(c, i18n.MsgDistributorAffinityChannelDisabled))
+									return
 								}
+							} else if usingGroup == "auto" {
+								userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+								autoGroups := service.GetUserAutoGroup(userGroup)
+								for _, g := range autoGroups {
+									if model.IsChannelEnabledForGroupModel(g, modelRequest.Model, preferred.Id) {
+										selectGroup = g
+										common.SetContextKey(c, constant.ContextKeyAutoGroup, g)
+										channel = preferred
+										break
+									}
+								}
+							} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
+								channel = preferred
+								selectGroup = usingGroup
 							}
-						} else if model.IsChannelEnabledForGroupModel(usingGroup, modelRequest.Model, preferred.Id) {
-							channel = preferred
-							selectGroup = usingGroup
 						}
-					}
-					if channel != nil {
-						circuitDecision := service.ChannelCircuitAllowAttempt(c.Request.Context(), channel.Id, modelRequest.Model)
-						if !circuitDecision.Allowed {
-							service.ClearChannelAffinityForRequest(c)
-							channel = nil
-							common.SysLog(fmt.Sprintf("channel circuit skipped affinity channel #%d for model %s: state=%s retry_after=%s", preferredChannelID, modelRequest.Model, circuitDecision.State, circuitDecision.RetryAfter))
-						} else {
-							service.MarkChannelAffinityUsed(c, selectGroup, channel.Id)
+						if channel != nil {
+							circuitDecision := service.ChannelCircuitAllowAttempt(c.Request.Context(), channel.Id, modelRequest.Model)
+							if !circuitDecision.Allowed {
+								service.ClearChannelAffinityForRequest(c)
+								channel = nil
+								common.SysLog(fmt.Sprintf("channel circuit skipped affinity channel #%d for model %s: state=%s retry_after=%s", preferredChannelID, modelRequest.Model, circuitDecision.State, circuitDecision.RetryAfter))
+							} else {
+								service.MarkChannelAffinityUsed(c, selectGroup, channel.Id)
+							}
 						}
 					}
 				}
 
 				if channel == nil {
-					channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(&service.RetryParam{
-						Ctx:                   c,
-						ModelName:             modelRequest.Model,
-						TokenGroup:            usingGroup,
-						Retry:                 common.GetPointer(0),
-						PreferredChannelTypes: types.PathToPreferredChannelTypes(c.Request.URL.Path),
-						RequiredEndpointType:  types.PathToRequiredEndpointType(c.Request.URL.Path),
-					})
+					channel, selectGroup, err = service.CacheGetRandomSatisfiedChannel(selectionParam)
 					if err != nil {
 						showGroup := usingGroup
 						if usingGroup == "auto" {

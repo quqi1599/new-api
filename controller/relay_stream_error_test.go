@@ -71,3 +71,25 @@ func TestWriteRelayErrorDoesNotAddRetryAfterForOtherErrors(t *testing.T) {
 
 	require.Empty(t, recorder.Header().Get("Retry-After"))
 }
+
+func TestWriteRelayErrorPreservesRetryAfterForCompactionRouteUnavailable(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	relayErr := types.WithOpenAIError(
+		types.OpenAIError{
+			Message: "all compatible remote-compaction routes are temporarily unavailable",
+			Type:    "server_error",
+			Code:    string(types.ErrorCodeCompactionRouteUnavailable),
+		},
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+	relayErr.SetRetryAfter("17")
+
+	writeRelayError(c, nil, types.RelayFormatOpenAI, relayErr)
+
+	require.Equal(t, "17", recorder.Header().Get("Retry-After"))
+	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)
+	require.Contains(t, recorder.Body.String(), string(types.ErrorCodeCompactionRouteUnavailable))
+}

@@ -216,6 +216,7 @@ const EditChannelModal = (props) => {
     upstream_model_update_last_check_time: 0,
     upstream_model_update_last_detected_models: [],
     upstream_model_update_ignored_models: '',
+    model_routing_first_enabled: false,
     api_key_policy_protection_enabled: false,
     cpa_audit_identity_enabled: false,
   };
@@ -937,6 +938,8 @@ const EditChannelModal = (props) => {
             : '';
           data.api_key_policy_protection_enabled =
             parsedSettings.api_key_policy_protection_enabled === true;
+          data.model_routing_first_enabled =
+            parsedSettings.model_routing_first_enabled === true;
           data.cpa_audit_identity_enabled =
             parsedSettings.cpa_audit_identity_enabled === true;
         } catch (error) {
@@ -959,6 +962,7 @@ const EditChannelModal = (props) => {
           data.upstream_model_update_last_detected_models = [];
           data.upstream_model_update_ignored_models = '';
           data.api_key_policy_protection_enabled = false;
+          data.model_routing_first_enabled = false;
           data.cpa_audit_identity_enabled = false;
         }
       } else {
@@ -979,6 +983,7 @@ const EditChannelModal = (props) => {
         data.upstream_model_update_last_detected_models = [];
         data.upstream_model_update_ignored_models = '';
         data.api_key_policy_protection_enabled = false;
+        data.model_routing_first_enabled = false;
         data.cpa_audit_identity_enabled = false;
       }
 
@@ -1056,6 +1061,7 @@ const EditChannelModal = (props) => {
         data.alpha_search_enabled ||
         data.claude_beta_query ||
         data.system_prompt_override ||
+        data.model_routing_first_enabled ||
         data.api_key_policy_protection_enabled ||
         data.cpa_audit_identity_enabled;
       if (hasAdvancedValues) {
@@ -1849,6 +1855,8 @@ const EditChannelModal = (props) => {
     }
     settings.api_key_policy_protection_enabled =
       localInputs.api_key_policy_protection_enabled === true;
+    settings.model_routing_first_enabled =
+      localInputs.model_routing_first_enabled === true;
     settings.cpa_audit_identity_enabled =
       localInputs.cpa_audit_identity_enabled === true;
 
@@ -1880,6 +1888,7 @@ const EditChannelModal = (props) => {
     delete localInputs.upstream_model_update_last_check_time;
     delete localInputs.upstream_model_update_last_detected_models;
     delete localInputs.upstream_model_update_ignored_models;
+    delete localInputs.model_routing_first_enabled;
     delete localInputs.api_key_policy_protection_enabled;
     delete localInputs.cpa_audit_identity_enabled;
 
@@ -2240,6 +2249,26 @@ const EditChannelModal = (props) => {
           {() => {
             const advancedSettingsContent = (
               <div className='space-y-4'>
+                <div className='pb-3 border-b border-gray-100'>
+                  <Text className='text-sm font-medium text-gray-500 mb-3 block'>
+                    {t('模型路由策略')}
+                  </Text>
+                  <Form.Switch
+                    field='model_routing_first_enabled'
+                    label={t('启用模型强优先路由')}
+                    checkedText={t('开')}
+                    uncheckedText={t('关')}
+                    onChange={(value) =>
+                      handleChannelOtherSettingsChange(
+                        'model_routing_first_enabled',
+                        value,
+                      )
+                    }
+                    extraText={t(
+                      '开启后，自动路由请求只要命中该渠道已有模型和接口能力，就会在会话亲和性、普通优先级和权重之前先尝试此渠道。API Key 保护名单、渠道禁用和熔断仍会跳过；请求在未向用户输出前失败时，会立即按现有安全重试规则回退其他渠道。建议同一模型只给一个渠道开启。',
+                    )}
+                  />
+                </div>
                 <div className='pb-3 border-b border-gray-100'>
                   <Text className='text-sm font-medium text-gray-500 mb-3 block'>
                     {t('审计与 API Key 策略')}

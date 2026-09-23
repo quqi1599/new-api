@@ -37,6 +37,27 @@ func TestAuthUnavailableDoesNotReplayAggregateChannelAcrossRounds(t *testing.T) 
 	}
 }
 
+func TestCompactionRouteUnavailableDoesNotRetryOrFallback(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	relayErr := types.WithOpenAIError(
+		types.OpenAIError{
+			Message: "all compatible remote-compaction routes are temporarily unavailable",
+			Type:    "server_error",
+			Code:    string(types.ErrorCodeCompactionRouteUnavailable),
+		},
+		http.StatusServiceUnavailable,
+		types.ErrOptionWithUpstreamResponse(),
+	)
+	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol"}
+
+	if shouldRetry(c, relayErr, 3, types.RelayFormatOpenAI) {
+		t.Fatal("typed compaction route unavailability must not be retried immediately")
+	}
+	if isGPTChannelFallbackError(info, relayErr) {
+		t.Fatal("typed compaction route unavailability must not enter generic GPT fallback")
+	}
+}
+
 func TestCPAAuthUnavailableCompatibilityEnvelopeDoesNotReplayAcrossRounds(t *testing.T) {
 	body := `{"error":{"message":"auth_unavailable: requested route is temporarily unavailable","type":"server_error","code":"internal_server_error"}}`
 	resp := &http.Response{
@@ -115,6 +136,55 @@ func TestGPTChannelFallbackStopsAfterOutputButAllowsDistinctChannels(t *testing.
 	)
 	if !canRetryGPTChannelFallback(info, types.RelayFormatOpenAI, err) {
 		t.Fatal("an explicit upstream failure before output must allow a different GPT channel")
+	}
+}
+
+func TestModelRoutingFirstFailureRemainsExcludedAcrossRetryRounds(t *testing.T) {
+	retryParam := &service.RetryParam{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{
+			ChannelOtherSettings: dto.ChannelOtherSettings{ModelRoutingFirstEnabled: true},
+		},
+	}
+
+	excludeFailedChannelForRetry(retryParam, info, 131)
+	if len(retryParam.ExcludedChannelIds) != 1 || retryParam.ExcludedChannelIds[0] != 131 {
+		t.Fatalf("round exclusions = %#v", retryParam.ExcludedChannelIds)
+	}
+	if len(retryParam.PersistentExcludedIds) != 1 || retryParam.PersistentExcludedIds[0] != 131 {
+		t.Fatalf("persistent exclusions = %#v", retryParam.PersistentExcludedIds)
+	}
+
+	retryParam.ExcludedChannelIds = nil
+	if len(retryParam.PersistentExcludedIds) != 1 || retryParam.PersistentExcludedIds[0] != 131 {
+		t.Fatalf("persistent exclusions after round reset = %#v", retryParam.PersistentExcludedIds)
+	}
+}
+
+func TestRelayFailureExclusionCombinesProductionPolicies(t *testing.T) {
+	for _, modelFirst := range []bool{false, true} {
+		for _, exhausted := range []bool{false, true} {
+			retryParam := &service.RetryParam{}
+			info := &relaycommon.RelayInfo{
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelOtherSettings: dto.ChannelOtherSettings{ModelRoutingFirstEnabled: modelFirst},
+				},
+			}
+			if exhausted {
+				info.LastError = types.NewErrorWithStatusCode(errors.New("auth_unavailable: requested route is temporarily unavailable"), types.ErrorCodeAuthUnavailable, http.StatusServiceUnavailable, types.ErrOptionWithUpstreamResponse())
+			}
+			excludeFailedChannelForRetry(retryParam, info, 131)
+			if len(retryParam.ExcludedChannelIds) != 1 || retryParam.ExcludedChannelIds[0] != 131 {
+				t.Fatalf("modelFirst=%v exhausted=%v: round exclusions=%v", modelFirst, exhausted, retryParam.ExcludedChannelIds)
+			}
+			wantPersistent := 0
+			if modelFirst || exhausted {
+				wantPersistent = 1
+			}
+			if len(retryParam.PersistentExcludedIds) != wantPersistent {
+				t.Fatalf("modelFirst=%v exhausted=%v: persistent exclusions=%v", modelFirst, exhausted, retryParam.PersistentExcludedIds)
+			}
+		}
 	}
 }
 

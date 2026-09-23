@@ -91,6 +91,7 @@ const (
 	ErrorCodePromptBlocked                 ErrorCode = "prompt_blocked"
 	ErrorCodeAuthUnavailable               ErrorCode = "auth_unavailable"
 	ErrorCodeRequestFeatureUnsupported     ErrorCode = "request_feature_unsupported"
+	ErrorCodeCompactionRouteUnavailable    ErrorCode = "compaction_route_unavailable"
 	ErrorCodeCPAContentAuditBlocked        ErrorCode = "cpa_content_audit_blocked"
 
 	// sql error
@@ -108,6 +109,7 @@ type NewAPIError struct {
 	skipRetry           bool
 	allowChannelPenalty bool
 	upstreamResponded   bool
+	retryAfter          string
 	recordErrorLog      *bool
 	errorType           ErrorType
 	errorCode           ErrorCode
@@ -412,6 +414,28 @@ func IsChannelPenaltyAllowed(err *NewAPIError) bool {
 // upstream result was observed.
 func (e *NewAPIError) HasUpstreamResponse() bool {
 	return e != nil && e.upstreamResponded
+}
+
+// GetRetryAfter returns a sanitized Retry-After value captured from an
+// explicit upstream response.
+func (e *NewAPIError) GetRetryAfter() string {
+	if e == nil {
+		return ""
+	}
+	return e.retryAfter
+}
+
+// SetRetryAfter keeps a bounded single-line Retry-After value. The controller
+// still decides which typed upstream failures may expose it downstream.
+func (e *NewAPIError) SetRetryAfter(value string) {
+	if e == nil {
+		return
+	}
+	value = strings.TrimSpace(value)
+	if len(value) > 128 || strings.ContainsAny(value, "\r\n") {
+		value = ""
+	}
+	e.retryAfter = value
 }
 
 func ErrOptionWithSkipRetry() NewAPIErrorOptions {
