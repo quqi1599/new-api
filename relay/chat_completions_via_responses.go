@@ -154,9 +154,11 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
-			return nil, newApiErr
 		}
-		return usage, nil
+		// An already-started stream can fail after billable usage was observed.
+		// Keep both values (and the original error identity) so TextHelper can
+		// settle only an exact PartialStreamError without turning it into success.
+		return usage, newApiErr
 	}
 
 	usage, newApiErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)

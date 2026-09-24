@@ -130,6 +130,10 @@ func GetChannel(group string, model string, retry int, preferredChannelTypes []i
 }
 
 func GetChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
+	return getChannelForEndpoint(group, model, retry, preferredChannelTypes, requiredEndpointType, excludedChannelIds, false)
+}
+
+func getChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int, exhaustCandidates bool) (*Channel, error) {
 	var abilities []Ability
 	// Resolve hard eligibility before either type preference or priority. In
 	// particular, an excluded/disabled native channel must not retain a priority
@@ -168,7 +172,14 @@ func GetChannelForEndpoint(group string, model string, retry int, preferredChann
 		eligibleChannelIDs = preferredChannelIDs
 	}
 
-	channelQuery, err := getChannelQueryForChannels(group, model, retry, eligibleChannelIDs)
+	// Legacy callers use retry as a priority-tier index. Exclusion-aware Relay
+	// callers instead exhaust the highest remaining tier: their attempt counter
+	// is a budget, not an index into a candidate list that shrinks after failure.
+	priorityIndex := retry
+	if exhaustCandidates {
+		priorityIndex = 0
+	}
+	channelQuery, err := getChannelQueryForChannels(group, model, priorityIndex, eligibleChannelIDs)
 	if err != nil {
 		return nil, err
 	}

@@ -64,7 +64,7 @@ func TestNativePreferenceCircuitFallback(t *testing.T) {
 	}
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-	param := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: "gpt-5.6-sol", PreferredChannelTypes: []int{constant.ChannelTypeOpenAI}}
+	param := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: "gpt-5.6-sol", ExhaustCandidates: true, PreferredChannelTypes: []int{constant.ChannelTypeOpenAI}}
 	upstreamErr := types.NewErrorWithStatusCode(errors.New("upstream unavailable"), types.ErrorCodeBadResponse, http.StatusBadGateway)
 	if !RecordChannelCircuitFailure(context.Background(), 9, param.ModelName, upstreamErr) {
 		t.Fatal("native circuit must be open")
@@ -80,7 +80,7 @@ func TestNativePreferenceCircuitFallback(t *testing.T) {
 	// request-lifetime/token exclusion or a hard endpoint capability gate.
 	for _, exclusion := range []string{"persistent", "token", "endpoint"} {
 		t.Run(exclusion, func(t *testing.T) {
-			next := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: param.ModelName, PreferredChannelTypes: param.PreferredChannelTypes}
+			next := &RetryParam{Ctx: c, TokenGroup: "default", ModelName: param.ModelName, ExhaustCandidates: true, PreferredChannelTypes: param.PreferredChannelTypes}
 			switch exclusion {
 			case "persistent":
 				next.AddPersistentExcludedChannel(10)

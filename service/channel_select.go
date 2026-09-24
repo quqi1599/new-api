@@ -25,6 +25,7 @@ type RetryParam struct {
 	RequiredEndpointType  constant.EndpointType // strict endpoint capability; empty keeps legacy selection
 	ExcludedChannelIds    []int                 // channels that have already failed in this request
 	PersistentExcludedIds []int                 // request-lifetime exclusions retained across retry rounds
+	ExhaustCandidates     bool                  // Relay tracks failed candidates; Retry remains an attempt budget, not a priority index
 	CircuitRetryAfter     time.Duration
 	CircuitSkippedIds     []int
 }
@@ -173,6 +174,11 @@ func AppendModelRoutingFirstAdminInfo(c *gin.Context, adminInfo map[string]inter
 // CacheGetRandomSatisfiedChannel tries to get a random channel that satisfies the requirements.
 // 尝试获取一个满足要求的随机渠道。
 //
+// ExhaustCandidates separates Relay's attempt budget from its priority cursor:
+// failed/blocked candidates are excluded, then the highest remaining native
+// tier is selected. Legacy callers without failure tracking retain retry-tier
+// indexing. Cross-group attempt limits below remain in force in both modes.
+//
 // For "auto" tokenGroup with cross-group Retry enabled:
 // 对于启用了跨分组重试的 "auto" tokenGroup：
 //
@@ -276,7 +282,7 @@ func cacheGetRandomSatisfiedChannelOnce(param *RetryParam) (*model.Channel, stri
 			}
 			logger.LogDebug(param.Ctx, "Auto selecting group: %s, priorityRetry: %d", autoGroup, priorityRetry)
 
-			channel, _ = model.GetRandomSatisfiedChannelForEndpoint(autoGroup, param.ModelName, priorityRetry, param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIds)
+			channel, _ = selectChannelForRetry(param, autoGroup, priorityRetry, excludedChannelIds)
 			if channel == nil {
 				// Current group has no available channel for this model, try next group
 				// 当前分组没有该模型的可用渠道，尝试下一个分组
@@ -314,10 +320,17 @@ func cacheGetRandomSatisfiedChannelOnce(param *RetryParam) (*model.Channel, stri
 			break
 		}
 	} else {
-		channel, err = model.GetRandomSatisfiedChannelForEndpoint(param.TokenGroup, param.ModelName, param.GetRetry(), param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIds)
+		channel, err = selectChannelForRetry(param, param.TokenGroup, param.GetRetry(), excludedChannelIds)
 		if err != nil {
 			return nil, param.TokenGroup, err
 		}
 	}
 	return channel, selectGroup, nil
+}
+
+func selectChannelForRetry(param *RetryParam, group string, priorityRetry int, excludedChannelIDs []int) (*model.Channel, error) {
+	if param.ExhaustCandidates {
+		return model.GetNextSatisfiedChannelForEndpoint(group, param.ModelName, param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIDs)
+	}
+	return model.GetRandomSatisfiedChannelForEndpoint(group, param.ModelName, priorityRetry, param.PreferredChannelTypes, param.RequiredEndpointType, excludedChannelIDs)
 }

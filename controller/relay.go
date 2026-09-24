@@ -237,6 +237,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		TokenGroup:            relayInfo.TokenGroup,
 		ModelName:             relayInfo.OriginModelName,
 		Retry:                 common.GetPointer(0),
+		ExhaustCandidates:     true, // failed candidates are excluded; RelayRetryState still bounds all attempts and rounds
 		PreferredChannelTypes: types.RelayFormatToPreferredChannelTypes(relayInfo.RelayFormat),
 		RequiredEndpointType:  types.RelayFormatToRequiredEndpointType(relayInfo.RelayFormat),
 	}

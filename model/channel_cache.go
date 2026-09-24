@@ -223,9 +223,24 @@ func GetRandomSatisfiedChannel(group string, model string, retry int, preferredC
 }
 
 func GetRandomSatisfiedChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
+	return getRandomSatisfiedChannelForEndpoint(group, model, retry, preferredChannelTypes, requiredEndpointType, excludedChannelIds, false)
+}
+
+// GetNextSatisfiedChannelForEndpoint selects without replacement when the
+// caller maintains its current-round failed-channel exclusions. After hard
+// eligibility and native preference, it exhausts the highest remaining
+// priority before descending, including other candidates at the same tier.
+// Retry budgets and round resets belong to the caller; this function does not
+// reset them. Legacy callers without failure exclusions must keep using
+// GetRandomSatisfiedChannelForEndpoint and its retry-index contract.
+func GetNextSatisfiedChannelForEndpoint(group string, model string, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int) (*Channel, error) {
+	return getRandomSatisfiedChannelForEndpoint(group, model, 0, preferredChannelTypes, requiredEndpointType, excludedChannelIds, true)
+}
+
+func getRandomSatisfiedChannelForEndpoint(group string, model string, retry int, preferredChannelTypes []int, requiredEndpointType constant.EndpointType, excludedChannelIds []int, exhaustCandidates bool) (*Channel, error) {
 	// if memory cache is disabled, get channel directly from database
 	if !common.MemoryCacheEnabled {
-		return GetChannelForEndpoint(group, model, retry, preferredChannelTypes, requiredEndpointType, excludedChannelIds)
+		return getChannelForEndpoint(group, model, retry, preferredChannelTypes, requiredEndpointType, excludedChannelIds, exhaustCandidates)
 	}
 
 	channelSyncLock.RLock()
@@ -312,10 +327,14 @@ func GetRandomSatisfiedChannelForEndpoint(group string, model string, retry int,
 	}
 	sort.Sort(sort.Reverse(sort.IntSlice(sortedUniquePriorities)))
 
-	if retry >= len(uniquePriorities) {
-		retry = len(uniquePriorities) - 1
+	priorityIndex := retry
+	if exhaustCandidates {
+		priorityIndex = 0
 	}
-	targetPriority := int64(sortedUniquePriorities[retry])
+	if priorityIndex >= len(uniquePriorities) {
+		priorityIndex = len(uniquePriorities) - 1
+	}
+	targetPriority := int64(sortedUniquePriorities[priorityIndex])
 
 	// get the priority for the given retry number
 	var sumWeight = 0
