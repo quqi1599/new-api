@@ -58,12 +58,14 @@ const ModelTestModal = ({
   t,
 }) => {
   const hasChannel = Boolean(currentTestChannel);
-  const streamToggleDisabled = [
-    'embeddings',
-    'image-generation',
-    'jina-rerank',
-    'openai-response-compact',
-  ].includes(selectedEndpointType);
+  const streamToggleDisabled =
+    [
+      'embeddings',
+      'image-generation',
+      'jina-rerank',
+      'openai-response-compact',
+      'decisions',
+    ].includes(selectedEndpointType) || currentTestChannel?.type === 64;
 
   React.useEffect(() => {
     if (streamToggleDisabled && isStreamTest) {
@@ -81,6 +83,7 @@ const ModelTestModal = ({
 
   const endpointTypeOptions = [
     { value: '', label: t('自动检测') },
+    { value: 'decisions', label: 'TypeSafe Jev (/v1/decisions)' },
     { value: 'openai', label: 'OpenAI (/v1/chat/completions)' },
     { value: 'openai-response', label: 'OpenAI Response (/v1/responses)' },
     {
@@ -199,7 +202,9 @@ const ModelTestModal = ({
                     theme='light'
                     type='warning'
                     icon={<Settings size={12} />}
-                    onClick={() => window.open('/console/setting?tab=ratio', '_blank')}
+                    onClick={() =>
+                      window.open('/console/setting?tab=ratio', '_blank')
+                    }
                     style={{ width: 'fit-content' }}
                   >
                     {t('前往设置')}

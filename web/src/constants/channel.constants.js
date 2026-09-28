@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 
 export const CHANNEL_OPTIONS = [
+  { value: 64, color: 'blue', label: 'TypeSafe / Jev' },
   { value: 1, color: 'green', label: 'OpenAI' },
   {
     value: 2,

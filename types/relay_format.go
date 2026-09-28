@@ -9,6 +9,7 @@ import (
 type RelayFormat string
 
 const (
+	RelayFormatDecisions                 RelayFormat = "decisions"
 	RelayFormatOpenAI                    RelayFormat = "openai"
 	RelayFormatClaude                                = "claude"
 	RelayFormatGemini                                = "gemini"
@@ -30,6 +31,8 @@ const (
 // channels matching these types are prioritized during selection.
 func RelayFormatToPreferredChannelTypes(format RelayFormat) []int {
 	switch format {
+	case RelayFormatDecisions:
+		return []int{constant.ChannelTypeTypeSafe}
 	case RelayFormatOpenAI, RelayFormatOpenAIAudio, RelayFormatOpenAIImage, RelayFormatOpenAIRealtime:
 		return []int{constant.ChannelTypeOpenAI}
 	case RelayFormatClaude:
@@ -45,6 +48,9 @@ func RelayFormatToPreferredChannelTypes(format RelayFormat) []int {
 // RelayFormatToRequiredEndpointType returns a strict channel capability. A
 // zero value means the existing preference-only selection behavior is used.
 func RelayFormatToRequiredEndpointType(format RelayFormat) constant.EndpointType {
+	if format == RelayFormatDecisions {
+		return constant.EndpointTypeDecisions
+	}
 	if format == RelayFormatOpenAIAlphaSearch {
 		return constant.EndpointTypeOpenAIAlphaSearch
 	}
@@ -70,6 +76,9 @@ func PathToPreferredChannelTypes(path string) []int {
 }
 
 func PathToRequiredEndpointType(path string) constant.EndpointType {
+	if path == "/v1/decisions" || path == "/v1/systemone" || path == "/typesafe/v1/systemone" {
+		return constant.EndpointTypeDecisions
+	}
 	if strings.HasPrefix(path, "/v1/alpha/search") {
 		return constant.EndpointTypeOpenAIAlphaSearch
 	}

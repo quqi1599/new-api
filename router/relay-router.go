@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// SetRelayRouter registers relay endpoints and their authentication, rate-limit,
+// and channel-distribution middleware, including the native decisions route.
 func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.CORS())
 	router.Use(middleware.DecompressRequestMiddleware())
@@ -58,6 +60,10 @@ func SetRelayRouter(router *gin.Engine) {
 			controller.ListModels(c, constant.ChannelTypeOpenAI)
 		})
 	}
+
+	typeSafeRouter := router.Group("/typesafe/v1")
+	typeSafeRouter.Use(middleware.RouteTag("relay"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute())
+	typeSafeRouter.POST("/systemone", func(c *gin.Context) { controller.Relay(c, types.RelayFormatDecisions) })
 
 	playgroundRouter := router.Group("/pg")
 	playgroundRouter.Use(middleware.RouteTag("relay"))
@@ -137,6 +143,10 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.POST("/audio/speech", func(c *gin.Context) {
 			controller.RelayDispatch(c, types.RelayFormatOpenAIAudio)
 		})
+
+		for _, path := range []string{"/decisions", "/systemone"} {
+			httpRouter.POST(path, func(c *gin.Context) { controller.Relay(c, types.RelayFormatDecisions) })
+		}
 
 		// rerank related routes
 		httpRouter.POST("/rerank", func(c *gin.Context) {

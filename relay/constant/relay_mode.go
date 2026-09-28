@@ -54,11 +54,16 @@ const (
 	RelayModeResponsesCompact
 
 	RelayModeAlphaSearch
+	RelayModeDecisions
 )
 
+// Path2RelayMode classifies gateway endpoint paths, returning RelayModeUnknown
+// when no supported route matches.
 func Path2RelayMode(path string) int {
 	relayMode := RelayModeUnknown
-	if strings.HasPrefix(path, "/v1/chat/completions") || strings.HasPrefix(path, "/pg/chat/completions") {
+	if path == "/v1/decisions" || path == "/v1/systemone" || path == "/typesafe/v1/systemone" {
+		relayMode = RelayModeDecisions
+	} else if strings.HasPrefix(path, "/v1/chat/completions") || strings.HasPrefix(path, "/pg/chat/completions") {
 		relayMode = RelayModeChatCompletions
 	} else if strings.HasPrefix(path, "/v1/completions") {
 		relayMode = RelayModeCompletions

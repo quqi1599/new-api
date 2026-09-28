@@ -104,6 +104,8 @@ func relayHandler(c *gin.Context, info *relaycommon.RelayInfo) *types.NewAPIErro
 		fallthrough
 	case relayconstant.RelayModeAudioTranscription:
 		err = relay.AudioHelper(c, info)
+	case relayconstant.RelayModeDecisions:
+		err = relay.DecisionsHelper(c, info)
 	case relayconstant.RelayModeRerank:
 		err = relay.RerankHelper(c, info)
 	case relayconstant.RelayModeEmbeddings:
@@ -167,6 +169,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = newRequestBodyFailure(c, err)
 		} else {
 			newAPIError = types.NewError(err, types.ErrorCodeInvalidRequest)
+			if relayFormat == types.RelayFormatDecisions {
+				newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
 		}
 		return
 	}

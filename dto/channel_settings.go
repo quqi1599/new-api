@@ -1,6 +1,7 @@
 package dto
 
 type ChannelSettings struct {
+	DecisionsUpstreamPath  string `json:"decisions_upstream_path,omitempty"`
 	ForceFormat            bool   `json:"force_format,omitempty"`
 	ThinkingToContent      bool   `json:"thinking_to_content,omitempty"`
 	Proxy                  string `json:"proxy"`

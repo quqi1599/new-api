@@ -1,5 +1,7 @@
 {
   "translation": {
+    "决策接口路径": "決策介面路徑",
+    "TypeSafe 默认 /v1/systemone；OpenRouter 使用 /alpha/decisions，API 地址填写 https://openrouter.ai/api": "TypeSafe 預設 /v1/systemone；OpenRouter 使用 /alpha/decisions，API 位址填寫 https://openrouter.ai/api",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_other": " + Web搜尋 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",
     " + 图片生成调用 {{symbol}}{{price}} / 1次 * {{ratioType}} {{ratio}}": " + 圖片生成調用 {{symbol}}{{price}} / 1次 * {{ratioType}} {{ratio}}",
     " + 文件搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_other": " + 檔案搜尋 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",

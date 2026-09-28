@@ -55,7 +55,8 @@ const (
 	ChannelTypeSora           = 55
 	ChannelTypeReplicate      = 56
 	ChannelTypeCodex          = 57
-	ChannelTypeDummy          // this one is only for count, do not add any channel after this
+	ChannelTypeTypeSafe       = 64 // Keep IDs 58-63 reserved for upstream channel types.
+	ChannelTypeDummy               // this one is only for count, do not add any channel after this
 
 )
 
@@ -118,9 +119,12 @@ var ChannelBaseURLs = []string{
 	"https://api.openai.com",                    //55
 	"https://api.replicate.com",                 //56
 	"https://chatgpt.com",                       //57
+	"", "", "", "", "", "",                      //58-63 reserved
+	"https://api.typesafe.ai", //64
 }
 
 var ChannelTypeNames = map[int]string{
+	ChannelTypeTypeSafe:       "TypeSafe / Jev",
 	ChannelTypeUnknown:        "Unknown",
 	ChannelTypeOpenAI:         "OpenAI",
 	ChannelTypeMidjourney:     "Midjourney",

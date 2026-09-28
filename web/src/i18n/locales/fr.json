@@ -1,5 +1,7 @@
 {
   "translation": {
+    "决策接口路径": "Chemin de décision",
+    "TypeSafe 默认 /v1/systemone；OpenRouter 使用 /alpha/decisions，API 地址填写 https://openrouter.ai/api": "TypeSafe : /v1/systemone par défaut. OpenRouter : /alpha/decisions avec la base https://openrouter.ai/api.",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_one": " + Recherche Web {{count}} fois / 1K fois * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_many": " + Recherche Web {{count}} fois / 1K fois * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_other": " + Recherche Web {{count}} fois / 1K fois * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",

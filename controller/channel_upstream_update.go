@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -260,6 +261,7 @@ func getUpstreamModelUpdateMinCheckIntervalSeconds() int64 {
 }
 
 func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+
 	baseURL := constant.ChannelBaseURLs[channel.Type]
 	if channel.GetBaseURL() != "" {
 		baseURL = channel.GetBaseURL()
@@ -329,6 +331,37 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 	body, err := GetResponseBody(http.MethodGet, url, channel, headers)
 	if err != nil {
 		return nil, err
+	}
+
+	if channel.Type == constant.ChannelTypeTypeSafe {
+		var result struct {
+			Models []struct {
+				Name string `json:"name"`
+			} `json:"models"`
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if common.Unmarshal(body, &result) != nil {
+			return nil, errors.New("invalid TypeSafe model list")
+		}
+		ids := []string{}
+		for _, item := range result.Models {
+			if strings.TrimSpace(item.Name) == "" {
+				return nil, errors.New("invalid TypeSafe model name")
+			}
+			ids = append(ids, item.Name)
+		}
+		for _, item := range result.Data {
+			if strings.TrimSpace(item.ID) == "" {
+				return nil, errors.New("invalid OpenRouter model name")
+			}
+			ids = append(ids, item.ID)
+		}
+		if len(ids) == 0 {
+			return nil, errors.New("empty TypeSafe model list")
+		}
+		return normalizeModelNames(ids), nil
 	}
 
 	var result OpenAIModelsResponse
