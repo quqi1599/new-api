@@ -15,10 +15,13 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
+	"github.com/tidwall/gjson"
 
 	"github.com/gin-gonic/gin"
 )
 
+// GetAndValidateRequest decodes and validates the request according to its relay
+// format and endpoint path before channel execution.
 func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dto.Request, err error) {
 	relayMode := relayconstant.Path2RelayMode(c.Request.URL.Path)
 
@@ -46,6 +49,33 @@ func GetAndValidateRequest(c *gin.Context, format types.RelayFormat) (request dt
 		request, err = GetAndValidOpenAIImageRequest(c, relayMode)
 	case types.RelayFormatEmbedding:
 		request, err = GetAndValidateEmbeddingRequest(c, relayMode)
+	case types.RelayFormatDecisions:
+		decisions := &dto.DecisionsRequest{}
+		storage, bodyErr := common.GetBodyStorage(c)
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		data, bodyErr := storage.Bytes()
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		seen := map[string]bool{}
+		duplicate := false
+		gjson.ParseBytes(data).ForEach(func(key, value gjson.Result) bool {
+			if seen[key.Str] {
+				duplicate = true
+				return false
+			}
+			seen[key.Str] = true
+			return true
+		})
+		if duplicate {
+			return nil, errors.New("duplicate decisions request field")
+		}
+		if err = common.UnmarshalBodyReusable(c, decisions); err == nil {
+			err = decisions.Validate()
+		}
+		request = decisions
 	case types.RelayFormatRerank:
 		request, err = GetAndValidateRerankRequest(c)
 	case types.RelayFormatOpenAIAudio:

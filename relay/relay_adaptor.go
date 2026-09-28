@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"github.com/QuantumNous/new-api/relay/channel/typesafe"
 	"strconv"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -52,6 +53,8 @@ import (
 
 func GetAdaptor(apiType int) channel.Adaptor {
 	switch apiType {
+	case constant.APITypeTypeSafe:
+		return &typesafe.Adaptor{}
 	case constant.APITypeAli:
 		return &ali.Adaptor{}
 	case constant.APITypeAnthropic:
