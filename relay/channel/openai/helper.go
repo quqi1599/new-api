@@ -212,7 +212,10 @@ func handleLastResponse(lastStreamData string, responseId *string, createAt *int
 		*usage = lastStreamResponse.Usage
 		if !info.ShouldIncludeUsage {
 			*shouldSendLastResp = lo.SomeBy(lastStreamResponse.Choices, func(choice dto.ChatCompletionsStreamResponseChoice) bool {
-				return choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != ""
+				// Upstream #7490: a usage-bearing frame can also finish a turn or
+				// carry the last tool arguments. Only a pure usage frame is optional.
+				return choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" ||
+					(choice.FinishReason != nil && *choice.FinishReason != "") || len(choice.Delta.ToolCalls) > 0
 			})
 		}
 	}

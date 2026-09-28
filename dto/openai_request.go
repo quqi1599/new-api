@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 	"github.com/samber/lo"
 
@@ -231,11 +232,8 @@ func (r *GeneralOpenAIRequest) ToMap() map[string]any {
 }
 
 func (r *GeneralOpenAIRequest) GetSystemRoleName() string {
-	if strings.HasPrefix(r.Model, "o") {
-		if !strings.HasPrefix(r.Model, "o1-mini") && !strings.HasPrefix(r.Model, "o1-preview") {
-			return "developer"
-		}
-	} else if strings.HasPrefix(r.Model, "gpt-5") {
+	_, model := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(r.Model)
+	if GetOpenAIChatCapabilities(model, r.ReasoningEffort).UseDeveloperRole {
 		return "developer"
 	}
 	return "system"

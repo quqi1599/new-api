@@ -30,7 +30,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
-	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
 )
@@ -230,6 +229,7 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if request == nil {
 		return nil, errors.New("request is nil")
 	}
+	compatibilityEffort := request.ReasoningEffort
 	if info.ChannelType != constant.ChannelTypeOpenAI && info.ChannelType != constant.ChannelTypeAzure {
 		request.StreamOptions = nil
 	}
@@ -310,35 +310,53 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 		}
 
 	}
-	if strings.HasPrefix(info.UpstreamModelName, "o") || strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
-		if lo.FromPtrOr(request.MaxCompletionTokens, uint(0)) == 0 && lo.FromPtrOr(request.MaxTokens, uint(0)) != 0 {
+	effort, baseModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.UpstreamModelName)
+	resolvedEffort := compatibilityEffort
+	if info.ChannelType == constant.ChannelTypeOpenRouter && len(request.Reasoning) > 0 {
+		// OpenRouter moves reasoning_effort into reasoning above. Inspect that
+		// wire value so clearing the original field cannot re-enable sampling.
+		var routerReasoning openrouter.RequestReasoning
+		if common.Unmarshal(request.Reasoning, &routerReasoning) == nil {
+			if routerReasoning.Effort != "" {
+				resolvedEffort = routerReasoning.Effort
+			} else if routerReasoning.Enabled || routerReasoning.MaxTokens > 0 {
+				resolvedEffort = "high"
+			}
+		}
+	}
+	if effort != "" {
+		resolvedEffort = effort
+	}
+	capabilities := dto.GetOpenAIChatCapabilities(baseModel, resolvedEffort)
+	if capabilities.UseMaxCompletionTokens {
+		if request.MaxCompletionTokens == nil {
 			request.MaxCompletionTokens = request.MaxTokens
-			request.MaxTokens = nil
 		}
+		// The upstream accepts one limit field. Preserve explicit zero values
+		// and prefer an explicitly supplied max_completion_tokens over max_tokens.
+		request.MaxTokens = nil
 
-		if strings.HasPrefix(info.UpstreamModelName, "o") {
+		if !capabilities.SupportsTemperature {
 			request.Temperature = nil
 		}
-
-		// gpt-5系列模型适配 归零不再支持的参数
-		if strings.HasPrefix(info.UpstreamModelName, "gpt-5") {
-			request.Temperature = nil
+		if !capabilities.SupportsTopP {
 			request.TopP = nil
+		}
+		if !capabilities.SupportsLogProbs {
 			request.LogProbs = nil
+			request.TopLogProbs = nil
 		}
 
 		// 转换模型推理力度后缀
-		effort, originModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(info.UpstreamModelName)
 		if effort != "" {
 			request.ReasoningEffort = effort
-			info.UpstreamModelName = originModel
-			request.Model = originModel
+			info.UpstreamModelName = baseModel
+			request.Model = baseModel
 		}
 
 		info.ReasoningEffort = request.ReasoningEffort
 
-		// o系列模型developer适配（o1-mini除外）
-		if !strings.HasPrefix(info.UpstreamModelName, "o1-mini") && !strings.HasPrefix(info.UpstreamModelName, "o1-preview") {
+		if capabilities.UseDeveloperRole {
 			//修改第一个Message的内容，将system改为developer
 			if len(request.Messages) > 0 && request.Messages[0].Role == "system" {
 				request.Messages[0].Role = "developer"

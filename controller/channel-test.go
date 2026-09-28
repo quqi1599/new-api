@@ -28,6 +28,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"github.com/QuantumNous/new-api/setting/reasoning"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/bytedance/gopkg/util/gopool"
@@ -740,6 +741,11 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 			if isStream {
 				req.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
 			}
+			_, capabilityModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(model)
+			if constant.EndpointType(endpointType) == constant.EndpointTypeOpenAI && dto.GetOpenAIChatCapabilities(capabilityModel, "").UseMaxCompletionTokens {
+				req.MaxCompletionTokens = req.MaxTokens
+				req.MaxTokens = nil
+			}
 			return req
 		}
 	}
@@ -797,7 +803,8 @@ func buildTestRequest(model string, endpointType string, channel *model.Channel,
 		testRequest.StreamOptions = &dto.StreamOptions{IncludeUsage: true}
 	}
 
-	if strings.HasPrefix(model, "o") {
+	_, capabilityModel := reasoning.ParseOpenAIReasoningEffortFromModelSuffix(model)
+	if dto.GetOpenAIChatCapabilities(capabilityModel, "").UseMaxCompletionTokens {
 		testRequest.MaxCompletionTokens = lo.ToPtr(uint(16))
 	} else if strings.Contains(model, "thinking") {
 		if !strings.Contains(model, "claude") {

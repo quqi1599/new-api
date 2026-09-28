@@ -100,7 +100,7 @@ func TestHandleLastResponse_NormalizesNestedDataPrefix(t *testing.T) {
 	assert.Equal(t, 1, usage.PromptTokens)
 	assert.Equal(t, 2, usage.CompletionTokens)
 	assert.True(t, containStreamUsage)
-	assert.False(t, shouldSendLastResp)
+	assert.True(t, shouldSendLastResp, "finish_reason must survive usage filtering")
 }
 
 func TestHandleFinalResponse_DoneFramesDoNotUnmarshalForConvertedFormats(t *testing.T) {
