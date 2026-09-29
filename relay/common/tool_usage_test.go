@@ -61,7 +61,7 @@ func TestImageGenerationCallCounterDeduplicatesFiltersAndCaps(t *testing.T) {
 }
 
 func TestResponsesBillabilityStatus(t *testing.T) {
-	require.True(t, IsNonBillableResponsesStatus([]byte(`"incomplete"`)))
+	require.False(t, IsNonBillableResponsesStatus([]byte(`"incomplete"`)))
 	require.True(t, IsNonBillableResponsesStatus([]byte(`"cancelled"`)))
 	require.False(t, IsNonBillableResponsesStatus([]byte(`"completed"`)))
 	require.False(t, IsBillableResponsesOutput(&dto.ResponsesOutput{Status: "partial"}))

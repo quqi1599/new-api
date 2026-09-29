@@ -26,20 +26,30 @@ import (
 
 const convertedResponsesText = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
 const convertedResponsesCompleted = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n"
+const convertedResponsesIncomplete = "data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n"
 const convertedResponsesFailed = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"code\":\"fixture_failed\",\"message\":\"synthetic failure\"}}}\n\n"
 
 type convertedResponsesCase struct {
-	name        string
-	body        string
-	allowWrites int // -1 permits all writes
-	wantStatus  int
-	wantPartial bool
-	wantUsage   bool
-	wantCache   int
+	name         string
+	upstreamPath string
+	body         string
+	allowWrites  int // -1 permits all writes
+	wantStatus   int
+	wantPartial  bool
+	wantUsage    bool
+	wantCache    int
+	nonStream    bool
+	wantObserved bool
 }
 
 func convertedResponsesCases() []convertedResponsesCase {
+	earlyUsage := "data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n\n"
 	return []convertedResponsesCase{
+		{name: "buffered_completed", body: convertedResponsesText + convertedResponsesCompleted, nonStream: true, allowWrites: -1, wantUsage: true, wantCache: 8},
+		{name: "buffered_incomplete", body: convertedResponsesText + convertedResponsesIncomplete, nonStream: true, allowWrites: -1, wantUsage: true, wantCache: 8},
+		{name: "buffered_eof", body: convertedResponsesText, nonStream: true, allowWrites: -1, wantStatus: http.StatusBadGateway},
+		{name: "buffered_eof_reported", body: earlyUsage + convertedResponsesText, nonStream: true, allowWrites: -1, wantStatus: http.StatusBadGateway, wantObserved: true},
+		{name: "incomplete", body: convertedResponsesText + convertedResponsesIncomplete, allowWrites: -1, wantUsage: true, wantCache: 8},
 		{name: "completed", body: convertedResponsesText + convertedResponsesCompleted, allowWrites: -1, wantUsage: true, wantCache: 8},
 		{name: "pre_output_eof", allowWrites: -1, wantStatus: http.StatusBadGateway},
 		{name: "explicit_failure", body: convertedResponsesText + convertedResponsesFailed, allowWrites: -1, wantStatus: http.StatusInternalServerError},
@@ -68,7 +78,11 @@ func newConvertedResponsesFixture(t *testing.T, tc convertedResponsesCase) (*gin
 	calls := new(atomic.Int32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		if r.URL.Path != "/v1/responses" {
+		expectedPath := tc.upstreamPath
+		if expectedPath == "" {
+			expectedPath = "/v1/responses"
+		}
+		if r.URL.Path != expectedPath {
 			t.Errorf("request did not use the Responses conversion: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -89,6 +103,10 @@ func newConvertedResponsesFixture(t *testing.T, tc convertedResponsesCase) (*gin
 		IsStream: true, OriginModelName: "gpt-5.6-sol", RelayFormat: types.RelayFormatOpenAI,
 		RelayMode: relayconstant.RelayModeChatCompletions, RequestURLPath: "/v1/chat/completions", StartTime: time.Now(),
 		Request: &dto.GeneralOpenAIRequest{Model: "gpt-5.6-sol", Stream: common.GetPointer(true), Messages: []dto.Message{{Role: "user", Content: "synthetic test"}}},
+	}
+	if tc.nonStream {
+		info.IsStream = false
+		info.Request.(*dto.GeneralOpenAIRequest).Stream = common.GetPointer(false)
 	}
 	info.InitChannelMeta(c)
 	info.SetEstimatePromptTokens(10)
@@ -111,7 +129,7 @@ func assertConvertedResponsesError(t *testing.T, tc convertedResponsesCase, c *g
 		require.Nil(t, info.PartialStreamError)
 		require.False(t, canSettlePartialStreamUsage(c, info, usage, apiErr))
 	}
-	if tc.wantUsage {
+	if tc.wantUsage || tc.wantObserved {
 		require.NotNil(t, usage)
 		require.Equal(t, 10, usage.PromptTokens)
 		require.Positive(t, usage.CompletionTokens)
@@ -131,6 +149,14 @@ func TestChatCompletionsViaResponsesPreservesUsageAndFailure(t *testing.T) {
 			usage, apiErr := chatCompletionsViaResponses(c, info, adaptor, info.Request.(*dto.GeneralOpenAIRequest))
 			assertConvertedResponsesError(t, tc, c, info, usage, apiErr)
 			require.EqualValues(t, 1, calls.Load())
+			if tc.nonStream {
+				if tc.wantStatus == 0 {
+					require.Equal(t, "application/json", c.Writer.Header().Get("Content-Type"))
+				} else {
+					require.False(t, c.Writer.Written())
+				}
+				require.False(t, info.IsStream)
+			}
 			require.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
 			require.Equal(t, "/v1/chat/completions", info.RequestURLPath)
 		})
@@ -209,10 +235,21 @@ func TestConvertedResponsesBillingSettlesOnceOrRefunds(t *testing.T) {
 				}
 				require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &logInfo))
 				wantStreamStatus := "ok"
+				if info.IsResponsesIncomplete() {
+					wantStreamStatus = "incomplete"
+					require.False(t, info.ShouldRecordChannelSuccess())
+				}
 				if tc.wantPartial {
 					wantStreamStatus = "error"
 				}
+				if tc.nonStream {
+					wantStreamStatus = ""
+				} // JSON responses have no downstream stream_status.
 				require.Equal(t, wantStreamStatus, logInfo.StreamStatus.Status)
+				if tc.nonStream && tc.name == "buffered_incomplete" {
+					require.Contains(t, logs[0].Other, `"state":"incomplete"`)
+					require.Contains(t, logs[0].Other, `"input_tokens_source":"reported"`)
+				}
 				if tc.wantCache > 0 {
 					require.Equal(t, 6, wantQuota, "10 input - 8 cached + 8*0.25 + 2 output")
 				}

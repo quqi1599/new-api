@@ -332,9 +332,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 
 		if newAPIError == nil {
-			service.RecordChannelCircuitSuccess(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+			if relayInfo.ShouldRecordChannelSuccess() {
+				service.RecordChannelCircuitSuccess(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+			} else if relayInfo.IsResponsesIncomplete() {
+				// The distributor only releases its initial channel. A retry may
+				// own a different half-open probe; release it without healing it.
+				service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+			}
 			relayInfo.LastError = nil
 			retryState.StopReason = service.RetryStopReasonSuccess
+			if relayInfo.IsResponsesIncomplete() {
+				retryState.StopReason = service.RetryStopReasonIncomplete
+			}
 			setRelayRetryDiagnostics(c, retryState)
 			logRelayRetryRoute(c)
 			return

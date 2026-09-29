@@ -1,5 +1,8 @@
 {
   "translation": {
+    "未完成": "Не завершено",
+    "响应终态": "Итог ответа",
+    "用量来源": "Источник данных об использовании",
     "决策接口路径": "Путь API решений",
     "TypeSafe 默认 /v1/systemone；OpenRouter 使用 /alpha/decisions，API 地址填写 https://openrouter.ai/api": "TypeSafe: /v1/systemone по умолчанию. OpenRouter: /alpha/decisions, базовый URL https://openrouter.ai/api.",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_one": " + Web-поиск {{count}} раз / 1K раз * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",

@@ -69,6 +69,9 @@ func applySystemPromptIfNeeded(c *gin.Context, info *relaycommon.RelayInfo, requ
 }
 
 func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, request *dto.GeneralOpenAIRequest) (*dto.Usage, *types.NewAPIError) {
+	// doRequest updates info.IsStream from upstream Content-Type; preserve
+	// the downstream contract before dispatching the upstream request.
+	clientStream := info.IsStream
 	chatJSON, err := common.Marshal(request)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
@@ -143,14 +146,14 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 
 	httpResp = resp.(*http.Response)
-	info.IsStream = info.IsStream || strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
+	upstreamStream := strings.HasPrefix(httpResp.Header.Get("Content-Type"), "text/event-stream")
 	if httpResp.StatusCode != http.StatusOK {
 		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
 		service.ResetStatusCode(newApiErr, statusCodeMappingStr)
 		return nil, newApiErr
 	}
 
-	if info.IsStream {
+	if clientStream && upstreamStream {
 		usage, newApiErr := openaichannel.OaiResponsesToChatStreamHandler(c, info, httpResp)
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)
@@ -159,6 +162,16 @@ func chatCompletionsViaResponses(c *gin.Context, info *relaycommon.RelayInfo, ad
 		// Keep both values (and the original error identity) so TextHelper can
 		// settle only an exact PartialStreamError without turning it into success.
 		return usage, newApiErr
+	}
+
+	if upstreamStream {
+		info.IsStream = false
+		common.SetContextKey(c, constant.ContextKeyIsStream, false)
+		usage, apiErr := openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
+		if apiErr != nil {
+			service.ResetStatusCode(apiErr, statusCodeMappingStr)
+		}
+		return usage, apiErr
 	}
 
 	usage, newApiErr := openaichannel.OaiResponsesToChatHandler(c, info, httpResp)

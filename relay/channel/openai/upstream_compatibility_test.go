@@ -36,7 +36,7 @@ func TestResponsesMissingUsageCompatibility(t *testing.T) {
 		{name: "metadata only interrupted", events: `{"type":"response.created"}`, wantError: true},
 		{name: "empty successful response", events: `{"type":"response.completed","response":{"output":[]}}`},
 		{name: "explicit failure", events: `{"type":"response.function_call_arguments.delta","delta":"hello world"}` + "\n" + `{"type":"response.failed","error":{"message":"broken"}}`, wantError: true},
-		{name: "explicit incomplete", events: `{"type":"response.output_text.delta","delta":"hello world"}` + "\n" + `{"type":"response.incomplete"}`, wantError: true},
+		{name: "explicit incomplete", events: `{"type":"response.output_text.delta","delta":"hello world"}` + "\n" + `{"type":"response.incomplete"}`},
 		{name: "authoritative usage wins", events: `{"type":"response.reasoning_text.delta","delta":"hello world"}` + "\n" + `{"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":2,"total_tokens":32,"input_tokens_details":{"cached_tokens":20}}}}`, prompt: 30, completion: 2, cache: 20},
 		{name: "authoritative zero wins", events: `{"type":"response.output_text.delta","delta":"hello world"}` + "\n" + `{"type":"response.completed","response":{"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`},
 		{name: "partial usage missing input", events: `{"type":"response.completed","response":{"usage":{"output_tokens":2}}}`, prompt: 100, completion: 2, estimated: true},
@@ -65,7 +65,7 @@ func TestResponsesMissingUsageCompatibility(t *testing.T) {
 			require.Equal(t, tt.prompt+completion, usage.TotalTokens)
 			require.Equal(t, tt.cache, usage.PromptTokensDetails.CachedTokens)
 			require.Equal(t, tt.estimated, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
-			if strings.Contains(tt.events, `"response.failed"`) || strings.Contains(tt.events, `"response.incomplete"`) {
+			if strings.Contains(tt.events, `"response.failed"`) {
 				require.NotSame(t, handlerErr, info.PartialStreamError, "explicit failures must retain the refund path")
 			} else if tt.wantError {
 				require.Same(t, handlerErr, info.PartialStreamError)

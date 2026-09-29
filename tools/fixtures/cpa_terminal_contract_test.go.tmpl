@@ -1,0 +1,290 @@
+package relay
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/model"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/QuantumNous/new-api/types"
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
+)
+
+func TestCPAProcessTerminalContract(t *testing.T) {
+	binary, outputDir := os.Getenv("CPA_CONTRACT_BINARY"), os.Getenv("CPA_CONTRACT_OUTPUT")
+	require.NotEmpty(t, binary)
+	service.InitHttpClient()
+	service.InitTokenEncoders()
+	oldSettings := *model_setting.GetGlobalSettings()
+	model_setting.GetGlobalSettings().PassThroughRequestEnabled = false
+	model_setting.GetGlobalSettings().ChatCompletionsToResponsesPolicy.Enabled = false
+	oldAuthority := system_setting.ServerAddress
+	system_setting.ServerAddress = "https://synthetic-newapi.example.test"
+	t.Cleanup(func() { *model_setting.GetGlobalSettings() = oldSettings; system_setting.ServerAddress = oldAuthority })
+	oldDB, oldLogDB := model.DB, model.LOG_DB
+	oldRedis, oldBatch, oldLog, oldExport := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
+	common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, true, false
+	data := t.TempDir()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(data, "newapi.db")), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = db, db
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB = oldDB, oldLogDB
+		common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = oldRedis, oldBatch, oldLog, oldExport
+		if sqlDB, e := db.DB(); e == nil {
+			_ = sqlDB.Close()
+		}
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}))
+	type specimen struct {
+		reason                          string
+		usage                           map[string]any
+		completed, opaque, expectReplay bool
+	}
+	var current atomic.Pointer[specimen]
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		require.Equal(t, "/v1/responses", r.URL.Path)
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		raw, readErr := io.ReadAll(r.Body)
+		require.NoError(t, readErr)
+		require.NoError(t, common.Unmarshal(raw, &request))
+		selected := current.Load()
+		require.NotNil(t, selected)
+		require.Equal(t, selected.expectReplay, strings.Contains(string(raw), "opaque_contract"), "reasoning replay must be tenant scoped")
+		response := map[string]any{"id": "resp_contract", "object": "response", "created_at": 1, "model": "gpt-5.6-sol", "status": "incomplete",
+			"incomplete_details": map[string]string{"reason": selected.reason},
+			"output":             []any{map[string]any{"type": "message", "id": "msg_contract", "role": "assistant", "status": "incomplete", "content": []any{map[string]any{"type": "output_text", "text": "synthetic partial", "annotations": []any{}}}}}}
+		if selected.completed {
+			response["status"] = "completed"
+			delete(response, "incomplete_details")
+			items := []any{}
+			if selected.opaque {
+				items = append(items, map[string]any{"type": "reasoning", "id": "rs_contract", "encrypted_content": "opaque_contract", "summary": []any{}})
+			}
+			items = append(items, map[string]any{"type": "message", "id": "msg_contract", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "answer", "annotations": []any{}}}})
+			response["output"] = items
+		}
+
+		if selected.usage != nil {
+			response["usage"] = selected.usage
+		}
+		if request.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			eventType := "response.incomplete"
+			if selected.completed {
+				eventType = "response.completed"
+			}
+			payload, e := common.Marshal(map[string]any{"type": eventType, "response": response})
+			require.NoError(t, e)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			payload, e := common.Marshal(response)
+			require.NoError(t, e)
+			_, _ = w.Write(payload)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	config := map[string]any{"version": 2, "gateways": []any{map[string]any{
+		"id": "fixture", "name": "fixture", "enabled": true, "kind": "sub2api", "protocol": "openai", "base_url": upstream.URL,
+		"compatibility": "generic", "responses_mode": "native_sse", "responses_profile": "codex", "responses_bridge": true, "session_affinity": false,
+		"model_aliases": map[string]string{"gpt-5.6-sol": "gpt-5.6-sol"},
+		"capabilities":  map[string]bool{"chat": true, "responses": true, "claude_messages": true, "stream": true, "tools": true, "reasoning": true},
+		"keys":          []any{map[string]any{"id": "fixture-key", "enabled": true, "api_key_env": "FIXTURE_UPSTREAM_KEY"}},
+	}}}
+	encoded, err := common.Marshal(config)
+	require.NoError(t, err)
+	configPath := filepath.Join(data, "gateways.json")
+	require.NoError(t, os.WriteFile(configPath, encoded, 0600))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	processLog, err := os.Create(filepath.Join(outputDir, "cpa-process.log"))
+	require.NoError(t, err)
+	process := exec.Command(binary)
+	process.Dir = data
+	process.Env = []string{"PATH=" + os.Getenv("PATH"), "CPA_LISTEN_ADDR=" + address, "CPA_API_KEY=fixture-client", "CPA_MANAGEMENT_KEY=fixture-management",
+		"CPA_GATEWAYS_FILE=" + configPath, "CPA_USAGE_PATH=" + filepath.Join(data, "usage.sqlite"), "CPA_LOG_PATH=" + filepath.Join(data, "diagnostics.sqlite"),
+		"CPA_ROUTING_STATE_PATH=" + filepath.Join(data, "routing.json"), "CPA_PROBE_PATH=" + filepath.Join(data, "probes.json"), "CPA_CONTENT_AUDIT_CONFIG=" + filepath.Join(data, "audit.json"),
+		"CPA_SECRET_KEY=WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo=", "CPA_MAX_ATTEMPTS=3", "CPA_SESSION_AFFINITY=false", "CPA_SHUTDOWN_GRACE_SECONDS=3", "CPA_SHUTDOWN_FINALIZE_SECONDS=5", "FIXTURE_UPSTREAM_KEY=synthetic-upstream-key"}
+	process.Stdout, process.Stderr = processLog, processLog
+	require.NoError(t, process.Start())
+	t.Cleanup(func() {
+		_ = process.Process.Signal(os.Interrupt)
+		done := make(chan error, 1)
+		go func() { done <- process.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(12 * time.Second):
+			_ = process.Process.Kill()
+			<-done
+		}
+		_ = processLog.Close()
+	})
+	cpaURL := "http://" + address
+	client := &http.Client{Timeout: time.Second}
+	require.Eventually(t, func() bool {
+		response, e := client.Get(cpaURL + "/readyz")
+		if e != nil {
+			return false
+		}
+		defer response.Body.Close()
+		return response.StatusCode == 200
+	}, 20*time.Second, 25*time.Millisecond)
+	reports := []map[string]any{}
+	for _, protocol := range []string{"responses", "chat"} {
+		for _, stream := range []bool{false, true} {
+			for _, reason := range []string{"max_output_tokens", "unknown"} {
+				for _, countCase := range []struct {
+					name                      string
+					usage                     map[string]any
+					input, output             int
+					inputSource, outputSource string
+				}{
+					{"reported", map[string]any{"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}, 4, 2, "reported", "reported"},
+					{"zero", map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, 0, 0, "reported", "reported"},
+					{"input_only", map[string]any{"input_tokens": 4}, 4, 0, "reported", "unreported"},
+					{"output_only", map[string]any{"output_tokens": 2}, 0, 2, "unreported", "reported"},
+					{"absent", nil, 0, 0, "unreported", "unreported"},
+				} {
+					name := fmt.Sprintf("%s-%v-%s-%s", protocol, stream, reason, countCase.name)
+					t.Run(name, func(t *testing.T) {
+						current.Store(&specimen{reason: reason, usage: countCase.usage})
+						calls.Store(0)
+						user := &model.User{Username: name, AffCode: name, Status: common.UserStatusEnabled, Quota: 1000000}
+						require.NoError(t, db.Create(user).Error)
+						token := &model.Token{UserId: user.Id, Name: "synthetic", Key: name, Status: common.TokenStatusEnabled, RemainQuota: 1000000, ExpiredTime: -1}
+						require.NoError(t, db.Create(token).Error)
+						channel := &model.Channel{Name: "synthetic", Type: constant.ChannelTypeOpenAI}
+						require.NoError(t, db.Create(channel).Error)
+						path := "/v1/responses"
+						if protocol == "chat" {
+							path = "/v1/chat/completions"
+						}
+						recorder := httptest.NewRecorder()
+						c, _ := gin.CreateTestContext(recorder)
+						c.Request = httptest.NewRequest(http.MethodPost, path, nil)
+						c.Request.Header.Set("X-CPA-Principal", strings.Repeat("f", 64))
+						common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+						common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, cpaURL)
+						common.SetContextKey(c, constant.ContextKeyChannelKey, "fixture-client")
+						common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
+						common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-5.6-sol")
+						info := &relaycommon.RelayInfo{IsStream: stream, OriginModelName: "gpt-5.6-sol", RequestURLPath: path, StartTime: time.Now(), UserId: user.Id, TokenId: token.Id, TokenKey: token.Key}
+						info.RelayFormat, info.RelayMode = types.RelayFormatOpenAIResponses, relayconstant.RelayModeResponses
+						info.Request = &dto.OpenAIResponsesRequest{Model: "gpt-5.6-sol", Stream: common.GetPointer(stream), Input: []byte(`"synthetic prompt"`)}
+						if protocol == "chat" {
+							info.RelayFormat, info.RelayMode = types.RelayFormatOpenAI, relayconstant.RelayModeChatCompletions
+							info.Request = &dto.GeneralOpenAIRequest{Model: "gpt-5.6-sol", Stream: common.GetPointer(stream), Messages: []dto.Message{{Role: "user", Content: "synthetic prompt"}}}
+						}
+						info.InitChannelMeta(c)
+						info.SetEstimatePromptTokens(9000)
+						info.UserSetting = dto.UserSetting{BillingPreference: "wallet_only", QuotaWarningThreshold: 1}
+						info.PriceData = types.PriceData{ModelRatio: 1, CompletionRatio: 1, CacheRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
+						require.Nil(t, service.PreConsumeBilling(c, 100, info))
+						var apiErr *types.NewAPIError
+						if protocol == "chat" {
+							apiErr = TextHelper(c, info)
+						} else {
+							apiErr = ResponsesHelper(c, info)
+						}
+						require.Nil(t, apiErr, "CPA response: %s", recorder.Body.String())
+						require.EqualValues(t, 1, calls.Load(), "one accepted generation, never replay")
+						require.Contains(t, recorder.Body.String(), "synthetic partial")
+						require.NotNil(t, info.ResponsesOutcome)
+						require.Equal(t, "incomplete", info.ResponsesOutcome.State)
+						require.Equal(t, reason, info.ResponsesOutcome.Reason)
+						require.Equal(t, countCase.inputSource, info.ResponsesOutcome.InputTokensSource)
+						require.Equal(t, countCase.outputSource, info.ResponsesOutcome.OutputTokensSource)
+						require.False(t, info.ShouldRecordChannelSuccess())
+						require.False(t, info.Billing.NeedsRefund())
+						info.Billing.Refund(c)
+						info.Billing.Refund(c)
+						var logs []model.Log
+						require.NoError(t, db.Where("user_id = ? AND type = ?", user.Id, model.LogTypeConsume).Find(&logs).Error)
+						require.Len(t, logs, 1)
+						require.Equal(t, countCase.input, logs[0].PromptTokens)
+						require.Equal(t, countCase.output, logs[0].CompletionTokens)
+						require.Equal(t, countCase.input+countCase.output, logs[0].Quota)
+						require.NoError(t, info.Billing.Settle(logs[0].Quota))
+						require.Eventually(t, func() bool {
+							var actual model.User
+							var tok model.Token
+							return db.First(&actual, user.Id).Error == nil && db.First(&tok, token.Id).Error == nil && actual.Quota == 1000000-logs[0].Quota && tok.RemainQuota == 1000000-logs[0].Quota
+						}, time.Second, time.Millisecond)
+						reports = append(reports, map[string]any{"case": name, "calls": calls.Load(), "state": info.ResponsesOutcome.State, "reason": info.ResponsesOutcome.Reason, "input_source": info.ResponsesOutcome.InputTokensSource, "output_source": info.ResponsesOutcome.OutputTokensSource, "input_tokens": logs[0].PromptTokens, "output_tokens": logs[0].CompletionTokens, "quota": logs[0].Quota})
+					})
+				}
+			}
+		}
+	}
+	// The same downstream session and shared CPA bearer must not cross tenants.
+	// NewAPI must generate its protected claim after all header overrides.
+	createCustomer := func(label string) (*model.User, *model.Token) {
+		user := &model.User{Username: label, AffCode: label, Status: common.UserStatusEnabled, Quota: 1000000}
+		require.NoError(t, db.Create(user).Error)
+		token := &model.Token{UserId: user.Id, Name: "synthetic", Key: label, Status: common.TokenStatusEnabled, RemainQuota: 1000000, ExpiredTime: -1}
+		require.NoError(t, db.Create(token).Error)
+		return user, token
+	}
+	firstUser, firstToken := createCustomer("replay-a")
+	otherUser, otherToken := createCustomer("replay-b")
+	runReplay := func(label string, user *model.User, token *model.Token, follow, expected bool) {
+		current.Store(&specimen{completed: true, opaque: !follow, expectReplay: expected, usage: map[string]any{"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}})
+		calls.Store(0)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		c.Request.Header.Set("X-CPA-Principal", strings.Repeat("f", 64))
+		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, cpaURL)
+		common.SetContextKey(c, constant.ContextKeyChannelKey, "fixture-client")
+		common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-5.6-sol")
+		messages := []dto.Message{{Role: "user", Content: "start"}}
+		if follow {
+			messages = append(messages, dto.Message{Role: "assistant", Content: "answer"}, dto.Message{Role: "user", Content: "next"})
+		}
+		info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.6-sol", RelayFormat: types.RelayFormatOpenAI, RelayMode: relayconstant.RelayModeChatCompletions, RequestURLPath: "/v1/chat/completions", StartTime: time.Now(), UserId: user.Id, TokenId: token.Id, TokenKey: token.Key,
+			Request: &dto.GeneralOpenAIRequest{Model: "gpt-5.6-sol", Messages: messages, PromptCacheKey: "shared-customer-controlled-session"}}
+		info.InitChannelMeta(c)
+		info.HeadersOverride = map[string]interface{}{"X-CPA-Principal": strings.Repeat("f", 64)}
+		info.UserSetting = dto.UserSetting{BillingPreference: "wallet_only", QuotaWarningThreshold: 1}
+		info.PriceData = types.PriceData{ModelRatio: 1, CompletionRatio: 1, CacheRatio: 1, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
+		require.Nil(t, service.PreConsumeBilling(c, 100, info))
+		require.Nil(t, TextHelper(c, info))
+		require.EqualValues(t, 1, calls.Load())
+		require.False(t, info.Billing.NeedsRefund())
+		reports = append(reports, map[string]any{"case": label, "calls": calls.Load(), "replay_expected": expected, "state": "completed"})
+	}
+	runReplay("replay-seed-a", firstUser, firstToken, false, false)
+	runReplay("replay-cross-tenant-b", otherUser, otherToken, true, false)
+	runReplay("replay-same-tenant-a", firstUser, firstToken, true, true)
+
+	bytes, err := common.Marshal(reports)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(outputDir, "cases.json"), bytes, 0600))
+}

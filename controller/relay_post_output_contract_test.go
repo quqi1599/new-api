@@ -29,3 +29,17 @@ func TestPostOutputFailureReachesControllerWithoutReplayOrSuccess(t *testing.T) 
 	writeRelayError(c, nil, types.RelayFormatOpenAIResponses, err)
 	require.Equal(t, before, c.Writer.Size(), "controller must not append a second/plain JSON error")
 }
+
+func TestProtocolIncompleteEndsWithoutReplayPenaltyOrCircuitRecovery(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	info := &relaycommon.RelayInfo{IsStream: true, OriginModelName: "gpt-5.6-sol", ChannelMeta: &relaycommon.ChannelMeta{}}
+	usage, err := openai.OaiResponsesStreamHandler(c, info, &http.Response{StatusCode: 200,
+		Body: io.NopCloser(strings.NewReader("data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n\n"))})
+	require.Nil(t, err, "nil terminates the controller retry loop")
+	require.False(t, info.ShouldRecordChannelSuccess(), "incomplete must not close a channel circuit")
+	require.False(t, service.ShouldCountChannelCircuitFailure(err))
+	require.Equal(t, 4, usage.PromptTokens)
+	require.Equal(t, 2, usage.CompletionTokens)
+	require.True(t, relayRetryIsUnsafe(c, info, types.RelayFormatOpenAIResponses, err))
+}

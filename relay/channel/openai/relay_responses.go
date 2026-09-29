@@ -36,16 +36,14 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	// 写入新的 response body
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
-	// compute usage
+	// Keep protocol completion and reported usage independent of HTTP 200.
+	info.ObserveResponsesTerminal("", &responsesResponse)
 	usage := dto.Usage{}
-	if responsesResponse.Usage != nil {
-		usage.PromptTokens = responsesResponse.Usage.InputTokens
-		usage.CompletionTokens = responsesResponse.Usage.OutputTokens
-		usage.TotalTokens = responsesResponse.Usage.TotalTokens
-		if responsesResponse.Usage.InputTokensDetails != nil {
-			usage.PromptTokensDetails.CachedTokens = responsesResponse.Usage.InputTokensDetails.CachedTokens
-		}
-	}
+	var usageEstimate responsesUsageEstimate
+	usageEstimate.observeResponse(&responsesResponse, string(responseBody), "", &usage)
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	usage.InputTokens, usage.OutputTokens = usage.PromptTokens, usage.CompletionTokens
+	usageEstimate.recordSources(info, false, false)
 	if !relaycommon.IsNonBillableResponsesStatus(responsesResponse.Status) {
 		for i := range responsesResponse.Output {
 			output := &responsesResponse.Output[i]
@@ -119,7 +117,7 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// Adapted from official PR #6549: Responses error events are valid SSE
 		// payloads, so transport-level success must not erase their business error.
 		switch streamResponse.Type {
-		case "error", "response.error", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+		case "error", "response.error", "response.failed", "response.cancelled", "response.canceled":
 			streamError := streamResponse.Error
 			if (len(streamError) == 0 || string(streamError) == "null") && streamResponse.Response != nil && streamResponse.Response.Error != nil {
 				if errorBytes, err := common.Marshal(streamResponse.Response.Error); err == nil {
@@ -145,9 +143,10 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Stop(streamFailure)
 			return
 		}
+		info.ObserveResponsesTerminal(streamResponse.Type, streamResponse.Response)
 		usageEstimate.observe(&streamResponse, data, usage)
 		switch streamResponse.Type {
-		case "response.completed", "response.done":
+		case "response.completed", "response.done", "response.incomplete":
 			if streamResponse.Response != nil {
 				if !imageCommitted {
 					if relaycommon.IsNonBillableResponsesStatus(streamResponse.Response.Status) {

@@ -38,13 +38,15 @@ type OpenAITextResponseChoice struct {
 }
 
 type OpenAITextResponse struct {
-	Id      string                     `json:"id"`
-	Model   string                     `json:"model"`
-	Object  string                     `json:"object"`
-	Created any                        `json:"created"`
-	Choices []OpenAITextResponseChoice `json:"choices"`
-	Error   any                        `json:"error,omitempty"`
-	Usage   `json:"usage"`
+	Id          string                     `json:"id"`
+	Model       string                     `json:"model"`
+	Object      string                     `json:"object"`
+	Created     any                        `json:"created"`
+	Choices     []OpenAITextResponseChoice `json:"choices"`
+	Error       any                        `json:"error,omitempty"`
+	CPATerminal *CPATerminal               `json:"cpa_terminal,omitempty"`
+	CPAUsage    *CPAUsagePresence          `json:"cpa_usage,omitempty"`
+	Usage       `json:"usage"`
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构
@@ -147,6 +149,8 @@ type ChatCompletionsStreamResponse struct {
 	SystemFingerprint *string                               `json:"system_fingerprint"`
 	Choices           []ChatCompletionsStreamResponseChoice `json:"choices"`
 	Usage             *Usage                                `json:"usage"`
+	CPATerminal       *CPATerminal                          `json:"cpa_terminal,omitempty"`
+	CPAUsage          *CPAUsagePresence                     `json:"cpa_usage,omitempty"`
 }
 
 func (c *ChatCompletionsStreamResponse) IsFinished() bool {
@@ -194,6 +198,8 @@ func (c *ChatCompletionsStreamResponse) Copy() *ChatCompletionsStreamResponse {
 		SystemFingerprint: c.SystemFingerprint,
 		Choices:           choices,
 		Usage:             c.Usage,
+		CPATerminal:       c.CPATerminal,
+		CPAUsage:          c.CPAUsage,
 	}
 }
 
@@ -228,11 +234,12 @@ type Usage struct {
 	UsageSemantic        string `json:"usage_semantic,omitempty"`
 	UsageSource          string `json:"usage_source,omitempty"`
 
-	PromptTokensDetails    InputTokenDetails  `json:"prompt_tokens_details"`
-	CompletionTokenDetails OutputTokenDetails `json:"completion_tokens_details"`
-	InputTokens            int                `json:"input_tokens"`
-	OutputTokens           int                `json:"output_tokens"`
-	InputTokensDetails     *InputTokenDetails `json:"input_tokens_details"`
+	PromptTokensDetails    InputTokenDetails   `json:"prompt_tokens_details"`
+	CompletionTokenDetails OutputTokenDetails  `json:"completion_tokens_details"`
+	InputTokens            int                 `json:"input_tokens"`
+	OutputTokens           int                 `json:"output_tokens"`
+	InputTokensDetails     *InputTokenDetails  `json:"input_tokens_details"`
+	OutputTokensDetails    *OutputTokenDetails `json:"output_tokens_details,omitempty"`
 
 	// claude cache 1h
 	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
@@ -334,7 +341,10 @@ func (o *OpenAIResponsesResponse) GetSize() string {
 }
 
 type IncompleteDetails struct {
-	Reasoning string `json:"reasoning"`
+	Reason string `json:"reason,omitempty"`
+	// Retain the old extension for decoding compatibility; it is not the
+	// protocol's incomplete reason and must not be used to infer one.
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 type ResponsesOutput struct {
@@ -349,6 +359,7 @@ type ResponsesOutput struct {
 	CallId    string                          `json:"call_id,omitempty"`
 	Name      string                          `json:"name,omitempty"`
 	Arguments json.RawMessage                 `json:"arguments,omitempty"`
+	Input     json.RawMessage                 `json:"input,omitempty"`
 	Summary   []ResponsesReasoningSummaryPart `json:"summary,omitempty"`
 }
 
@@ -356,6 +367,9 @@ type ResponsesOutput struct {
 func (r *ResponsesOutput) ArgumentsString() string {
 	if r == nil {
 		return ""
+	}
+	if r.Type == "custom_tool_call" && len(r.Input) > 0 {
+		return ResponsesArgumentsString(r.Input)
 	}
 	return ResponsesArgumentsString(r.Arguments)
 }
@@ -399,11 +413,14 @@ const (
 
 // ResponsesStreamResponse 用于处理 /v1/responses 流式响应
 type ResponsesStreamResponse struct {
-	Type     string                   `json:"type"`
-	Response *OpenAIResponsesResponse `json:"response,omitempty"`
-	Error    json.RawMessage          `json:"error,omitempty"`
-	Delta    string                   `json:"delta,omitempty"`
-	Item     *ResponsesOutput         `json:"item,omitempty"`
+	Type      string                   `json:"type"`
+	Response  *OpenAIResponsesResponse `json:"response,omitempty"`
+	Error     json.RawMessage          `json:"error,omitempty"`
+	Delta     string                   `json:"delta,omitempty"`
+	Arguments json.RawMessage          `json:"arguments,omitempty"`
+	Input     string                   `json:"input,omitempty"`
+	Text      *string                  `json:"text,omitempty"`
+	Item      *ResponsesOutput         `json:"item,omitempty"`
 	// - response.function_call_arguments.delta
 	// - response.function_call_arguments.done
 	OutputIndex  *int                           `json:"output_index,omitempty"`

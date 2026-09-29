@@ -166,7 +166,7 @@ func IsNonBillableResponsesStatus(status []byte) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "failed", "cancelled", "canceled", "incomplete":
+	case "failed", "cancelled", "canceled":
 		return true
 	default:
 		return false

@@ -190,9 +190,9 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 					if mediaMsg.IsStringContent() {
 						oaiToolMessage.SetStringContent(mediaMsg.GetStringContent())
 					} else {
-						mediaContents := mediaMsg.ParseMediaContent()
-						encodeJson, _ := common.Marshal(mediaContents)
-						oaiToolMessage.SetStringContent(string(encodeJson))
+						text, media := claudeToolResultToChat(mediaMsg.ParseMediaContent())
+						oaiToolMessage.SetStringContent(text)
+						mediaMessages = append(mediaMessages, media...)
 					}
 					openAIMessages = append(openAIMessages, oaiToolMessage)
 				}
@@ -615,15 +615,25 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 	}
 	for _, choice := range openAIResponse.Choices {
 		stopReason = stopReasonOpenAI2Claude(choice.FinishReason)
-		if choice.FinishReason == "tool_calls" {
+		if choice.FinishReason == "tool_calls" || (info.IsResponsesIncomplete() && len(choice.Message.ParseToolCalls()) > 0) {
+			if text := choice.Message.StringContent(); text != "" {
+				contents = append(contents, dto.ClaudeMediaMessage{Type: "text", Text: common.GetPointer(text)})
+			}
 			for _, toolUse := range choice.Message.ParseToolCalls() {
 				claudeContent := dto.ClaudeMediaMessage{}
 				claudeContent.Type = "tool_use"
 				claudeContent.Id = toolUse.ID
 				claudeContent.Name = toolUse.Function.Name
 				var mapParams map[string]interface{}
-				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil {
+				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil && (mapParams != nil || !info.IsResponsesIncomplete()) {
 					claudeContent.Input = mapParams
+				} else if info.IsResponsesIncomplete() {
+					// Messages requires an object for tool input. Keep truncated
+					// arguments as visible output rather than inventing executable
+					// input or silently discarding the partial tool call.
+					partial := "[Incomplete tool call: " + toolUse.Function.Name + "]\n" + toolUse.Function.Arguments
+					contents = append(contents, dto.ClaudeMediaMessage{Type: "text", Text: common.GetPointer(partial)})
+					continue
 				} else {
 					claudeContent.Input = toolUse.Function.Arguments
 				}
@@ -850,6 +860,8 @@ func ResponseOpenAI2Gemini(openAIResponse *dto.OpenAITextResponse, info *relayco
 			finishReason = "MAX_TOKENS"
 		case "content_filter":
 			finishReason = "SAFETY"
+		case "incomplete":
+			finishReason = "OTHER"
 		case "tool_calls":
 			finishReason = "STOP"
 		default:
@@ -953,6 +965,8 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 				finishReason = "MAX_TOKENS"
 			case "content_filter":
 				finishReason = "SAFETY"
+			case "incomplete":
+				finishReason = "OTHER"
 			case "tool_calls":
 				finishReason = "STOP"
 			default:
@@ -1004,4 +1018,39 @@ func StreamResponseOpenAI2Gemini(openAIResponse *dto.ChatCompletionsStreamRespon
 	}
 
 	return geminiResponse
+}
+
+// Adapted from upstream #7512: tool text remains linked to its tool ID; images
+// follow the complete tool result batch in a user message.
+func claudeToolResultToChat(blocks []dto.ClaudeMediaMessage) (string, []dto.MediaContent) {
+	var texts []string
+	var media []dto.MediaContent
+	for _, block := range blocks {
+		switch block.Type {
+		case "text", "input_text":
+			texts = append(texts, block.GetText())
+		case "image":
+			if block.Source == nil {
+				raw, _ := common.Marshal(blocks)
+				return string(raw), nil
+			}
+			url := block.Source.Url
+			if block.Source.Type == "base64" {
+				url = fmt.Sprintf("data:%s;base64,%v", block.Source.MediaType, block.Source.Data)
+			}
+			if url == "" {
+				raw, _ := common.Marshal(blocks)
+				return string(raw), nil
+			}
+			media = append(media, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: &dto.MessageImageUrl{Url: url}, CacheControl: block.CacheControl})
+		default:
+			raw, _ := common.Marshal(blocks)
+			return string(raw), nil
+		}
+	}
+	text := strings.Join(texts, "\n")
+	if text == "" && len(media) > 0 {
+		text = "[image]"
+	}
+	return text, media
 }

@@ -121,6 +121,8 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var responseTextBuilder strings.Builder
 	var toolCount int
 	var usage = &dto.Usage{}
+	var terminalUsage dto.Usage
+	var terminalObserver responsesUsageEstimate
 	var terminalFailure *types.NewAPIError
 	var deliveryFailure *types.NewAPIError
 	var streamItems []string // store stream items
@@ -168,6 +170,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		if !sr.Accept() {
 			return
 		}
+		terminalObserver.observeChatTerminal(info, data, &terminalUsage)
 		// Retain the current accepted frame before flushing the prior buffered
 		// one. A downstream failure must not discard usage that already arrived.
 		previousStreamData := lastStreamData
@@ -237,10 +240,28 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		logger.LogError(c, "error processing tokens: "+err.Error())
 	}
 
-	if !containStreamUsage {
-		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		usage.CompletionTokens += toolCount * 7
+	if info.IsResponsesIncomplete() || (terminalObserver.promptReported && terminalObserver.completionReported) {
+		// Completion and usage may arrive in different frames. Missing fields
+		// stay unknown, while an explicit upstream zero remains authoritative.
+		usage = &terminalUsage
+		containStreamUsage = true
+	} else {
+		if terminalObserver.promptReported || terminalObserver.completionReported {
+			usage = &terminalUsage
+		}
+		if !containStreamUsage {
+			estimated := service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
+			if !terminalObserver.promptReported {
+				terminalUsage.PromptTokens = estimated.PromptTokens
+			}
+			if !terminalObserver.completionReported {
+				terminalUsage.CompletionTokens = estimated.CompletionTokens + toolCount*7
+			}
+			terminalUsage.TotalTokens = terminalUsage.PromptTokens + terminalUsage.CompletionTokens
+			usage = &terminalUsage
+		}
 	}
+	terminalObserver.recordSources(info, !containStreamUsage && usage.PromptTokens > 0, !containStreamUsage && usage.CompletionTokens > 0)
 
 	lastStreamPayload, done := helper.NormalizeSSEPayload(lastStreamData)
 	if done {
@@ -306,6 +327,12 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	if oaiError := simpleResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
 		return nil, types.WithOpenAIError(*oaiError, resp.StatusCode)
 	}
+	var terminalObserver responsesUsageEstimate
+	var terminalUsage dto.Usage
+	terminalObserver.observeChatTerminal(info, string(responseBody), &terminalUsage)
+	if info.IsResponsesIncomplete() {
+		simpleResponse.Usage = terminalUsage
+	}
 
 	for _, choice := range simpleResponse.Choices {
 		if choice.FinishReason == constant.FinishReasonContentFilter {
@@ -320,9 +347,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	usageModified := false
-	if simpleResponse.Usage.PromptTokens == 0 {
+	if !info.IsResponsesIncomplete() && !terminalObserver.promptReported && simpleResponse.Usage.PromptTokens == 0 {
 		completionTokens := simpleResponse.Usage.CompletionTokens
-		if completionTokens == 0 {
+		if completionTokens == 0 && !terminalObserver.completionReported {
 			for _, choice := range simpleResponse.Choices {
 				ctkm := service.CountTextToken(choice.Message.StringContent()+choice.Message.GetReasoningContent(), info.UpstreamModelName)
 				completionTokens += ctkm
@@ -335,6 +362,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		}
 		usageModified = true
 	}
+	terminalObserver.recordSources(info, usageModified && simpleResponse.Usage.PromptTokens > 0, usageModified && simpleResponse.Usage.CompletionTokens > 0)
 
 	applyUsagePostProcessing(info, &simpleResponse.Usage, responseBody)
 

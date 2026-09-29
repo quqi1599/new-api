@@ -1,5 +1,8 @@
 {
   "translation": {
+    "未完成": "Incomplete",
+    "响应终态": "Response outcome",
+    "用量来源": "Usage source",
     "决策接口路径": "Decisions endpoint path",
     "TypeSafe 默认 /v1/systemone；OpenRouter 使用 /alpha/decisions，API 地址填写 https://openrouter.ai/api": "TypeSafe defaults to /v1/systemone. For OpenRouter, use /alpha/decisions with API base https://openrouter.ai/api.",
     " + Web搜索 {{count}}次 / 1K 次 * {{symbol}}{{price}} * {{ratioType}} {{ratio}}_one": " + Web search {{count}} time / 1K times * {{symbol}}{{price}} * {{ratioType}} {{ratio}}",

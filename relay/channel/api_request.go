@@ -408,6 +408,7 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	for key, value := range headerOverride {
 		targetHeader.Set(key, value)
 	}
+	applyCPAPrincipal(targetHeader, info)
 	if err = applyCPAAuditIdentityHeaders(targetHeader, c.Request.Method, fullRequestURL, info, time.Now(), common2.CPAAuditIdentitySecret); err != nil {
 		return nil, fmt.Errorf("apply CPA audit identity: %w", err)
 	}
@@ -970,6 +971,7 @@ func setRelayCancelOrigin(c *gin.Context, origin string) {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	applyCPAPrincipal(req.Header, info)
 	if err := applyCPAAuditIdentity(req, info); err != nil {
 		return nil, fmt.Errorf("apply CPA audit identity: %w", err)
 	}

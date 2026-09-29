@@ -213,15 +213,17 @@ type ClaudeRequest struct {
 	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 	// InferenceGeo controls Claude data residency region.
 	// This field is filtered by default and can be enabled via channel setting allow_inference_geo.
-	InferenceGeo      string          `json:"inference_geo,omitempty"`
-	MaxTokens         *uint           `json:"max_tokens,omitempty"`
-	MaxTokensToSample *uint           `json:"max_tokens_to_sample,omitempty"`
-	StopSequences     []string        `json:"stop_sequences,omitempty"`
-	Temperature       *float64        `json:"temperature,omitempty"`
-	TopP              *float64        `json:"top_p,omitempty"`
-	TopK              *int            `json:"top_k,omitempty"`
-	Stream            *bool           `json:"stream,omitempty"`
-	Tools             any             `json:"tools,omitempty"`
+	InferenceGeo      string   `json:"inference_geo,omitempty"`
+	MaxTokens         *uint    `json:"max_tokens,omitempty"`
+	MaxTokensToSample *uint    `json:"max_tokens_to_sample,omitempty"`
+	StopSequences     []string `json:"stop_sequences,omitempty"`
+	Temperature       *float64 `json:"temperature,omitempty"`
+	TopP              *float64 `json:"top_p,omitempty"`
+	TopK              *int     `json:"top_k,omitempty"`
+	Stream            *bool    `json:"stream,omitempty"`
+	Tools             any      `json:"tools,omitempty"`
+	// Upstream #7598: preserve native auto-mode guard settings verbatim.
+	Safeguards        json.RawMessage `json:"safeguards,omitempty"`
 	ContextManagement json.RawMessage `json:"context_management,omitempty"`
 	OutputConfig      json.RawMessage `json:"output_config,omitempty"`
 	OutputFormat      json.RawMessage `json:"output_format,omitempty"`

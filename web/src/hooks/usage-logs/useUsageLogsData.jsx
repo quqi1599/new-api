@@ -622,12 +622,30 @@ export const useLogsData = () => {
           value: other.request_path,
         });
       }
+      if (other?.responses_outcome) {
+        const outcome = other.responses_outcome;
+        expandDataLocal.push({
+          key: t('响应终态'),
+          value: [outcome.state, outcome.reason].filter(Boolean).join(' / '),
+        });
+        expandDataLocal.push({
+          key: t('用量来源'),
+          value: `input: ${outcome.input_tokens_source}; output: ${outcome.output_tokens_source}`,
+        });
+      }
       if (isAdminUser && other?.stream_status) {
         const ss = other.stream_status;
         const isOk = ss.status === 'ok';
-        const statusLabel = isOk ? '✓ ' + t('正常') : '✗ ' + t('异常');
+        const statusLabel = isOk
+          ? '✓ ' + t('正常')
+          : ss.status === 'incomplete'
+            ? '○ ' + t('未完成')
+            : '✗ ' + t('异常');
         let streamValue =
-          statusLabel + ' (' + (ss.end_reason || 'unknown') + ')';
+          statusLabel +
+          ' (' +
+          (ss.incomplete_reason || ss.end_reason || 'unknown') +
+          ')';
         if (ss.error_count > 0) {
           streamValue += ` [${t('软错误')}: ${ss.error_count}]`;
         }

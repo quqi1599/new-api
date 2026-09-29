@@ -53,7 +53,7 @@ func TestOaiResponsesHandlerBillsActualOutputsNotToolDeclarations(t *testing.T) 
 	require.Equal(t, []relaycommon.ImageGenerationCallInfo{{Quality: "medium", Size: "1024x1536"}}, info.ResponsesUsageInfo.ImageGenerationCalls)
 }
 
-func TestOaiResponsesHandlerDoesNotBillIncompleteResponse(t *testing.T) {
+func TestOaiResponsesHandlerBillsCompletedToolsInIncompleteResponse(t *testing.T) {
 	c, _ := newResponsesTestContext()
 	info := &relaycommon.RelayInfo{
 		OriginModelName: "gpt-4.1",
@@ -72,8 +72,8 @@ func TestOaiResponsesHandlerDoesNotBillIncompleteResponse(t *testing.T) {
 	_, handlerErr := OaiResponsesHandler(c, info, resp)
 
 	require.Nil(t, handlerErr)
-	require.Zero(t, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearch].CallCount)
-	require.Empty(t, info.ResponsesUsageInfo.ImageGenerationCalls)
+	require.Equal(t, 1, info.ResponsesUsageInfo.BuiltInTools[dto.BuildInToolWebSearch].CallCount)
+	require.Len(t, info.ResponsesUsageInfo.ImageGenerationCalls, 1)
 }
 
 func TestOaiResponsesStreamHandlerDeduplicatesImageAcrossEvents(t *testing.T) {

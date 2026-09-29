@@ -145,8 +145,8 @@ function renderType(type, t) {
 function buildStreamStatusTooltip(ss, t) {
   if (!ss) return null;
   const lines = [
-    t('流状态') + '：' + t('异常'),
-    (ss.end_reason || 'unknown'),
+    t('流状态') + '：' + t(ss.status === 'incomplete' ? '未完成' : '异常'),
+    ss.incomplete_reason || ss.end_reason || 'unknown',
   ];
   if (ss.error_count > 0) {
     lines.push(`${t('软错误')}: ${ss.error_count}`);
@@ -180,16 +180,13 @@ function renderIsStream(bool, t, streamStatus) {
                 right: -4,
                 top: -4,
                 lineHeight: 1,
-                color: '#ef4444',
+                color:
+                  streamStatus?.status === 'incomplete' ? '#d97706' : '#ef4444',
                 cursor: 'pointer',
                 userSelect: 'none',
               }}
             >
-              <CircleAlert
-                size={14}
-                strokeWidth={2.5}
-                color='currentColor'
-              />
+              <CircleAlert size={14} strokeWidth={2.5} color='currentColor' />
             </span>
           </Tooltip>
         )}

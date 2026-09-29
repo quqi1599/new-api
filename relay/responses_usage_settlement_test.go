@@ -1,8 +1,10 @@
 package relay
 
 import (
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,8 +28,13 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 	service.InitTokenEncoders()
 	settings := model_setting.GetGlobalSettings()
 	oldPassThrough := settings.PassThroughRequestEnabled
+	oldPolicy := settings.ChatCompletionsToResponsesPolicy
+	settings.ChatCompletionsToResponsesPolicy.Enabled = false
 	settings.PassThroughRequestEnabled = false
-	t.Cleanup(func() { settings.PassThroughRequestEnabled = oldPassThrough })
+	t.Cleanup(func() {
+		settings.PassThroughRequestEnabled = oldPassThrough
+		settings.ChatCompletionsToResponsesPolicy = oldPolicy
+	})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldRedis, oldBatch, oldLog, oldExport := common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled
 	common.RedisEnabled, common.BatchUpdateEnabled, common.LogConsumeEnabled, common.DataExportEnabled = false, false, true, false
@@ -43,12 +50,19 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 	})
 	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.Log{}))
 	const initialQuota = 1000000
+	const chatIncomplete = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"cpa_terminal\":{\"status\":\"incomplete\",\"reason\":\"max_output_tokens\"},\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\ndata: [DONE]\n\n"
 	const toolDelta = "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"hello world\"}\n\n"
 	for _, tc := range []struct {
 		name, body                     string
 		writes, status                 int
 		wantLog, wantCharge, estimated bool
 	}{
+		{"chat_incomplete_usage", chatIncomplete, -1, 0, true, true, false},
+		{"chat_incomplete_disconnect", chatIncomplete, 1, 499, true, true, false},
+		{"incomplete_usage", toolDelta + convertedResponsesIncomplete, -1, 0, true, true, false},
+		{"incomplete_zero", toolDelta + "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", -1, 0, true, false, false},
+		{"incomplete_unknown", toolDelta + "data: {\"type\":\"response.incomplete\"}\n\n", -1, 0, true, false, false},
+		{"incomplete_disconnect", toolDelta + convertedResponsesIncomplete, 1, 499, true, true, false},
 		{"tool_eof", toolDelta, -1, http.StatusBadGateway, true, true, true},
 		{"tool_completed", toolDelta + "data: {\"type\":\"response.completed\"}\n\n", -1, 0, true, true, true},
 		{"downstream_disconnect", "data: {\"type\":\"response.created\"}\n\n" + toolDelta, 1, 499, true, true, true},
@@ -58,12 +72,20 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 		{"explicit_zero", toolDelta + "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", -1, 0, true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, info, calls := newConvertedResponsesFixture(t, convertedResponsesCase{name: tc.name, body: tc.body, allowWrites: tc.writes})
-			c.Request.URL.Path = "/v1/responses"
-			info.RequestURLPath = "/v1/responses"
-			info.RelayFormat = types.RelayFormatOpenAIResponses
-			info.RelayMode = relayconstant.RelayModeResponses
-			info.Request = &dto.OpenAIResponsesRequest{Model: info.OriginModelName, Stream: common.GetPointer(true), Input: []byte(`"synthetic test"`)}
+			fixture := convertedResponsesCase{name: tc.name, body: tc.body, allowWrites: tc.writes}
+			chat := strings.HasPrefix(tc.name, "chat_")
+			if chat {
+				fixture.upstreamPath = "/v1/chat/completions"
+			}
+			c, info, calls := newConvertedResponsesFixture(t, fixture)
+			if !chat {
+				c.Request.URL.Path = "/v1/responses"
+				info.RequestURLPath = "/v1/responses"
+				info.RelayFormat = types.RelayFormatOpenAIResponses
+				info.RelayMode = relayconstant.RelayModeResponses
+				info.Request = &dto.OpenAIResponsesRequest{Model: info.OriginModelName, Stream: common.GetPointer(true), Input: []byte(`"synthetic test"`)}
+			}
+
 			user := &model.User{Username: "raw-" + tc.name, AffCode: tc.name, Status: common.UserStatusEnabled, Quota: initialQuota}
 			require.NoError(t, db.Create(user).Error)
 			token := &model.Token{UserId: user.Id, Name: "synthetic", Key: "raw-" + tc.name, Status: common.TokenStatusEnabled, RemainQuota: initialQuota, ExpiredTime: -1}
@@ -75,7 +97,12 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 			info.UserSetting = dto.UserSetting{BillingPreference: "wallet_only", QuotaWarningThreshold: 1}
 			info.PriceData = types.PriceData{ModelRatio: 1, CompletionRatio: 1, CacheRatio: 0.25, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
 			require.Nil(t, service.PreConsumeBilling(c, 100, info))
-			apiErr := ResponsesHelper(c, info)
+			var apiErr *types.NewAPIError
+			if chat {
+				apiErr = TextHelper(c, info)
+			} else {
+				apiErr = ResponsesHelper(c, info)
+			}
 			require.EqualValues(t, 1, calls.Load(), "never replay a stream after output")
 			if tc.status == 0 {
 				require.Nil(t, apiErr)
@@ -99,6 +126,7 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 					require.Zero(t, quota)
 				}
 				var other struct {
+					Outcome   *relaycommon.ResponsesOutcome `json:"responses_outcome"`
 					AdminInfo struct {
 						LocalCount bool `json:"local_count_tokens"`
 					} `json:"admin_info"`
@@ -109,6 +137,26 @@ func TestResponsesMissingUsageSettlement(t *testing.T) {
 				require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
 				require.Equal(t, tc.estimated, other.AdminInfo.LocalCount)
 				status := "ok"
+				if strings.Contains(tc.name, "incomplete_") {
+					status = "incomplete"
+					require.NotNil(t, other.Outcome)
+					require.Equal(t, "incomplete", other.Outcome.State)
+					require.False(t, info.ShouldRecordChannelSuccess())
+					if strings.HasSuffix(tc.name, "incomplete_usage") || strings.HasSuffix(tc.name, "incomplete_disconnect") {
+						require.Equal(t, 6, quota)
+						require.Equal(t, "max_output_tokens", other.Outcome.Reason)
+						require.Equal(t, "reported", other.Outcome.InputTokensSource)
+						require.Equal(t, "reported", other.Outcome.OutputTokensSource)
+					} else {
+						require.Equal(t, "unknown", other.Outcome.Reason)
+						source := "reported"
+						if tc.name == "incomplete_unknown" {
+							source = "unreported"
+						}
+						require.Equal(t, source, other.Outcome.InputTokensSource)
+						require.Equal(t, source, other.Outcome.OutputTokensSource)
+					}
+				}
 				if tc.status != 0 {
 					status = "error"
 				}

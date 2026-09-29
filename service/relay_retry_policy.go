@@ -12,6 +12,7 @@ import (
 
 const (
 	RetryStopReasonSuccess           = "success"
+	RetryStopReasonIncomplete        = "incomplete"
 	RetryStopReasonNotRetryable      = "not_retryable"
 	RetryStopReasonOutputStarted     = "output_started"
 	RetryStopReasonAttemptsExhausted = "attempts_exhausted"

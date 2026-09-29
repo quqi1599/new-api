@@ -88,15 +88,38 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		message.SetStringContent(value)
 		out.Messages = append(out.Messages, message)
 	case []any:
+		// Upstream #7510: keep parallel tool results contiguous, then attach
+		// their media to one user message after the complete result batch.
+		var pendingMedia []dto.MediaContent
+		flushMedia := func() {
+			if len(pendingMedia) > 0 {
+				message := dto.Message{Role: "user"}
+				message.SetMediaContent(pendingMedia)
+				out.Messages = append(out.Messages, message)
+				pendingMedia = nil
+			}
+		}
 		for index, item := range value {
 			itemMap, ok := item.(map[string]any)
 			if !ok {
 				return nil, fmt.Errorf("input item %d must be an object", index)
 			}
+			itemType, _ := itemMap["type"].(string)
+			if itemType == "function_call_output" || itemType == "custom_tool_call_output" {
+				text, media, err := responsesToolOutputToChat(itemMap["output"])
+				if err != nil {
+					return nil, fmt.Errorf("input item %d: %w", index, err)
+				}
+				itemMap["output"] = text
+				pendingMedia = append(pendingMedia, media...)
+			} else {
+				flushMedia()
+			}
 			if err := appendResponsesInputItem(&out.Messages, itemMap); err != nil {
 				return nil, fmt.Errorf("input item %d: %w", index, err)
 			}
 		}
+		flushMedia()
 	default:
 		return nil, fmt.Errorf("input must be a string or array")
 	}
@@ -301,6 +324,8 @@ func setResponsesMessageContent(message *dto.Message, value any) error {
 				}
 			}
 			media = append(media, dto.MediaContent{Type: dto.ContentTypeFile, File: file})
+		case "input_video":
+			media = append(media, dto.MediaContent{Type: dto.ContentTypeVideoUrl, VideoUrl: part["video_url"]})
 		case "input_audio":
 			media = append(media, dto.MediaContent{Type: dto.ContentTypeInputAudio, InputAudio: part["input_audio"]})
 		}
@@ -336,4 +361,45 @@ func responsesValueString(value any) (string, error) {
 		return "", err
 	}
 	return string(encoded), nil
+}
+
+// Recognized content parts are split into tool text and user media. Arbitrary
+// JSON tool output is preserved as JSON instead of silently losing fields.
+func responsesToolOutputToChat(value any) (string, []dto.MediaContent, error) {
+	parts, ok := value.([]any)
+	if !ok || len(parts) == 0 {
+		text, err := responsesValueString(value)
+		return text, nil, err
+	}
+	for _, value := range parts {
+		part, ok := value.(map[string]any)
+		if !ok {
+			raw, err := responsesValueString(parts)
+			return raw, nil, err
+		}
+		switch part["type"] {
+		case "text", "input_text", "output_text", "input_image", "input_file", "input_audio", "input_video":
+		default:
+			raw, err := responsesValueString(parts)
+			return raw, nil, err
+		}
+	}
+	var message dto.Message
+	if err := setResponsesMessageContent(&message, value); err != nil {
+		return "", nil, err
+	}
+	var texts []string
+	var media []dto.MediaContent
+	for _, part := range message.ParseContent() {
+		if part.Type == dto.ContentTypeText {
+			texts = append(texts, part.Text)
+		} else {
+			media = append(media, part)
+		}
+	}
+	text := strings.Join(texts, "\n")
+	if text == "" && len(media) > 0 {
+		text = "[media]"
+	}
+	return text, media, nil
 }

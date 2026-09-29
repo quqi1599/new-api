@@ -103,3 +103,28 @@ func TestChatCompletionsResponseToResponsesResponseKeepsTextAndToolCalls(t *test
 	require.Equal(t, "lookup", got.Output[1].Name)
 	require.Equal(t, `{"q":"x"}`, got.Output[1].ArgumentsString())
 }
+
+func TestResponsesToolMediaFollowsEntireResultBatch(t *testing.T) {
+	req := &dto.OpenAIResponsesRequest{Model: "fixture", Input: []byte(`[
+      {"type":"function_call","call_id":"one","name":"a","arguments":"{}"},
+      {"type":"function_call","call_id":"two","name":"b","arguments":"{}"},
+      {"type":"function_call_output","call_id":"one","output":[{"type":"text","text":"first"},{"type":"input_image","image_url":"data:image/png;base64,AQ=="}]},
+      {"type":"custom_tool_call_output","call_id":"two","output":[{"type":"input_image","image_url":"https://fixture.invalid/image"}]},
+      {"role":"user","content":"continue"} ]`)}
+	got, err := ResponsesRequestToChatCompletionsRequest(req)
+	require.NoError(t, err)
+	require.Len(t, got.Messages, 5)
+	require.Equal(t, "tool", got.Messages[1].Role)
+	require.Equal(t, "one", got.Messages[1].ToolCallId)
+	require.Equal(t, "first", got.Messages[1].StringContent())
+	require.Equal(t, "tool", got.Messages[2].Role)
+	require.Equal(t, "two", got.Messages[2].ToolCallId)
+	require.NotContains(t, got.Messages[2].StringContent(), "https://")
+	require.Equal(t, "user", got.Messages[3].Role)
+	require.Len(t, got.Messages[3].ParseContent(), 2)
+	require.Equal(t, "continue", got.Messages[4].StringContent())
+	raw, media, err := responsesToolOutputToChat([]any{map[string]any{"ok": true}})
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"ok":true}]`, raw)
+	require.Empty(t, media)
+}
