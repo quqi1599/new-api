@@ -21,6 +21,7 @@ type OpenAIError struct {
 type ClaudeError struct {
 	Type    string `json:"type,omitempty"`
 	Message string `json:"message,omitempty"`
+	Code    any    `json:"code,omitempty"`
 }
 
 type ErrorType string
@@ -362,6 +363,7 @@ func WithOpenAIError(openAIError OpenAIError, statusCode int, ops ...NewAPIError
 	for _, op := range ops {
 		op(e)
 	}
+	normalizeDeterministicUpstreamError(e)
 	return e
 }
 
@@ -376,9 +378,13 @@ func WithClaudeError(claudeError ClaudeError, statusCode int, ops ...NewAPIError
 		Err:        errors.New(claudeError.Message),
 		errorCode:  ErrorCode(claudeError.Type),
 	}
+	if claudeError.Code != nil && fmt.Sprint(claudeError.Code) != "" {
+		e.errorCode = ErrorCode(fmt.Sprint(claudeError.Code))
+	}
 	for _, op := range ops {
 		op(e)
 	}
+	normalizeDeterministicUpstreamError(e)
 	return e
 }
 

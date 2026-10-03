@@ -103,17 +103,6 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			sr.Error(fmt.Errorf("responses stream event is missing type"))
 			return
 		}
-		if !sr.Accept() {
-			return
-		}
-		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
-			deliveryFailure = helper.DownstreamStreamError(c, info, err)
-			sr.Stop(err)
-			// This frame was already accepted upstream. Preserve its usage/text
-			// below even if delivery failed. Stop prevents another frame (and
-			// makes a later sr.Done a no-op), without discarding known usage.
-		}
-
 		// Adapted from official PR #6549: Responses error events are valid SSE
 		// payloads, so transport-level success must not erase their business error.
 		switch streamResponse.Type {
@@ -135,13 +124,34 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 				types.ErrOptionWithSkipRetry(),
 				types.ErrOptionWithChannelPenalty(),
 			)
+			// Responses permits nested errors and top-level code/message fields.
+			var detail types.OpenAIError
+			errorPayload := streamError
+			if len(errorPayload) == 0 || string(errorPayload) == "null" {
+				errorPayload = []byte(data)
+			}
+			if common.Unmarshal(errorPayload, &detail) == nil && detail.Code != nil {
+				terminalFailure = types.WithOpenAIError(detail, http.StatusBadGateway,
+					types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+			}
+			if helper.StreamStarted(c) {
+				_ = helper.SendInBandStreamError(c, types.RelayFormatOpenAIResponses, terminalFailure)
+			}
 			if !imageCommitted {
 				imageCounter.Reset()
 				imageCounter.Commit(info)
 				imageCommitted = true
 			}
-			sr.Stop(streamFailure)
+			sr.Stop(terminalFailure)
 			return
+		}
+		if !sr.Accept() {
+			return
+		}
+		if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+			deliveryFailure = helper.DownstreamStreamError(c, info, err)
+			sr.Stop(err)
+			// Preserve known usage even when an accepted frame cannot be delivered.
 		}
 		info.ObserveResponsesTerminal(streamResponse.Type, streamResponse.Response)
 		usageEstimate.observe(&streamResponse, data, usage)
@@ -185,14 +195,14 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 			}
 		}
 	})
-	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
-		return nil, streamErr
-	}
 	if terminalFailure != nil {
 		// Protocol-native error frames may already have committed an SSE 200. The
 		// controller suppresses a trailing JSON error in that case, but it still
 		// needs a non-nil result to avoid success settlement and success logging.
 		return usage, terminalFailure
+	}
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
 	}
 
 	usageEstimate.finish(c, info, usage)

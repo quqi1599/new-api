@@ -886,8 +886,8 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return "", types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-		apiErr := types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && (claudeError.Type != "" || claudeError.Code != nil) {
+		apiErr := types.WithClaudeError(*claudeError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
 		if helper.StreamStarted(c) {
 			if writeErr := helper.SendInBandStreamError(c, info.RelayFormat, apiErr); writeErr != nil {
 				logger.LogError(c, "send in-band stream error failed: "+writeErr.Error())
@@ -1022,11 +1022,11 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 			sr.Done()
 		}
 	})
-	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
-		return nil, streamErr
-	}
 	if err != nil {
 		return nil, err
+	}
+	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		return nil, streamErr
 	}
 
 	if helper.ShouldFinalizeStream(info) {
@@ -1080,8 +1080,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			sr.Stop(streamErr)
 			return
 		}
-		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
-			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError)
+		if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && (claudeError.Type != "" || claudeError.Code != nil) {
+			streamErr = types.WithClaudeError(*claudeError, http.StatusInternalServerError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
+			if helper.StreamStarted(c) {
+				_ = helper.SendInBandStreamError(c, info.RelayFormat, streamErr)
+			}
 			sr.Stop(streamErr)
 			return
 		}
@@ -1136,11 +1139,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		}
 	})
 
-	if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
-		return nil, preOutputErr
-	}
 	if streamErr != nil {
 		return nil, streamErr
+	}
+	if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
+		return nil, preOutputErr
 	}
 	if !helper.ShouldFinalizeStream(info) {
 		FinalizeClaudeUsage(c, info, claudeInfo)
@@ -1154,7 +1157,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
-	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && claudeError.Type != "" {
+	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && (claudeError.Type != "" || claudeError.Code != nil) {
 		return types.WithClaudeError(*claudeError, http.StatusInternalServerError)
 	}
 	maybeMarkClaudeRefusal(c, claudeResponse.StopReason)

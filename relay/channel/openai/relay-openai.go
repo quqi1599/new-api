@@ -125,6 +125,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var terminalObserver responsesUsageEstimate
 	var terminalFailure *types.NewAPIError
 	var deliveryFailure *types.NewAPIError
+	metadataOnlyStream := true
 	var streamItems []string // store stream items
 	var lastStreamData string
 	var secondLastStreamData string // 存储倒数第二个stream data，用于音频模型
@@ -170,6 +171,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		if !sr.Accept() {
 			return
 		}
+		metadataOnlyStream = metadataOnlyStream && chatStreamMetadataOnly(parsedEvent)
 		terminalObserver.observeChatTerminal(info, data, &terminalUsage)
 		// Retain the current accepted frame before flushing the prior buffered
 		// one. A downstream failure must not discard usage that already arrived.
@@ -193,6 +195,12 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	})
 	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
+		if terminalFailure != nil {
+			if helper.StreamStarted(c) {
+				_ = helper.SendInBandStreamError(c, info.RelayFormat, terminalFailure)
+			}
+			return nil, terminalFailure
+		}
 		return nil, streamErr
 	}
 
@@ -235,14 +243,16 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
-	// 处理token计算
+	// Count generated text and tool output, not role-only metadata or heartbeats.
 	if err := processTokens(info.RelayMode, streamItems, &responseTextBuilder, &toolCount); err != nil {
 		logger.LogError(c, "error processing tokens: "+err.Error())
 	}
 
-	if info.IsResponsesIncomplete() || (terminalObserver.promptReported && terminalObserver.completionReported) {
+	metadataOnlyFailure := !helper.ShouldFinalizeStream(info) && metadataOnlyStream
+	if info.IsResponsesIncomplete() || metadataOnlyFailure || (terminalObserver.promptReported && terminalObserver.completionReported) {
 		// Completion and usage may arrive in different frames. Missing fields
 		// stay unknown, while an explicit upstream zero remains authoritative.
+		// A failed metadata-only stream must not charge an estimated full prompt.
 		usage = &terminalUsage
 		containStreamUsage = true
 	} else {

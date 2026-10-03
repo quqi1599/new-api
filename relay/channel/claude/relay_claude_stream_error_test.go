@@ -90,3 +90,33 @@ func newClaudeStreamErrorTestContext(relayFormat types.RelayFormat, sse string) 
 	}
 	return recorder, c, info, resp
 }
+
+func TestClaudeSafetyStreamErrorPreservesCodeBeforeAndAfterOutput(t *testing.T) {
+	for _, format := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAI, types.RelayFormatOpenAIResponses} {
+		for _, started := range []bool{false, true} {
+			sse := "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"content_policy_violation\",\"message\":\"fixture\"}}\n\n"
+			recorder, c, info, resp := newClaudeStreamErrorTestContext(format, sse)
+			if started {
+				_, _ = c.Writer.Write([]byte(": ping\n\n"))
+			}
+			var apiErr *types.NewAPIError
+			if format == types.RelayFormatOpenAIResponses {
+				_, apiErr = ClaudeResponsesStreamHandler(c, resp, info)
+			} else {
+				_, apiErr = ClaudeStreamHandler(c, resp, info)
+			}
+			require.NotNil(t, apiErr)
+			require.Equal(t, 400, apiErr.StatusCode)
+			require.Equal(t, types.ErrorCode("content_policy_violation"), apiErr.GetErrorCode())
+			require.True(t, types.IsSkipRetryError(apiErr))
+			require.False(t, types.IsChannelPenaltyAllowed(apiErr))
+			if started {
+				require.Contains(t, recorder.Body.String(), "content_policy_violation")
+			} else {
+				require.False(t, c.Writer.Written())
+			}
+			require.NotContains(t, recorder.Body.String(), "[DONE]")
+			require.NotContains(t, recorder.Body.String(), "response.completed")
+		}
+	}
+}

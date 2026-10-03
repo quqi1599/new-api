@@ -534,8 +534,9 @@ func (c *ClaudeResponse) GetClaudeError() *types.ClaudeError {
 	case *types.ClaudeError:
 		return err
 	case map[string]interface{}:
-		// 处理从JSON解析来的map结构
+		// Preserve the structured code carried by compatible providers.
 		claudeErr := &types.ClaudeError{}
+		claudeErr.Code = err["code"]
 		if errType, ok := err["type"].(string); ok {
 			claudeErr.Type = errType
 		}
