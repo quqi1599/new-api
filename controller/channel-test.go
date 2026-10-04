@@ -62,7 +62,8 @@ func normalizeChannelTestEndpoint(channel *model.Channel, modelName, endpointTyp
 	return normalized
 }
 
-func testChannel(channel *model.Channel, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(channel *model.Channel, testModel string, endpointType string, isStream bool, testModes ...string) testResult {
+	visionProbe := len(testModes) > 0 && testModes[0] == "vision"
 	tik := time.Now()
 	var unsupportedTestChannelTypes = []int{
 		constant.ChannelTypeMidjourney,
@@ -230,6 +231,11 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 	}
 
 	request := buildTestRequest(testModel, endpointType, channel, isStream)
+	if visionProbe {
+		if err := addChannelVisionProbe(request); err != nil {
+			return testResult{context: c, localErr: err}
+		}
+	}
 
 	info, err := relaycommon.GenRelayInfo(c, relayFormat, request, nil)
 
@@ -511,6 +517,11 @@ func testChannel(channel *model.Channel, testModel string, endpointType string, 
 			context:     c,
 			localErr:    bodyErr,
 			newAPIError: types.NewOpenAIError(bodyErr, types.ErrorCodeBadResponseBody, http.StatusInternalServerError),
+		}
+	}
+	if visionProbe {
+		if err := validateChannelVisionAnswer(respBody, isStream); err != nil {
+			return testResult{context: c, localErr: err}
 		}
 	}
 	info.SetEstimatePromptTokens(usage.PromptTokens)
@@ -885,8 +896,13 @@ func TestChannel(c *gin.Context) {
 	testModel := c.Query("model")
 	endpointType := c.Query("endpoint_type")
 	isStream, _ := strconv.ParseBool(c.Query("stream"))
+	testMode := c.Query("test_mode")
+	if testMode != "" && testMode != "vision" {
+		common.ApiError(c, errors.New("unsupported channel test_mode"))
+		return
+	}
 	tik := time.Now()
-	result := testChannel(channel, testModel, endpointType, isStream)
+	result := testChannel(channel, testModel, endpointType, isStream, testMode)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,

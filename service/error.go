@@ -91,6 +91,11 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.SetRetryAfter(retryAfter)
+			// An explicit payload-size rejection cannot be healed by replaying
+			// the same request across channels, even if retry ranges include 413.
+			if resp != nil && resp.StatusCode == http.StatusRequestEntityTooLarge {
+				newApiErr = types.NewError(newApiErr, newApiErr.GetErrorCode(), types.ErrOptionWithSkipRetry())
+			}
 		}
 		localAuditBlocked := resp != nil && strings.EqualFold(strings.TrimSpace(resp.Header.Get("X-CPA-Local-Guard")), "content-audit")
 		if newApiErr != nil && (localAuditBlocked || newApiErr.GetErrorCode() == types.ErrorCodeCPAContentAuditBlocked) {

@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
 )
 
 // ResponsesRequestToChatCompletionsRequest converts the subset shared by the
@@ -315,7 +317,11 @@ func setResponsesMessageContent(message *dto.Message, value any) error {
 		case "input_text", "output_text", "text":
 			media = append(media, dto.MediaContent{Type: dto.ContentTypeText, Text: common.Interface2String(part["text"])})
 		case "input_image":
-			media = append(media, dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: normalizeResponsesImageURL(part["image_url"], part["detail"])})
+			image := dto.MediaContent{Type: dto.ContentTypeImageURL, ImageUrl: normalizeResponsesImageURL(part["image_url"], part["detail"])}
+			if value := image.GetImageMedia(); value == nil || strings.TrimSpace(value.Url) == "" {
+				return invalidResponsesMedia("input_image requires a non-empty image_url; file_id images cannot be resolved on this conversion route; send an HTTPS URL or base64 data URL")
+			}
+			media = append(media, image)
 		case "input_file":
 			file := map[string]any{}
 			for _, key := range []string{"filename", "file_data", "file_id"} {
@@ -336,6 +342,10 @@ func setResponsesMessageContent(message *dto.Message, value any) error {
 	}
 	message.SetMediaContent(media)
 	return nil
+}
+
+func invalidResponsesMedia(message string) error {
+	return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeRequestFeatureUnsupported, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 }
 
 func normalizeResponsesImageURL(value any, detail any) any {

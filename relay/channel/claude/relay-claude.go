@@ -398,10 +398,13 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 					default:
 						source := mediaMessage.ToFileSource()
 						if source == nil {
-							continue
+							return nil, unsupportedClaudeMedia("image content requires a non-empty URL or inline data; unresolved media cannot be discarded")
 						}
 						base64Data, mimeType, err := service.GetBase64Data(c, source, "formatting image for Claude")
 						if err != nil {
+							if !source.IsURL() {
+								return nil, unsupportedClaudeMedia("invalid inline image encoding")
+							}
 							return nil, fmt.Errorf("get file data failed: %w", err)
 						}
 						claudeMediaMessage := dto.ClaudeMediaMessage{
@@ -414,7 +417,10 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 						} else if strings.HasPrefix(mimeType, "image/") {
 							claudeMediaMessage.Type = "image"
 						} else {
-							continue
+							return nil, unsupportedClaudeMedia("unsupported media type for Claude image content; send an image or PDF")
+						}
+						if base64Data == "" {
+							return nil, unsupportedClaudeMedia("image data is empty")
 						}
 
 						claudeMediaMessage.Source.MediaType = mimeType
@@ -459,17 +465,20 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 func convertOpenAIFileToClaudeContent(c *gin.Context, mediaMessage dto.MediaContent) (dto.ClaudeMediaMessage, bool, error) {
 	file := mediaMessage.GetFile()
 	if file == nil || file.FileData == "" {
-		return dto.ClaudeMediaMessage{}, false, nil
+		return dto.ClaudeMediaMessage{}, false, unsupportedClaudeMedia("file requires inline file_data and filename; file_id cannot be resolved on this Claude conversion route")
 	}
 
 	mimeType := inferClaudeFileMimeType(file.FileName)
 	if mimeType == "" {
-		return dto.ClaudeMediaMessage{}, false, nil
+		return dto.ClaudeMediaMessage{}, false, unsupportedClaudeMedia("file requires a supported filename extension (PDF or UTF-8 text)")
 	}
 
 	source := types.NewFileSourceFromData(file.FileData, mimeType)
 	base64Data, loadedMimeType, err := service.GetBase64Data(c, source, "formatting file for Claude")
 	if err != nil {
+		if !source.IsURL() {
+			return dto.ClaudeMediaMessage{}, false, unsupportedClaudeMedia("invalid inline file encoding")
+		}
 		return dto.ClaudeMediaMessage{}, false, fmt.Errorf("get file data failed: %w", err)
 	}
 	if loadedMimeType != "" {
@@ -493,7 +502,7 @@ func convertOpenAIFileToClaudeContent(c *gin.Context, mediaMessage dto.MediaCont
 			return dto.ClaudeMediaMessage{}, false, fmt.Errorf("decode text file failed: %s", err.Error())
 		}
 		if !utf8.Valid(decoded) {
-			return dto.ClaudeMediaMessage{}, false, nil
+			return dto.ClaudeMediaMessage{}, false, unsupportedClaudeMedia("text attachment is not valid UTF-8")
 		}
 		return dto.ClaudeMediaMessage{
 			Type: "text",
@@ -501,7 +510,11 @@ func convertOpenAIFileToClaudeContent(c *gin.Context, mediaMessage dto.MediaCont
 		}, true, nil
 	}
 
-	return dto.ClaudeMediaMessage{}, false, nil
+	return dto.ClaudeMediaMessage{}, false, unsupportedClaudeMedia("unsupported file type on this Claude conversion route; send PDF or UTF-8 text")
+}
+
+func unsupportedClaudeMedia(message string) error {
+	return types.NewErrorWithStatusCode(fmt.Errorf("%s", message), types.ErrorCodeRequestFeatureUnsupported, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 }
 
 func inferClaudeFileMimeType(fileName string) string {

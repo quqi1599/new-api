@@ -277,7 +277,7 @@ func TestBuildOpenAIStyleUsageFromClaudeUsageDefaultsAggregateCacheCreationTo5m(
 	require.Equal(t, 0, openAIUsage.ClaudeCacheCreation1hTokens)
 }
 
-func TestRequestOpenAI2ClaudeMessage_IgnoresUnsupportedFileContent(t *testing.T) {
+func TestRequestOpenAI2ClaudeMessage_RejectsUnsupportedFileContent(t *testing.T) {
 	request := dto.GeneralOpenAIRequest{
 		Model: "claude-3-5-sonnet",
 		Messages: []dto.Message{
@@ -301,15 +301,8 @@ func TestRequestOpenAI2ClaudeMessage_IgnoresUnsupportedFileContent(t *testing.T)
 	}
 
 	claudeRequest, err := RequestOpenAI2ClaudeMessage(nil, request)
-	require.NoError(t, err)
-	require.Len(t, claudeRequest.Messages, 1)
-
-	content, ok := claudeRequest.Messages[0].Content.([]dto.ClaudeMediaMessage)
-	require.True(t, ok)
-	require.Len(t, content, 1)
-	require.Equal(t, "text", content[0].Type)
-	require.NotNil(t, content[0].Text)
-	require.Equal(t, "see attachment", *content[0].Text)
+	require.ErrorContains(t, err, "unsupported file type")
+	require.Nil(t, claudeRequest)
 }
 
 func TestRequestOpenAI2ClaudeMessage_SupportsPDFFileContent(t *testing.T) {

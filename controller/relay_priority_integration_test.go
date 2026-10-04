@@ -28,7 +28,7 @@ import (
 // Drive the real Relay entrypoint rather than constructing RetryParam in the
 // test. This catches missing production wiring for exclusion-aware selection.
 func TestRelayPriorityFallbackUsesNextHealthyTier(t *testing.T) {
-	for _, outcome := range []string{"completed", "incomplete"} {
+	for _, outcome := range []string{"completed", "incomplete", "payload_too_large"} {
 		for _, cached := range []bool{false, true} {
 			name := "database"
 			if cached {
@@ -81,6 +81,11 @@ func TestRelayPriorityFallbackUsesNextHealthyTier(t *testing.T) {
 						mu.Unlock()
 						w.Header().Set("Content-Type", "application/json")
 						if priority == 100 {
+							if outcome == "payload_too_large" {
+								w.WriteHeader(http.StatusRequestEntityTooLarge)
+								_, _ = w.Write([]byte(`{"error":{"type":"request_too_large","message":"synthetic oversized image"}}`))
+								return
+							}
 							w.WriteHeader(http.StatusServiceUnavailable)
 							_, _ = w.Write([]byte(`{"error":{"message":"synthetic exhausted route","code":"auth_unavailable","type":"server_error"}}`))
 							return
@@ -122,6 +127,15 @@ func TestRelayPriorityFallbackUsesNextHealthyTier(t *testing.T) {
 				require.Nil(t, middleware.SetupContextForSelectedChannel(c, &first, "gpt-5.6-sol"))
 
 				Relay(c, types.RelayFormatOpenAIResponses)
+
+				if outcome == "payload_too_large" {
+					require.Equal(t, http.StatusRequestEntityTooLarge, recorder.Code, recorder.Body.String())
+					mu.Lock()
+					gotCalls := append([]int(nil), calls...)
+					mu.Unlock()
+					require.Equal(t, []int{100}, gotCalls)
+					return
+				}
 
 				require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 				require.Contains(t, recorder.Body.String(), `"`+outcome+`"`)

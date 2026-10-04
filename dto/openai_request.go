@@ -352,8 +352,12 @@ func (m *MediaContent) GetFile() *MessageFile {
 			return m.File.(*MessageFile)
 		}
 		if itemMap, ok := m.File.(map[string]any); ok {
+			fileName := common.Interface2String(itemMap["filename"])
+			if fileName == "" {
+				fileName = common.Interface2String(itemMap["file_name"])
+			}
 			out := &MessageFile{
-				FileName: common.Interface2String(itemMap["file_name"]),
+				FileName: fileName,
 				FileData: common.Interface2String(itemMap["file_data"]),
 				FileId:   common.Interface2String(itemMap["file_id"]),
 			}
@@ -549,6 +553,13 @@ func (m *Message) ParseContent() []MediaContent {
 		return contentList
 	}
 
+	// Backported from upstream 0ed497f066 (#7137): reconstructed messages
+	// can retain typed media while no longer carrying the parsed-content cache.
+	if content, ok := m.Content.([]MediaContent); ok {
+		m.parsedContent = content
+		return content
+	}
+
 	// 尝试解析为数组
 	//var arrayContent []map[string]interface{}
 
@@ -622,27 +633,10 @@ func (m *Message) ParseContent() []MediaContent {
 			}
 		case ContentTypeFile:
 			if fileData, ok := contentItem["file"].(map[string]interface{}); ok {
-				fileId, ok3 := fileData["file_id"].(string)
-				if ok3 {
-					contentList = append(contentList, MediaContent{
-						Type: ContentTypeFile,
-						File: &MessageFile{
-							FileId: fileId,
-						},
-					})
-				} else {
-					fileName, ok1 := fileData["filename"].(string)
-					fileDataStr, ok2 := fileData["file_data"].(string)
-					if ok1 && ok2 {
-						contentList = append(contentList, MediaContent{
-							Type: ContentTypeFile,
-							File: &MessageFile{
-								FileName: fileName,
-								FileData: fileDataStr,
-							},
-						})
-					}
-				}
+				// Preserve all fields, including incomplete attachments, so the
+				// target adaptor can reject unsupported content explicitly.
+				part := MediaContent{Type: ContentTypeFile, File: fileData}
+				contentList = append(contentList, MediaContent{Type: ContentTypeFile, File: part.GetFile()})
 			}
 		case ContentTypeVideoUrl:
 			if videoUrl, ok := contentItem["video_url"].(string); ok {
