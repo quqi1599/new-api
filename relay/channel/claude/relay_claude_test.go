@@ -2,10 +2,13 @@ package claude
 
 import (
 	"encoding/base64"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -301,7 +304,11 @@ func TestRequestOpenAI2ClaudeMessage_RejectsUnsupportedFileContent(t *testing.T)
 	}
 
 	claudeRequest, err := RequestOpenAI2ClaudeMessage(nil, request)
-	require.ErrorContains(t, err, "unsupported file type")
+	var apiErr *types.NewAPIError
+	require.True(t, errors.As(err, &apiErr))
+	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
+	require.Equal(t, types.ErrorCodeRequestFeatureUnsupported, apiErr.GetErrorCode())
+	require.True(t, types.IsSkipRetryError(apiErr))
 	require.Nil(t, claudeRequest)
 }
 
