@@ -10,16 +10,23 @@ import (
 func normalizeDeterministicUpstreamError(e *NewAPIError) {
 	code := string(e.errorCode)
 	message := e.Error()
+	status := http.StatusBadRequest
 	switch code {
 	case "1301", "content_policy_violation":
 		code = "content_policy_violation"
 		message = "上游内容安全策略拦截了本次请求。请调整相关内容后再提交；请勿原样重复尝试。"
 	case "request_feature_unsupported":
+	case "request_too_large", "image_too_large":
+		// CPA may report this inside HTTP-200 SSE after output has begun. The
+		// structured request rejection is terminal even when an adapter used 502.
+		code = "request_too_large"
+		status = http.StatusRequestEntityTooLarge
+	case "invalid_image_input":
 	default:
 		return
 	}
 	e.errorCode = ErrorCode(code)
-	e.StatusCode = http.StatusBadRequest
+	e.StatusCode = status
 	e.skipRetry = true
 	e.allowChannelPenalty = false
 	e.Err = errors.New(message)
