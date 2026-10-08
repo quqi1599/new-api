@@ -88,12 +88,7 @@ func SendInBandStreamError(c *gin.Context, relayFormat types.RelayFormat, relayE
 			Error types.OpenAIError `json:"error"`
 		}{Error: relayErr.ToOpenAIError()})
 	case types.RelayFormatOpenAIResponses:
-		public := relayErr.ToOpenAIError()
-		body, err := common.Marshal(gin.H{"type": "error", "code": public.Code, "message": public.Message, "param": public.Param})
-		if err != nil {
-			return err
-		}
-		return ResponseChunkData(c, dto.ResponsesStreamResponse{Type: "error"}, string(body))
+		return sendResponsesTerminalFailure(c, relayErr)
 	default:
 		return fmt.Errorf("unsupported relay format for in-band stream error: %s", relayFormat)
 	}
@@ -135,7 +130,11 @@ func ResponseChunkData(c *gin.Context, resp dto.ResponsesStreamResponse, data st
 	if _, err := fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", resp.Type, data); err != nil {
 		return wrapDownstreamWriteError(fmt.Errorf("write responses stream data failed: %w", err))
 	}
-	return FlushWriter(c)
+	if err := FlushWriter(c); err != nil {
+		return err
+	}
+	observeResponsesDelivery(c, resp.Type, data)
+	return nil
 }
 
 func StringData(c *gin.Context, str string) error {

@@ -107,6 +107,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// payloads, so transport-level success must not erase their business error.
 		switch streamResponse.Type {
 		case "error", "response.error", "response.failed", "response.cancelled", "response.canceled":
+			// Preserve actual usage even though failure keeps its existing refund
+			// and no-replay policy. Never estimate usage from a failed terminal.
+			usageEstimate.observe(&streamResponse, data, usage)
 			streamError := streamResponse.Error
 			if (len(streamError) == 0 || string(streamError) == "null") && streamResponse.Response != nil && streamResponse.Response.Error != nil {
 				if errorBytes, err := common.Marshal(streamResponse.Response.Error); err == nil {
@@ -135,7 +138,15 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 					types.ErrOptionWithSkipRetry(), types.ErrOptionWithChannelPenalty())
 			}
 			if helper.StreamStarted(c) {
-				_ = helper.SendInBandStreamError(c, types.RelayFormatOpenAIResponses, terminalFailure)
+				// Keep the original failed response, including its ID, sequence,
+				// usage and extensions. Codex ignores generic error-only frames.
+				if streamResponse.Type == "response.failed" {
+					if err := sendResponsesStreamData(c, streamResponse, data); err != nil {
+						helper.DownstreamStreamError(c, info, err)
+					}
+				} else if err := helper.SendInBandStreamError(c, types.RelayFormatOpenAIResponses, terminalFailure); err != nil {
+					helper.DownstreamStreamError(c, info, err)
+				}
 			}
 			if !imageCommitted {
 				imageCounter.Reset()
