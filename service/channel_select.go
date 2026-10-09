@@ -71,6 +71,7 @@ func isTokenChannelExcluded(c *gin.Context, channelId int) bool {
 func excludedChannelIdsForRequest(param *RetryParam) []int {
 	excluded := append([]int(nil), param.ExcludedChannelIds...)
 	excluded = append(excluded, param.PersistentExcludedIds...)
+	excluded = append(excluded, relayCandidateSkippedIDs(param.Ctx)...)
 	return append(excluded, tokenExcludedChannelIds(param.Ctx)...)
 }
 

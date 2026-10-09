@@ -92,6 +92,7 @@ const (
 	ErrorCodePromptBlocked                 ErrorCode = "prompt_blocked"
 	ErrorCodeAuthUnavailable               ErrorCode = "auth_unavailable"
 	ErrorCodeRequestFeatureUnsupported     ErrorCode = "request_feature_unsupported"
+	ErrorCodeGPTSamplingUnsupported        ErrorCode = "gpt_sampling_unsupported"
 	ErrorCodeCompactionRouteUnavailable    ErrorCode = "compaction_route_unavailable"
 	ErrorCodeCPAContentAuditBlocked        ErrorCode = "cpa_content_audit_blocked"
 

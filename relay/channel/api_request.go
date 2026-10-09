@@ -977,6 +977,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 	common2.ResetRelayAttemptTimeoutContext(c)
 	relayRequestStartedAt := time.Now()
+	observeAttempt := info.UpstreamAttemptObserver()
 	// Some provider adaptors build requests with their own timeout context before
 	// delegating here. Preserve that deadline/value context while also binding it
 	// to the inbound client lifetime. The combined context stays alive until the
@@ -1032,9 +1033,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 				if observedTimer == nil || !observedTimer.Expired() || c.Request.Context().Err() != nil {
 					return
 				}
-				setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
-				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "non_stream_total")
-				common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, observedTimeout)
+				observeAttempt(func() {
+					setRelayCancelOrigin(c, constant2.RelayCancelOriginGatewayDeadline)
+					common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "non_stream_total")
+					common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutSeconds, observedTimeout)
+				})
 			})
 		}
 		req = req.WithContext(combinedCtx)
@@ -1065,6 +1068,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// and hide an upstream first-event timeout from the controller.
 
 	var requestMayHaveBeenSent atomic.Bool
+	markAttemptAccepted := info.UpstreamRequestAcceptanceMarker()
 	var transportPhase atomic.Int32
 	const (
 		transportPhaseUnknown int32 = iota
@@ -1081,20 +1085,24 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		},
 		GotConn: func(httptrace.GotConnInfo) {
 			transportPhase.Store(transportPhaseUnknown)
-			common2.SetContextKey(c, constant2.ContextKeyRelayConnectedUpstream, true)
+			observeAttempt(func() {
+				common2.SetContextKey(c, constant2.ContextKeyRelayConnectedUpstream, true)
+			})
 		},
 		WroteRequest: func(wroteInfo httptrace.WroteRequestInfo) {
-			if wroteInfo.Err == nil {
-				common2.SetContextKey(c, constant2.ContextKeyRelayRequestWritten, true)
-			} else {
-				var writeNetErr net.Error
-				if errors.Is(wroteInfo.Err, context.DeadlineExceeded) || errors.As(wroteInfo.Err, &writeNetErr) && writeNetErr.Timeout() {
-					common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "request_write")
+			observeAttempt(func() {
+				if wroteInfo.Err == nil {
+					common2.SetContextKey(c, constant2.ContextKeyRelayRequestWritten, true)
+				} else {
+					var writeNetErr net.Error
+					if errors.Is(wroteInfo.Err, context.DeadlineExceeded) || errors.As(wroteInfo.Err, &writeNetErr) && writeNetErr.Timeout() {
+						common2.SetContextKey(c, constant2.ContextKeyRelayTimeoutPhase, "request_write")
+					}
 				}
-			}
+			})
 			requestMayHaveBeenSent.Store(true)
 			if unsafeToReplay {
-				info.MarkUpstreamRequestMayHaveBeenAccepted()
+				markAttemptAccepted()
 			}
 		},
 	}
@@ -1139,7 +1147,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	requestReachedUpstream := requestMayHaveBeenSent.Load() || resp != nil
 	unsafeRequestReachedUpstream := unsafeToReplay && requestReachedUpstream
 	if unsafeRequestReachedUpstream {
-		info.MarkUpstreamRequestMayHaveBeenAccepted()
+		markAttemptAccepted()
 	}
 	if err != nil {
 		var transportNetErr net.Error

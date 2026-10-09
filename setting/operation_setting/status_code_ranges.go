@@ -37,6 +37,8 @@ var alwaysSkipRetryCodes = map[types.ErrorCode]struct{}{
 	types.ErrorCodeBadResponseBody:           {},
 	types.ErrorCodeCPAContentAuditBlocked:    {},
 	types.ErrorCodeRequestFeatureUnsupported: {},
+	// Sampling/model incompatibility is deterministic across unchanged retries.
+	types.ErrorCodeGPTSamplingUnsupported: {},
 }
 
 func AutomaticDisableStatusCodesToString() string {

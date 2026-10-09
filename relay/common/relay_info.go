@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -165,10 +166,11 @@ type RelayInfo struct {
 	// in a type-erased reader, so net/http can still send Content-Length.
 	UpstreamRequestBodySize int64
 
-	// upstreamRequestMayHaveBeenAccepted closes the replay gate for unsafe
-	// requests. net/http can invoke ClientTrace callbacks from transport
-	// goroutines, so the marker must be concurrency-safe.
-	upstreamRequestMayHaveBeenAccepted atomic.Bool
+	// upstreamAttemptState stores an attempt generation in the high bits and
+	// its possible-acceptance flag in the low bit. A single atomic word prevents
+	// late HTTP trace callbacks from an earlier attempt marking a new attempt.
+	upstreamAttemptState         atomic.Uint64
+	upstreamAttemptObservationMu sync.Mutex
 
 	// firstValidEventDeadline is the request-scoped pre-output budget shared by
 	// every channel attempt. It is deliberately not a request Context deadline:
@@ -222,13 +224,59 @@ type RelayInfo struct {
 // upstream operation crossed the point where NewAPI can no longer prove it was
 // rejected. Retrying could duplicate generation, tools, tasks, or billing.
 func (info *RelayInfo) MarkUpstreamRequestMayHaveBeenAccepted() {
-	if info != nil {
-		info.upstreamRequestMayHaveBeenAccepted.Store(true)
-	}
+	info.UpstreamRequestAcceptanceMarker()()
 }
 
 func (info *RelayInfo) UpstreamRequestMayHaveBeenAccepted() bool {
-	return info != nil && info.upstreamRequestMayHaveBeenAccepted.Load()
+	return info != nil && info.upstreamAttemptState.Load()&1 != 0
+}
+
+// BeginUpstreamAttempt resets only transport acceptance after the controller
+// has authorized another attempt. It must never be used to reopen the replay
+// gate after output or an unknown upstream result. Request-wide progress,
+// usage, continuation ownership and total time budgets are unchanged.
+func (info *RelayInfo) BeginUpstreamAttempt() {
+	if info == nil {
+		return
+	}
+	info.upstreamAttemptObservationMu.Lock()
+	defer info.upstreamAttemptObservationMu.Unlock()
+	for {
+		previous := info.upstreamAttemptState.Load()
+		if info.upstreamAttemptState.CompareAndSwap(previous, (previous&^1)+2) {
+			return
+		}
+	}
+}
+
+// UpstreamRequestAcceptanceMarker binds asynchronous transport observations to
+// the current attempt. A marker retained by an old request cannot affect the
+// next attempt even if its callback arrives after BeginUpstreamAttempt.
+func (info *RelayInfo) UpstreamRequestAcceptanceMarker() func() {
+	if info == nil {
+		return func() {}
+	}
+	attempt := info.upstreamAttemptState.Load() &^ 1
+	return func() {
+		info.upstreamAttemptState.CompareAndSwap(attempt, attempt|1)
+	}
+}
+
+// UpstreamAttemptObserver fences asynchronous phase diagnostics as well as
+// acceptance. The callback must only record bounded local metadata; it must
+// not start another attempt or recursively invoke this observer.
+func (info *RelayInfo) UpstreamAttemptObserver() func(func()) {
+	if info == nil {
+		return func(observe func()) { observe() }
+	}
+	attempt := info.upstreamAttemptState.Load() &^ 1
+	return func(observe func()) {
+		info.upstreamAttemptObservationMu.Lock()
+		defer info.upstreamAttemptObservationMu.Unlock()
+		if info.upstreamAttemptState.Load()&^1 == attempt {
+			observe()
+		}
+	}
 }
 
 func (info *RelayInfo) SetFirstValidEventDeadline(deadline time.Time) {

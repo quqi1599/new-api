@@ -15,6 +15,8 @@ const (
 	RetryStopReasonIncomplete        = "incomplete"
 	RetryStopReasonNotRetryable      = "not_retryable"
 	RetryStopReasonOutputStarted     = "output_started"
+	RetryStopReasonUpstreamUnknown   = "upstream_outcome_unknown"
+	RetryStopReasonCandidateLimit    = "candidate_limit_exhausted"
 	RetryStopReasonAttemptsExhausted = "attempts_exhausted"
 	RetryStopReasonRoundsExhausted   = "rounds_exhausted"
 	RetryStopReasonDeadlineExceeded  = "deadline_exceeded"

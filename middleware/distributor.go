@@ -30,6 +30,12 @@ type ModelRequest struct {
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		var channel *model.Channel
+		var selectionParam *service.RetryParam
+		selectionFormat := types.RelayFormatOpenAI
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/images/") {
+			selectionFormat = types.RelayFormatOpenAIImage
+		}
+		selectionState := service.NewRelayRetryStateForRequest(c, selectionFormat, common.RetryTimes)
 		channelId, ok := common.GetContextKey(c, constant.ContextKeyTokenSpecificChannelId)
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
@@ -108,6 +114,11 @@ func Distribute() func(c *gin.Context) {
 					abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorModelNameRequired))
 					return
 				}
+				if reason := service.RelayCandidateSelectionStopReason(c, selectionState); reason != "" {
+					selectionErr := service.RelayCandidateSelectionError(c, selectionState, reason)
+					abortWithOpenAiMessage(c, selectionErr.StatusCode, selectionErr.Error(), selectionErr.GetErrorCode())
+					return
+				}
 				var selectGroup string
 				usingGroup := common.GetContextKeyString(c, constant.ContextKeyUsingGroup)
 				// check path is /pg/chat/completions
@@ -128,7 +139,7 @@ func Distribute() func(c *gin.Context) {
 					}
 				}
 
-				selectionParam := &service.RetryParam{
+				selectionParam = &service.RetryParam{
 					Ctx:                   c,
 					ModelName:             modelRequest.Model,
 					TokenGroup:            usingGroup,
@@ -215,16 +226,50 @@ func Distribute() func(c *gin.Context) {
 				}
 			}
 		}
-		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
-		if setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model); setupErr != nil {
+		for {
+			if reason := service.RelayCandidateSelectionStopReason(c, selectionState); reason != "" {
+				selectionErr := service.RelayCandidateSelectionError(c, selectionState, reason)
+				abortWithOpenAiMessage(c, selectionErr.StatusCode, selectionErr.Error(), selectionErr.GetErrorCode())
+				return
+			}
+			setupErr := SetupContextForSelectedChannel(c, channel, modelRequest.Model)
+			if setupErr == nil {
+				break
+			}
 			if channel != nil {
 				service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, modelRequest.Model)
 			}
-			abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.Error(), setupErr.GetErrorCode())
-			return
+			// Keep explicit channel/affinity constraints and every auth/group/model
+			// check above. Only a local key rejection permits another candidate.
+			if ok || selectionParam == nil || service.ShouldSkipRetryAfterChannelAffinityFailure(c) || setupErr.GetErrorCode() != types.ErrorCodeChannelNoAvailableKey {
+				abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.Error(), setupErr.GetErrorCode())
+				return
+			}
+			service.RecordRelayCandidateSkip(c, channel.Id)
+			selectionParam.AddPersistentExcludedChannel(channel.Id)
+			selectionParam.ExhaustCandidates = true
+			service.ClearChannelAffinityForRequest(c)
+			if reason := service.RelayCandidateSelectionStopReason(c, selectionState); reason != "" {
+				selectionErr := service.RelayCandidateSelectionError(c, selectionState, reason)
+				abortWithOpenAiMessage(c, selectionErr.StatusCode, selectionErr.Error(), selectionErr.GetErrorCode())
+				return
+			}
+			channel, _, err = service.CacheGetModelRoutingFirstSatisfiedChannel(selectionParam)
+			if err == nil && channel == nil {
+				channel, _, err = service.CacheGetRandomSatisfiedChannel(selectionParam)
+			}
+			if err != nil || channel == nil {
+				selectionErr := service.RelayCandidateSelectionError(c, selectionState, service.RetryStopReasonNoChannel)
+				abortWithOpenAiMessage(c, selectionErr.StatusCode, selectionErr.Error(), selectionErr.GetErrorCode())
+				return
+			}
 		}
+		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
 		c.Next()
-		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && !c.GetBool("background_relay_submitted") {
+		// A committed SSE 200 may still end in an explicit relay failure. Do not
+		// renew that binding as a success. Unmarked handlers and legitimate
+		// incomplete terminals retain the existing affinity policy.
+		if channel != nil && c.Writer != nil && c.Writer.Status() < http.StatusBadRequest && c.GetString("relay_final_outcome") != "failed" && !c.GetBool("background_relay_submitted") {
 			service.RecordChannelAffinity(c, channel.Id)
 		}
 		if channel != nil && !c.GetBool("background_relay_submitted") {
