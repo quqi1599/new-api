@@ -251,6 +251,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	retryState := service.NewRelayRetryStateForRequest(c, relayFormat, common.RetryTimes)
+	retryState.AlignGPTTextRequestBudget(c, relayInfo, relayFormat)
 	setRelayRetryDiagnostics(c, retryState)
 	lastRetryAllowed := false
 
