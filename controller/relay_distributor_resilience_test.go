@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,15 +31,20 @@ import (
 var distributorResilienceIdentity atomic.Int64
 
 type distributorResilienceFixture struct {
-	cached        bool
-	candidates    []string
-	groups        []string
-	forced        bool
-	modelDenied   bool
-	autoGroup     bool
-	canceled      bool
-	expired       bool
-	affinityCheck bool
+	cached         bool
+	candidates     []string
+	groups         []string
+	forced         bool
+	modelDenied    bool
+	autoGroup      bool
+	canceled       bool
+	expired        bool
+	affinityCheck  bool
+	bodyReader     func(io.Reader) io.Reader
+	requestContext context.Context
+	chat           bool
+	nonStream      bool
+	errorDelay     time.Duration
 }
 
 func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture) streamResilienceResult {
@@ -118,9 +124,20 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 				return
 			}
 			if kind == "error" {
+				time.Sleep(fixture.errorDelay)
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = fmt.Fprint(w, `{"error":{"code":"server_error","message":"synthetic explicit rejection"}}`)
+				return
+			}
+			if fixture.chat {
+				if fixture.nonStream {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"id":"chatcmpl_upload","object":"chat.completion","model":"gpt-5.6-sol","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic-ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				} else {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprint(w, "data: {\"id\":\"chatcmpl_upload\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthetic-ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n")
+				}
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -154,8 +171,21 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 		}
 		c.Next()
 	}, middleware.Distribute())
-	router.POST("/v1/responses", func(c *gin.Context) { Relay(c, types.RelayFormatOpenAIResponses) })
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"synthetic","stream":true}`))
+	path := "/v1/responses"
+	var format types.RelayFormat = types.RelayFormatOpenAIResponses
+	body := `{"model":"gpt-5.6-sol","input":"synthetic","stream":true}`
+	if fixture.chat {
+		path, format = "/v1/chat/completions", types.RelayFormatOpenAI
+		body = fmt.Sprintf(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"synthetic"}],"stream":%t}`, !fixture.nonStream)
+	}
+	router.POST(path, func(c *gin.Context) { Relay(c, format) })
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	if fixture.bodyReader != nil {
+		req.Body = io.NopCloser(fixture.bodyReader(req.Body))
+	}
+	if fixture.requestContext != nil {
+		req = req.WithContext(fixture.requestContext)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	key := "sk-" + token.Key
 	if fixture.forced {

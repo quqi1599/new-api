@@ -35,9 +35,10 @@ func Distribute() func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/images/") {
 			selectionFormat = types.RelayFormatOpenAIImage
 		}
-		selectionState := service.NewRelayRetryStateForRequest(c, selectionFormat, common.RetryTimes)
 		channelId, ok := common.GetContextKey(c, constant.ContextKeyTokenSpecificChannelId)
+		intakeStarted := time.Now()
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
+		c.Set("relay_request_intake_ms", time.Since(intakeStarted).Milliseconds())
 		if err != nil {
 			if common.IsBodyAdmissionError(err) {
 				abortWithOpenAiMessage(
@@ -51,6 +52,10 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		// Start the shared selection/retry budget only after receiving and parsing
+		// the upload. Slow clients must not consume it before routing can begin.
+		// An existing budget and the request context still retain their deadlines.
+		selectionState := service.NewRelayRetryStateForRequest(c, selectionFormat, common.RetryTimes)
 		tokenPolicyBanned, err := model.IsTokenProtectedChannelBanned(c.GetInt("token_id"))
 		if err != nil {
 			common.SysLog("failed to load API key policy protection state: " + err.Error())
