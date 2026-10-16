@@ -1,0 +1,18 @@
+{
+  "profile": "owned-production-cpa-new",
+  "verified_at": "2026-10-17",
+  "service": "new-api",
+  "circuit_bypass_channel_ids": [9, 141, 142, 143],
+  "cpa_new_endpoint": {
+    "scheme": "http",
+    "host": "192.168.191.54",
+    "port": 18317,
+    "path": ""
+  },
+  "cpa_new_channels": [
+    {"id": 141, "type": 14, "status": 1, "auto_ban": 0},
+    {"id": 142, "type": 1, "status": 1, "auto_ban": 0},
+    {"id": 143, "type": 1, "status": 1, "auto_ban": 0}
+  ],
+  "legacy_bypass_preserved": [9]
+}
