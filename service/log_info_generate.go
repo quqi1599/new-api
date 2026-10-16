@@ -122,9 +122,13 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	appendFinalRequestFormat(relayInfo, other)
 	appendBillingInfo(relayInfo, other)
 	appendParamOverrideInfo(relayInfo, other)
+	relayInfo.FinalizeGenerationOutcome()
 	appendStreamStatus(relayInfo, other)
 	if relayInfo != nil && relayInfo.ResponsesOutcome != nil {
 		other["responses_outcome"] = relayInfo.ResponsesOutcome
+	}
+	if relayInfo != nil && relayInfo.GenerationOutcome != nil {
+		other["generation_outcome"] = relayInfo.GenerationOutcome
 	}
 	return other
 }

@@ -155,6 +155,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			c.Set("relay_final_outcome", "failed")
+			if common.GetContextKeyString(c, constant.ContextKeyRelayCancelOrigin) == constant.RelayCancelOriginDownstreamDisconnected {
+				c.Set("relay_final_outcome", "cancelled")
+			}
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			writeRelayError(c, ws, relayFormat, newAPIError)
@@ -254,6 +257,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	retryState.AlignGPTTextRequestBudget(c, relayInfo, relayFormat)
 	setRelayRetryDiagnostics(c, retryState)
 	lastRetryAllowed := false
+	decodeRecoveryActive := false
 
 	for retryState.CanAttempt(c.Request.Context()) {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -305,6 +309,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 
+		if decodeRecoveryActive && !retryState.CanAttempt(c.Request.Context()) {
+			newAPIError = relayInfo.LastError
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+			break
+		}
+		if decodeRecoveryActive && !decodeRecoveryRequestSafe(c, relayInfo, relayFormat) {
+			newAPIError = relayInfo.LastError
+			retryState.StopReason = service.RetryStopReasonUpstreamUnknown
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+			break
+		}
+
 		retryState.RecordAttempt(channel.Id)
 		relayInfo.BeginUpstreamAttempt()
 		common.ResetRelayAttemptTimeoutContext(c)
@@ -343,7 +359,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if newAPIError == nil {
 			if relayInfo.ShouldRecordChannelSuccess() {
 				service.RecordChannelCircuitSuccess(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
-			} else if relayInfo.IsResponsesIncomplete() {
+			} else {
 				// The distributor only releases its initial channel. A retry may
 				// own a different half-open probe; release it without healing it.
 				service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
@@ -351,7 +367,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			relayInfo.LastError = nil
 			retryState.StopReason = service.RetryStopReasonSuccess
 			c.Set("relay_final_outcome", "completed")
-			if relayInfo.IsResponsesIncomplete() {
+			if relayInfo.GenerationOutcome != nil && (relayInfo.GenerationOutcome.State == "failed" || relayInfo.GenerationOutcome.State == "cancelled") {
+				// A settled partial stream may return no adapter error; it still
+				// must not be counted as completed or replayed after output.
+				c.Set("relay_final_outcome", relayInfo.GenerationOutcome.State)
+				retryState.StopReason = service.RetryStopReasonOutputStarted
+				if relayInfo.GenerationOutcome.State == "cancelled" {
+					retryState.StopReason = service.RetryStopReasonClientGone
+				}
+			} else if relayInfo.IsResponsesIncomplete() {
 				retryState.StopReason = service.RetryStopReasonIncomplete
 				c.Set("relay_final_outcome", "incomplete")
 			}
@@ -369,6 +393,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		sessionBlocked := shouldBanTokenFromProtectedChannels(relayInfo, newAPIError)
 
 		excludeFailedChannelForRetry(retryParam, relayInfo, channel.Id)
+		recordExhaustedGateway(retryParam, channel, newAPIError)
+		decodeRecoveryActive = decodeRecoveryActive || isDecodeRecoveryFailure(newAPIError)
+		if decodeRecoveryActive {
+			// Recovery shares the existing budget and never revives a failed entrance.
+			for failedID := range retryState.DistinctChannel {
+				retryParam.AddPersistentExcludedChannel(failedID)
+			}
+		}
 
 		policyProtectionReady := !sessionBlocked || relayInfo.TokenId > 0
 		if sessionBlocked && relayInfo.TokenId > 0 {
@@ -395,6 +427,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		_, specificChannel := c.Get("specific_channel_id")
 		canGPTFallback := gptFallback && policyProtectionReady && !specificChannel &&
 			!service.ShouldSkipRetryAfterChannelAffinityFailure(c) &&
+			(!isDecodeFailureCode(newAPIError) || isDecodeRecoveryFailure(newAPIError) && decodeRecoveryRequestSafe(c, relayInfo, relayFormat)) &&
 			canRetryGPTChannelFallback(relayInfo, relayFormat, newAPIError)
 		forceGPTFallback := sessionBlocked || gptFallback
 		if canGPTFallback {
@@ -692,6 +725,14 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 		if channel == nil {
 			return nil, types.NewError(fmt.Errorf("分组 %s 下模型 %s 的可用渠道不存在（retry）", selectGroup, info.OriginModelName), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
+		if isExhaustedGatewayCandidate(retryParam, channel) {
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, info.OriginModelName)
+			retryParam.AddPersistentExcludedChannel(channel.Id)
+			service.RecordRelayCandidateSkip(c, channel.Id)
+			c.Set("retry_candidate_skip_reason", "gateway_service_exhausted")
+			setRelayRetryDiagnostics(c, retryState)
+			continue
+		}
 
 		info.PriceData.GroupRatioInfo = helper.HandleGroupRatio(c, info)
 
@@ -739,6 +780,10 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, r
 	}
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
+	}
+	if types.IsLocalOutputFormatRouteError(openaiErr) {
+		_, specific := c.Get("specific_channel_id")
+		return retryTimes > 0 && !specific
 	}
 	if types.IsSkipRetryError(openaiErr) {
 		return false
@@ -792,6 +837,9 @@ func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
 }
 
 func relayRetryIsUnsafe(c *gin.Context, info *relaycommon.RelayInfo, relayFormat types.RelayFormat, relayErr *types.NewAPIError) bool {
+	if isDecodeFailureCode(relayErr) && (!isDecodeRecoveryFailure(relayErr) || !relayErr.HasUpstreamResponse() || !decodeRecoveryRequestSafe(c, info, relayFormat)) {
+		return true
+	}
 	if relayProgressStarted(c, info) {
 		return true
 	}

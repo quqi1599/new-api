@@ -14,8 +14,9 @@ import (
 )
 
 type ResponseFormat struct {
-	Type       string          `json:"type,omitempty"`
-	JsonSchema json.RawMessage `json:"json_schema,omitempty"`
+	Type        string                     `json:"type,omitempty"`
+	JsonSchema  json.RawMessage            `json:"json_schema,omitempty"`
+	ExtraFields map[string]json.RawMessage `json:"-"`
 }
 
 type FormatJsonSchema struct {

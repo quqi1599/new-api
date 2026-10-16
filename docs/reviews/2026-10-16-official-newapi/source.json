@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/QuantumNous/new-api",
+  "commit": "d032204733db31208f10bac118b6e683aab3bf29",
+  "official_commit_time": "2026-10-16T06:45:17Z",
+  "inspection_date": "2026-10-16",
+  "method": "GitHub read-only tarball and API; isolated synthetic tests; no Git refs modified"
+}

@@ -622,15 +622,17 @@ export const useLogsData = () => {
           value: other.request_path,
         });
       }
-      if (other?.responses_outcome) {
-        const outcome = other.responses_outcome;
+      const outcome = other?.generation_outcome?.state
+        ? other.generation_outcome
+        : other?.responses_outcome;
+      if (outcome?.state) {
         expandDataLocal.push({
           key: t('响应终态'),
           value: [outcome.state, outcome.reason].filter(Boolean).join(' / '),
         });
         expandDataLocal.push({
           key: t('用量来源'),
-          value: `input: ${outcome.input_tokens_source}; output: ${outcome.output_tokens_source}`,
+          value: `input: ${outcome.input_tokens_source || 'unreported'}; output: ${outcome.output_tokens_source || 'unreported'}`,
         });
       }
       if (isAdminUser && other?.stream_status) {

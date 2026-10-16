@@ -35,44 +35,6 @@ func normalizeChatImageURLToString(v any) any {
 	}
 }
 
-func convertChatResponseFormatToResponsesText(reqFormat *dto.ResponseFormat) json.RawMessage {
-	if reqFormat == nil || strings.TrimSpace(reqFormat.Type) == "" {
-		return nil
-	}
-
-	format := map[string]any{
-		"type": reqFormat.Type,
-	}
-
-	if reqFormat.Type == "json_schema" && len(reqFormat.JsonSchema) > 0 {
-		var chatSchema map[string]any
-		if err := common.Unmarshal(reqFormat.JsonSchema, &chatSchema); err == nil {
-			for key, value := range chatSchema {
-				if key == "type" {
-					continue
-				}
-				format[key] = value
-			}
-
-			if nested, ok := format["json_schema"].(map[string]any); ok {
-				for key, value := range nested {
-					if _, exists := format[key]; !exists {
-						format[key] = value
-					}
-				}
-				delete(format, "json_schema")
-			}
-		} else {
-			format["json_schema"] = reqFormat.JsonSchema
-		}
-	}
-
-	textRaw, _ := common.Marshal(map[string]any{
-		"format": format,
-	})
-	return textRaw
-}
-
 func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*dto.OpenAIResponsesRequest, error) {
 	if req == nil {
 		return nil, errors.New("request is nil")
@@ -363,7 +325,10 @@ func ChatCompletionsRequestToResponsesRequest(req *dto.GeneralOpenAIRequest) (*d
 		}
 	}
 
-	textRaw := convertChatResponseFormatToResponsesText(req.ResponseFormat)
+	textRaw, formatErr := chatFormatToResponsesText(req.ResponseFormat, req.Verbosity)
+	if formatErr != nil {
+		return nil, formatErr
+	}
 
 	maxOutputTokens := lo.FromPtrOr(req.MaxTokens, uint(0))
 	maxCompletionTokens := lo.FromPtrOr(req.MaxCompletionTokens, uint(0))

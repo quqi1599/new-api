@@ -30,10 +30,12 @@ type cpaStateRelayResult struct {
 	alternateCalls int32
 }
 
+type cpaStateAliasOptions struct{ cached, claude, recoverChat bool }
+
 // Exercise Relay, real HTTP decoding and the selector across three rounds.
 // Both endpoints are local synthetic servers; the alternate represents an
 // unrelated state owner that must never receive rejected opaque history.
-func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream bool) cpaStateRelayResult {
+func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream bool, sameServiceAlias ...cpaStateAliasOptions) cpaStateRelayResult {
 	t.Helper()
 	setupCPAContractChannels(t, alternate)
 	require.NoError(t, model.DB.AutoMigrate(&model.Log{}, &model.Token{}))
@@ -72,7 +74,10 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 	for i := 0; i < count; i++ {
 		isOwner := i == 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var request dto.OpenAIResponsesRequest
+			var request struct {
+				dto.OpenAIResponsesRequest
+				ResponseFormat *dto.ResponseFormat `json:"response_format"`
+			}
 			if err := common.DecodeJson(r.Body, &request); err != nil {
 				t.Errorf("decode synthetic request: %v", err)
 			}
@@ -82,12 +87,25 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 			w.Header().Set("Content-Type", "application/json")
 			if isOwner {
 				ownerCalls.Add(1)
+				if len(sameServiceAlias) > 0 && sameServiceAlias[0].recoverChat && r.URL.Path == "/v1/chat/completions" {
+					require.NotNil(t, request.ResponseFormat)
+					require.Equal(t, "json_object", request.ResponseFormat.Type)
+					_, _ = fmt.Fprint(w, `{"id":"chatcmpl_synthetic","object":"chat.completion","model":"gpt-6.1-sol","choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+					return
+				}
 				w.WriteHeader(status)
-				_, _ = fmt.Fprintf(w, `{"error":{"type":"invalid_request_error","code":%q,"message":"synthetic state_owner_unavailable mention"}}`, code)
+				if r.URL.Path == "/v1/messages" {
+					_, _ = fmt.Fprintf(w, `{"type":"error","error":{"type":"api_error","code":%q,"message":"synthetic state_owner_unavailable mention"},"request_id":"req_synthetic"}`, code)
+				} else {
+					_, _ = fmt.Fprintf(w, `{"error":{"type":"cpa_error","code":%q,"message":"synthetic state_owner_unavailable mention","request_id":"req_synthetic"}}`, code)
+				}
 				return
 			}
 			alternateCalls.Add(1)
 			response := `{"id":"resp_synthetic","object":"response","status":"completed","model":"gpt-6.1-sol","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`
+			if r.URL.Path == "/v1/chat/completions" {
+				response = `{"id":"chatcmpl_synthetic","object":"chat.completion","model":"gpt-6.1-sol","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`
+			}
 			if stream {
 				w.Header().Set("Content-Type", "text/event-stream")
 				_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":%s}\n\n", response)
@@ -102,22 +120,49 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 		channel := model.Channel{Id: id, Type: constant.ChannelTypeOpenAI, Status: common.ChannelStatusEnabled,
 			Group: "default", Models: "gpt-5.5", ModelMapping: &mapping, Priority: &priority,
 			BaseURL: &server.URL, Key: "synthetic-key", AutoBan: common.GetPointer(0)}
+		if isOwner && len(sameServiceAlias) > 0 && sameServiceAlias[0].claude {
+			channel.Type = constant.ChannelTypeAnthropic
+		}
 		require.NoError(t, model.DB.Save(&channel).Error)
 		require.NoError(t, model.DB.Save(&model.Ability{Group: "default", Model: "gpt-5.5", ChannelId: id, Enabled: true, Priority: &priority}).Error)
 		if isOwner {
 			first = channel
 		}
 	}
+	if len(sameServiceAlias) > 0 {
+		alias := first
+		alias.Id = 19
+		if sameServiceAlias[0].claude {
+			alias.Type = constant.ChannelTypeOpenAI
+		}
+		priority := int64(95)
+		alias.Priority = &priority
+		require.NoError(t, model.DB.Save(&alias).Error)
+		require.NoError(t, model.DB.Save(&model.Ability{Group: "default", Model: "gpt-5.5", ChannelId: alias.Id, Enabled: true, Priority: &priority}).Error)
+		common.MemoryCacheEnabled = sameServiceAlias[0].cached
+		if common.MemoryCacheEnabled {
+			model.InitChannelCache()
+		}
+	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(fmt.Sprintf(`{"model":"gpt-5.5","previous_response_id":%q,"input":"synthetic","stream":%t}`, previousID, stream)))
+	format := types.RelayFormat(types.RelayFormatOpenAIResponses)
+	if len(sameServiceAlias) > 0 && sameServiceAlias[0].claude {
+		format = types.RelayFormatClaude
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"synthetic"}],"max_tokens":16}`))
+		if sameServiceAlias[0].recoverChat {
+			format = types.RelayFormatOpenAI
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"synthetic"}],"response_format":{"type":"json_object"}}`))
+		}
+	}
 	c.Request.Header.Set("Content-Type", "application/json")
 	common.SetContextKey(c, constant.ContextKeyUsingGroup, "default")
 	common.SetContextKey(c, constant.ContextKeyUserGroup, "default")
 	common.SetContextKey(c, constant.ContextKeyTokenGroup, "default")
 	common.SetContextKey(c, constant.ContextKeyUserSetting, dto.UserSetting{AcceptUnsetRatioModel: true})
 	require.Nil(t, middleware.SetupContextForSelectedChannel(c, &first, "gpt-5.5"))
-	Relay(c, types.RelayFormatOpenAIResponses)
+	Relay(c, format)
 	return cpaStateRelayResult{c, recorder, ownerCalls.Load(), alternateCalls.Load()}
 }
 

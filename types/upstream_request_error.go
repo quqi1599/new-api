@@ -12,12 +12,24 @@ func normalizeDeterministicUpstreamError(e *NewAPIError) {
 	message := e.Error()
 	status := http.StatusBadRequest
 	switch code {
+	case "upstream_invalid_request":
+		// CPA has already classified this exact HTTP 422 as request-scoped.
+		// Preserve its public envelope; another protocol entrance cannot repair
+		// the same rejected request. Other statuses and local errors are distinct.
+		if e.StatusCode == http.StatusUnprocessableEntity && e.HasUpstreamResponse() {
+			e.skipRetry = true
+			e.allowChannelPenalty = false
+		}
+		return
 	case "output_invalid_json", "output_schema_mismatch", "output_not_json_object", "output_stream_mismatch", "output_unknown_tool":
 		// CPA's exact 502 output-validation contract describes a result that
 		// was already generated. A different channel would generate again, and
 		// request-scoped validation is not evidence of whole-channel failure.
 		// Preserve the upstream status, machine code and original explanation.
-		if e.StatusCode == http.StatusBadGateway {
+		// Native Claude stream adapters represent these in-band errors as 500.
+		// That mapping does not establish the same contract for OpenAI HTTP 500s.
+		if e.StatusCode == http.StatusBadGateway ||
+			e.StatusCode == http.StatusInternalServerError && e.errorType == ErrorTypeClaudeError {
 			e.skipRetry = true
 			e.allowChannelPenalty = false
 		}

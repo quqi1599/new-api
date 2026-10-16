@@ -1,0 +1,19 @@
+package claude
+import (
+ "net/http/httptest"
+ "testing"
+ "github.com/QuantumNous/new-api/relaykit/dto"
+ "github.com/QuantumNous/new-api/relaykit/types"
+ relaycommon "github.com/QuantumNous/new-api/relay/common"
+ "github.com/gin-gonic/gin"
+)
+func TestAuditOfficialClaudeMaxTokensOutcome(t *testing.T) {
+ c,_:=gin.CreateTestContext(httptest.NewRecorder())
+ c.Request=httptest.NewRequest("POST","/v1/messages",nil)
+ info:=&relaycommon.RelayInfo{RelayFormat:types.RelayFormatClaude,IsStream:true,StreamStatus:relaycommon.NewStreamStatus(),ChannelMeta:&relaycommon.ChannelMeta{UpstreamModelName:"claude-test"}}
+ ci:=&ClaudeResponseInfo{Usage:&dto.Usage{}}
+ for _,data:=range []string{`{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":5}}`,`{"type":"message_stop"}`} {
+  if err:=HandleStreamResponseData(c,info,ci,data);err!=nil{t.Fatal(err)}
+ }
+ if got:=info.StreamStatus.ResponseOutcome();got!="incomplete"{t.Fatalf("Claude max_tokens protocol outcome: got %q, want incomplete",got)}
+}

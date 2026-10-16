@@ -1,0 +1,31 @@
+package relayconvert
+import (
+ "context"
+ "encoding/json"
+ "testing"
+ "github.com/QuantumNous/new-api/relaykit/dto"
+ "github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
+ "github.com/QuantumNous/new-api/relaykit/relayconvert/kitutil"
+ "github.com/QuantumNous/new-api/relaykit/types"
+ "github.com/tidwall/gjson"
+)
+const auditSchema = `{"type":"object","properties":{"n":{"const":9007199254740993}},"additionalProperties":false}`
+func TestAuditOfficialSchemaConversions(t *testing.T) {
+ maxTokens:=uint(32)
+ chat := &dto.GeneralOpenAIRequest{MaxTokens:&maxTokens,Model:"claude-test", Messages:[]dto.Message{{Role:"user",Content:"synthetic"}},ResponseFormat:&dto.ResponseFormat{Type:"json_schema",JsonSchema:json.RawMessage(`{"name":"result","strict":true,"schema":`+auditSchema+`}`)}}
+ responses := &dto.OpenAIResponsesRequest{Model:"claude-test",Input:json.RawMessage(`"synthetic"`),Text:json.RawMessage(`{"format":{"type":"json_schema","name":"result","strict":true,"schema":`+auditSchema+`}}`)}
+ messages := &dto.ClaudeRequest{Model:"claude-test",Messages:[]dto.ClaudeMessage{{Role:"user",Content:"synthetic"}},OutputConfig:json.RawMessage(`{"format":{"type":"json_schema","schema":`+auditSchema+`}}`)}
+ cases:=[]struct{name string;input any;target types.RelayFormat;path string}{
+ {"chat_to_responses",chat,types.RelayFormatOpenAIResponses,"text.format.schema.properties.n.const"},
+ {"responses_to_chat",responses,types.RelayFormatOpenAI,"response_format.json_schema.schema.properties.n.const"},
+ {"chat_to_claude",chat,types.RelayFormatClaude,"output_config.format.schema.properties.n.const"},
+ {"claude_to_chat",messages,types.RelayFormatOpenAI,"response_format.json_schema.schema.properties.n.const"},
+ }
+ for _,tc:=range cases{t.Run(tc.name,func(t *testing.T){
+  result,err:=ConvertRequest(context.Background(),&convmeta.Values{},tc.target,tc.input)
+  if err!=nil{t.Fatal(err)}
+  data,err:=kitutil.Marshal(result.Value);if err!=nil{t.Fatal(err)}
+  got:=gjson.GetBytes(data,tc.path).Raw
+  if got!="9007199254740993"{t.Fatalf("schema integer at %s: got %q, want exact 9007199254740993",tc.path,got)}
+ })}
+}

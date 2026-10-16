@@ -1,0 +1,13 @@
+// Captured from the temporary Go overlay used on 2026-10-16.
+// This test failed against the candidate input-IMAGE mapper, which was withdrawn.
+// Saved as .txt so it is evidence, not an active regression that locks in an omission.
+func TestReviewGeminiImageCacheOverlap(t *testing.T) {
+    usage := buildUsageFromGeminiMetadata(dto.GeminiUsageMetadata{
+        PromptTokenCount: 130, CachedContentTokenCount: 25,
+        PromptTokensDetails: []dto.GeminiPromptTokensDetails{{Modality:"IMAGE", TokenCount:115}, {Modality:"TEXT", TokenCount:15}},
+    }, 0)
+    params := service.BuildTieredTokenParams(&usage, false, map[string]bool{"img":true,"cr":true})
+    if params.P+params.Img+params.CR != float64(usage.PromptTokens) {
+        t.Fatalf("overlap counted twice: prompt=%d P=%v Img=%v CR=%v sum=%v", usage.PromptTokens, params.P, params.Img, params.CR, params.P+params.Img+params.CR)
+    }
+}

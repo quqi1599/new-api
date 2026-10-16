@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/service"
@@ -115,10 +116,24 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	}
 
 	usage, newAPIError := adaptor.DoResponse(c, httpResp, info)
+	if count, known := openai.ConfirmedImageCount(c); known {
+		relaycommon.SetImageBillingOutcome(c, count, newAPIError != nil)
+	}
 	if newAPIError != nil {
 		// reset status code 重置状态码
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
-		return newAPIError
+		_, imageCountKnown := openai.ConfirmedImageCount(c)
+		imageUsage, validUsage := usage.(*dto.Usage)
+		confirmedImageFailure := imageCountKnown && validUsage && imageUsage != nil &&
+			info.PartialStreamError == newAPIError && types.IsSkipRetryError(newAPIError)
+		if !canSettlePartialStreamUsage(c, info, usage, newAPIError) && !confirmedImageFailure {
+			return newAPIError
+		}
+	}
+	imageUsage, ok := usage.(*dto.Usage)
+	if !ok || imageUsage == nil {
+		return types.NewErrorWithStatusCode(fmt.Errorf("image adaptor returned no usage"), types.ErrorCodeBadResponseBody,
+			http.StatusBadGateway, types.ErrOptionWithSkipRetry())
 	}
 
 	imageN := uint(1)
@@ -126,11 +141,13 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		imageN = *request.N
 	}
 
-	if usage.(*dto.Usage).TotalTokens == 0 {
-		usage.(*dto.Usage).TotalTokens = 1
+	_, confirmedCountKnown := openai.ConfirmedImageCount(c)
+	legacyUsageFallback := !openai.ImageUsageReported(c) && (!info.PriceData.UsePrice || !confirmedCountKnown)
+	if newAPIError == nil && legacyUsageFallback && imageUsage.TotalTokens == 0 {
+		imageUsage.TotalTokens = 1
 	}
-	if usage.(*dto.Usage).PromptTokens == 0 {
-		usage.(*dto.Usage).PromptTokens = 1
+	if newAPIError == nil && legacyUsageFallback && imageUsage.PromptTokens == 0 {
+		imageUsage.PromptTokens = 1
 	}
 
 	quality := request.Quality
@@ -146,10 +163,12 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if len(quality) > 0 {
 		logContent = append(logContent, fmt.Sprintf("品质 %s", quality))
 	}
-	if imageN > 0 {
+	if completedCount, known := openai.ConfirmedImageCount(c); known {
+		logContent = append(logContent, fmt.Sprintf("请求数量 %d，已完成数量 %d", imageN, completedCount))
+	} else if imageN > 0 {
 		logContent = append(logContent, fmt.Sprintf("生成数量 %d", imageN))
 	}
 
-	service.PostTextConsumeQuota(c, info, usage.(*dto.Usage), logContent)
-	return nil
+	service.PostTextConsumeQuota(c, info, imageUsage, logContent)
+	return newAPIError
 }

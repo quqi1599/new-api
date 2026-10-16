@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/types"
 
@@ -55,6 +56,9 @@ type textQuotaSummary struct {
 	ImageGenerationCallPrice float64
 	ToolCallSurchargeQuota   decimal.Decimal
 	ToolSurchargeItems       []ToolSurchargeItem
+	FixedImageBilling        bool
+	CompletedImageCount      int
+	BillableImageCount       float64
 }
 
 type ToolSurchargeItem struct {
@@ -68,7 +72,8 @@ type ToolSurchargeItem struct {
 }
 
 func (summary textQuotaSummary) hasBillableUsage() bool {
-	return summary.TotalTokens > 0 || !summary.ToolCallSurchargeQuota.IsZero()
+	return summary.TotalTokens > 0 || !summary.ToolCallSurchargeQuota.IsZero() ||
+		(summary.FixedImageBilling && summary.BillableImageCount > 0)
 }
 
 func cacheWriteTokensTotal(summary textQuotaSummary) int {
@@ -221,6 +226,22 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 		UsageSemantic:        usageSemanticFromUsage(relayInfo, usage),
 	}
 	summary.IsClaudeUsageSemantic = summary.UsageSemantic == "anthropic"
+	imageEndpoint := relayInfo.RelayMode == relayconstant.RelayModeImagesGenerations || relayInfo.RelayMode == relayconstant.RelayModeImagesEdits
+	tieredBilling := relayInfo.TieredBillingSnapshot != nil && relayInfo.TieredBillingSnapshot.BillingMode == "tiered_expr"
+	if relayInfo.PriceData.UsePrice && imageEndpoint && !tieredBilling {
+		if outcome, known := relaycommon.GetImageBillingOutcome(ctx); known {
+			summary.FixedImageBilling = true
+			summary.CompletedImageCount = outcome.CompletedImages
+			summary.BillableImageCount = float64(outcome.CompletedImages)
+			if !outcome.Failed && outcome.CompletedImages > 0 {
+				// Successful requests keep their existing requested/adaptor-adjusted n.
+				summary.BillableImageCount = 1
+				if n, present := relayInfo.PriceData.OtherRatios()["n"]; present {
+					summary.BillableImageCount = n
+				}
+			}
+		}
+	}
 
 	if usage == nil {
 		usage = &dto.Usage{
@@ -336,14 +357,28 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	} else {
 		quotaCalculateDecimal := dModelPrice.Mul(dQuotaPerUnit).Mul(dGroupRatio)
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(audioInputQuota)
-		quotaCalculateDecimal = relayInfo.PriceData.ApplyOtherRatiosToDecimal(quotaCalculateDecimal)
+		if summary.FixedImageBilling {
+			// Replace only this request's count. Unit prices and shared positive-only
+			// multipliers stay unchanged, including when no image completed.
+			quotaCalculateDecimal = quotaCalculateDecimal.Mul(decimal.NewFromFloat(summary.BillableImageCount))
+			for name, multiplier := range relayInfo.PriceData.OtherRatios() {
+				if name != "n" {
+					quotaCalculateDecimal = quotaCalculateDecimal.Mul(decimal.NewFromFloat(multiplier))
+				}
+			}
+		} else {
+			quotaCalculateDecimal = relayInfo.PriceData.ApplyOtherRatiosToDecimal(quotaCalculateDecimal)
+		}
 		quotaCalculateDecimal = quotaCalculateDecimal.Add(summary.ToolCallSurchargeQuota)
 		quota, clamp := common.QuotaFromDecimalChecked(quotaCalculateDecimal)
 		summary.Quota = quota
 		noteQuotaClamp(relayInfo, clamp)
 	}
 
-	if !summary.hasBillableUsage() {
+	if summary.FixedImageBilling && summary.BillableImageCount == 0 {
+		// Reported tokens from previews do not create a fixed per-image charge.
+		summary.Quota = 0
+	} else if !summary.hasBillableUsage() {
 		summary.Quota = 0
 	} else if !ratio.IsZero() && summary.Quota == 0 {
 		summary.Quota = 1
@@ -398,6 +433,8 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	if !summary.hasBillableUsage() {
 		switch {
+		case summary.FixedImageBilling && summary.CompletedImageCount == 0:
+			extraContent = append(extraContent, "未确认完整图片，按张计费为零")
 		case relayInfo.ResponsesOutcome != nil && relayInfo.ResponsesOutcome.InputTokensSource == "reported" && relayInfo.ResponsesOutcome.OutputTokensSource == "reported":
 			extraContent = append(extraContent, "上游实报用量为零")
 		case relayInfo.IsResponsesIncomplete():
@@ -438,6 +475,11 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		other["usage_semantic"] = "anthropic"
 	} else {
 		other = GenerateTextOtherInfo(ctx, relayInfo, summary.ModelRatio, summary.GroupRatio, summary.CompletionRatio, summary.CacheTokens, summary.CacheRatio, summary.ModelPrice, relayInfo.PriceData.GroupRatioInfo.GroupSpecialRatio)
+	}
+	if summary.FixedImageBilling {
+		other["image_billing_count"] = summary.BillableImageCount
+		other["image_completed_count"] = summary.CompletedImageCount
+		other["image_billing_unit"] = "image"
 	}
 	if adminRejectReason != "" {
 		other["reject_reason"] = adminRejectReason
