@@ -91,6 +91,26 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.SetRetryAfter(retryAfter)
+			if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+				// Only the paired, bounded CPA contract establishes that retrying
+				// this gateway entrance would replay an already-finished budget.
+				// Ordinary 429/5xx responses keep their existing fallback policy.
+				scopes := resp.Header.Values("X-CPA-Retry-Scope")
+				attempts := resp.Header.Values("X-CPA-Retry-Attempts")
+				if len(scopes) == 1 && strings.TrimSpace(scopes[0]) == "gateway" && len(attempts) == 1 {
+					value := strings.TrimSpace(attempts[0])
+					if len(value) == 1 && value[0] >= '1' && value[0] <= '8' {
+						if !newApiErr.HasUpstreamResponse() {
+							// A truncated error body must not erase the already-received
+							// explicit rejection and completed retry budget. Keep the
+							// body-read error details, but retain the original HTTP status.
+							newApiErr = types.NewError(newApiErr, newApiErr.GetErrorCode(),
+								types.ErrOptionWithUpstreamResponse(), types.ErrOptionWithStatusCode(resp.StatusCode))
+						}
+						newApiErr.SetGatewayRetryAttempts(int(value[0] - '0'))
+					}
+				}
+			}
 			// An explicit payload-size rejection cannot be healed by replaying
 			// the same request across channels, even if retry ranges include 413.
 			if resp != nil && resp.StatusCode == http.StatusRequestEntityTooLarge {

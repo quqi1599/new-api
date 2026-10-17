@@ -380,19 +380,32 @@ func TestConsumeAwsResponseStreamPartialEOFEstimatesUsageWithoutDone(t *testing.
 }
 
 func TestConsumeAwsResponseStreamReturnsWriteFailureAfterSSECommitted(t *testing.T) {
-	events := make(chan bedrockruntimeTypes.ResponseStream, 1)
+	events := make(chan bedrockruntimeTypes.ResponseStream, 2)
 	events <- &bedrockruntimeTypes.ResponseStreamMemberChunk{
 		Value: bedrockruntimeTypes.PayloadPart{Bytes: []byte(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}`)},
+	}
+	events <- &bedrockruntimeTypes.ResponseStreamMemberChunk{
+		Value: bedrockruntimeTypes.PayloadPart{Bytes: []byte(`{"type":"message_stop"}`)},
 	}
 	close(events)
 	stream := &fakeAwsResponseStream{events: events}
 	c, recorder, info, claudeInfo := newAwsStreamTestContext()
 	c.Writer = &awsFailAfterWriteWriter{ResponseWriter: c.Writer, err: errors.New("downstream write failed")}
 
-	streamErr, _ := consumeAwsResponseStream(c, info, c.Request.Context(), stream, claudeInfo)
+	streamErr, usage := consumeAwsResponseStream(c, info, c.Request.Context(), stream, claudeInfo)
 
 	require.NotNil(t, streamErr, "a committed SSE response must still fail settlement when the downstream write fails")
+	require.Equal(t, 499, streamErr.StatusCode)
 	require.True(t, types.IsSkipRetryError(streamErr))
-	require.Equal(t, relaycommon.StreamEndReasonHandlerStop, info.StreamStatus.EndReason)
+	require.False(t, types.IsChannelPenaltyAllowed(streamErr), "downstream delivery failure must not penalize Bedrock")
+	// The shared Claude writer classifies the actual delivery failure before
+	// AWS stops the handler. Preserve that provenance instead of replacing it
+	// with a generic upstream handler_stop reason.
+	require.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+	require.Equal(t, constant.RelayCancelOriginDownstreamDisconnected, common.GetContextKeyString(c, constant.ContextKeyRelayCancelOrigin))
+	require.Nil(t, usage, "a first-write failure without reported usage must not fabricate billable usage")
+	require.True(t, stream.closed.Load())
+	require.Len(t, events, 1, "stop consuming immediately after the failed write; a queued terminal event must not restore success")
 	require.NotEmpty(t, recorder.Body.String())
+	require.NotContains(t, recorder.Body.String(), "[DONE]")
 }

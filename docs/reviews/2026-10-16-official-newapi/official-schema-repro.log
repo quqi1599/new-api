@@ -1,0 +1,12 @@
+--- FAIL: TestAuditOfficialSchemaConversions (0.00s)
+    --- FAIL: TestAuditOfficialSchemaConversions/chat_to_responses (0.00s)
+        audit_schema_repro_test.go:29: schema integer at text.format.schema.properties.n.const: got "9007199254740992", want exact 9007199254740993
+    --- FAIL: TestAuditOfficialSchemaConversions/responses_to_chat (0.00s)
+        audit_schema_repro_test.go:29: schema integer at response_format.json_schema.schema.properties.n.const: got "9007199254740992", want exact 9007199254740993
+    --- FAIL: TestAuditOfficialSchemaConversions/chat_to_claude (0.00s)
+        audit_schema_repro_test.go:29: schema integer at output_config.format.schema.properties.n.const: got "", want exact 9007199254740993
+    --- FAIL: TestAuditOfficialSchemaConversions/claude_to_chat (0.00s)
+        audit_schema_repro_test.go:29: schema integer at response_format.json_schema.schema.properties.n.const: got "", want exact 9007199254740993
+FAIL
+FAIL	github.com/QuantumNous/new-api/relaykit/relayconvert	0.361s
+FAIL

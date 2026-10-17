@@ -50,6 +50,11 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
 		ThinkingBudget: req.ThinkingBudget,
 		THINKING:       req.THINKING,
 	}
+	format, verbosity, formatErr := responsesTextToChatFormat(req.Text)
+	if formatErr != nil {
+		return nil, formatErr
+	}
+	out.ResponseFormat, out.Verbosity = format, verbosity
 	if req.Reasoning != nil {
 		out.ReasoningEffort = req.Reasoning.Effort
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/channel/openrouter"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/reasonmap"
+	"github.com/QuantumNous/new-api/service/openaicompat"
 	"github.com/samber/lo"
 )
 
@@ -19,6 +20,11 @@ func ClaudeToOpenAIRequest(claudeRequest dto.ClaudeRequest, info *relaycommon.Re
 		Model:       claudeRequest.Model,
 		Temperature: claudeRequest.Temperature,
 	}
+	format, formatErr := openaicompat.ClaudeOutputFormatToChat(&claudeRequest)
+	if formatErr != nil {
+		return nil, formatErr
+	}
+	openAIRequest.ResponseFormat = format
 	if claudeRequest.MaxTokens != nil {
 		openAIRequest.MaxTokens = lo.ToPtr(lo.FromPtr(claudeRequest.MaxTokens))
 	}

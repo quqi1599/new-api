@@ -206,6 +206,9 @@ type RelayInfo struct {
 
 	StreamStatus     *StreamStatus
 	ResponsesOutcome *ResponsesOutcome
+	// GenerationOutcome includes downstream delivery; ResponsesOutcome retains
+	// the upstream model terminal for log compatibility and usage settlement.
+	GenerationOutcome *ResponsesOutcome
 	// PartialStreamError marks a failed, already-started stream whose measured
 	// partial usage still follows the existing settlement policy. It is never a
 	// successful completion or permission to replay the upstream operation.

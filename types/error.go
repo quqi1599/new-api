@@ -106,17 +106,18 @@ const (
 )
 
 type NewAPIError struct {
-	Err                 error
-	RelayError          any
-	skipRetry           bool
-	allowChannelPenalty bool
-	upstreamResponded   bool
-	retryAfter          string
-	recordErrorLog      *bool
-	errorType           ErrorType
-	errorCode           ErrorCode
-	StatusCode          int
-	Metadata            json.RawMessage
+	Err                  error
+	RelayError           any
+	skipRetry            bool
+	allowChannelPenalty  bool
+	upstreamResponded    bool
+	retryAfter           string
+	gatewayRetryAttempts int
+	recordErrorLog       *bool
+	errorType            ErrorType
+	errorCode            ErrorCode
+	StatusCode           int
+	Metadata             json.RawMessage
 }
 
 // Unwrap enables errors.Is / errors.As to work with NewAPIError by exposing the underlying error.
@@ -443,6 +444,26 @@ func (e *NewAPIError) SetRetryAfter(value string) {
 		value = ""
 	}
 	e.retryAfter = value
+}
+
+// GatewayRetryAttempts is nonzero only when an explicit gateway response
+// confirms that its internal retry policy finished. It is request-local;
+// independent upstream entrances may still be tried.
+func (e *NewAPIError) GatewayRetryAttempts() int {
+	if e == nil {
+		return 0
+	}
+	return e.gatewayRetryAttempts
+}
+
+// SetGatewayRetryAttempts latches the original HTTP failure contract before
+// optional status mapping. It does not make independent-channel retry unsafe.
+func (e *NewAPIError) SetGatewayRetryAttempts(attempts int) {
+	if e == nil || !e.HasUpstreamResponse() || attempts < 1 || attempts > 8 ||
+		(e.StatusCode != http.StatusTooManyRequests && (e.StatusCode < 500 || e.StatusCode > 599)) {
+		return
+	}
+	e.gatewayRetryAttempts = attempts
 }
 
 func ErrOptionWithSkipRetry() NewAPIErrorOptions {

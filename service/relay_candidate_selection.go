@@ -88,8 +88,8 @@ func RelayCandidateSelectionError(c *gin.Context, state *RelayRetryState, reason
 		c.Set("retry_stop_reason", reason)
 		if state != nil {
 			state.StopReason = reason
-			logger.LogInfo(c, fmt.Sprintf("relay_selection_final attempts=%d stop_reason=%s elapsed_ms=%d max_elapsed_ms=%d candidate_skip_count=%d candidate_skip_limit=%d",
-				state.Attempts, reason, time.Since(state.StartedAt).Milliseconds(), state.Policy.MaxElapsed.Milliseconds(), c.GetInt("retry_candidate_skip_count"), RelayCandidateSkipLimit))
+			logger.LogInfo(c, fmt.Sprintf("relay_selection_final attempts=%d stop_reason=%s elapsed_ms=%d max_elapsed_ms=%d candidate_skip_count=%d candidate_skip_limit=%d intake_ms=%d",
+				state.Attempts, reason, time.Since(state.StartedAt).Milliseconds(), state.Policy.MaxElapsed.Milliseconds(), c.GetInt("retry_candidate_skip_count"), RelayCandidateSkipLimit, c.GetInt64("relay_request_intake_ms")))
 		}
 	}
 	return types.NewErrorWithStatusCode(errors.New(message), types.ErrorCodeGetChannelFailed, status, types.ErrOptionWithSkipRetry())

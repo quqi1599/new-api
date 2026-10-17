@@ -1,0 +1,2 @@
+go vet ./dto ./types ./service/openaicompat ./relay/channel/claude ./relay/common ./service ./controller ./relay
+exit_code=0; no diagnostics

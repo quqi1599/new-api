@@ -1,0 +1,9 @@
+[GIN-debug] [WARNING] Running in "debug" mode. Switch to "release" mode in production.
+ - using env:	export GIN_MODE=release
+ - using code:	gin.SetMode(gin.ReleaseMode)
+
+--- FAIL: TestAuditOfficialClaudeMaxTokensOutcome (0.00s)
+    audit_terminal_repro_test.go:18: Claude max_tokens protocol outcome: got "completed", want incomplete
+FAIL
+FAIL	github.com/QuantumNous/new-api/relay/channel/claude	0.661s
+FAIL

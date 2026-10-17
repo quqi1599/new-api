@@ -136,6 +136,8 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 	}
 	if maxTokens := textRequest.GetMaxTokens(); maxTokens > 0 {
 		claudeRequest.MaxTokens = common.GetPointer(maxTokens)
+	} else if textRequest.MaxTokens != nil || textRequest.MaxCompletionTokens != nil {
+		claudeRequest.MaxTokens = common.GetPointer(uint(0))
 	}
 	if textRequest.TopP != nil {
 		claudeRequest.TopP = common.GetPointer(*textRequest.TopP)
@@ -143,8 +145,8 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 	if textRequest.TopK != nil {
 		claudeRequest.TopK = common.GetPointer(*textRequest.TopK)
 	}
-	if textRequest.IsStream(nil) {
-		claudeRequest.Stream = common.GetPointer(true)
+	if textRequest.Stream != nil {
+		claudeRequest.Stream = common.GetPointer(*textRequest.Stream)
 	}
 
 	// 处理 tool_choice 和 parallel_tool_calls
@@ -155,7 +157,7 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		}
 	}
 
-	if claudeRequest.MaxTokens == nil || *claudeRequest.MaxTokens == 0 {
+	if claudeRequest.MaxTokens == nil {
 		defaultMaxTokens := uint(model_setting.GetClaudeSettings().GetDefaultMaxTokens(textRequest.Model))
 		claudeRequest.MaxTokens = &defaultMaxTokens
 	}
@@ -459,6 +461,9 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 
 	claudeRequest.Prompt = ""
 	claudeRequest.Messages = claudeMessages
+	if err := openaicompat.ApplyChatOutputFormatToClaude(textRequest.ResponseFormat, &claudeRequest); err != nil {
+		return nil, err
+	}
 	return &claudeRequest, nil
 }
 
@@ -685,12 +690,14 @@ func ResponseClaude2OpenAI(claudeResponse *dto.ClaudeResponse) *dto.OpenAITextRe
 }
 
 type ClaudeResponseInfo struct {
-	ResponseId   string
-	Created      int64
-	Model        string
-	ResponseText strings.Builder
-	Usage        *dto.Usage
-	Done         bool
+	ResponseId                      string
+	Created                         int64
+	Model                           string
+	ResponseText                    strings.Builder
+	Usage                           *dto.Usage
+	Done                            bool
+	inputReported, outputReported   bool
+	inputEstimated, outputEstimated bool
 }
 
 func cacheCreationTokensForOpenAIUsage(usage *dto.Usage) int {
@@ -927,6 +934,7 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	}
 	if info.RelayFormat == types.RelayFormatClaude {
 		FormatClaudeResponseInfo(&claudeResponse, nil, claudeInfo)
+		observeClaudeTerminal(info, claudeInfo, &claudeResponse, data)
 
 		if claudeResponse.Type == "message_start" {
 			// message_start, 获取usage
@@ -942,6 +950,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		}
 		helper.ExtendWriteDeadline(c)
 		if err := helper.ClaudeChunkData(c, claudeResponse, data); err != nil {
+			if deliveryErr := helper.DownstreamStreamError(c, info, err); deliveryErr != nil {
+				return claudeResponse.Type, deliveryErr
+			}
 			return claudeResponse.Type, types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
 	} else if info.RelayFormat == types.RelayFormatOpenAI {
@@ -950,11 +961,15 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		if !FormatClaudeResponseInfo(&claudeResponse, response, claudeInfo) {
 			return claudeResponse.Type, nil
 		}
+		observeClaudeTerminal(info, claudeInfo, &claudeResponse, data)
 
 		helper.ExtendWriteDeadline(c)
 		err = helper.ObjectData(c, response)
 		if err != nil {
 			logger.LogError(c, "send_stream_response_failed: "+err.Error())
+			if deliveryErr := helper.DownstreamStreamError(c, info, err); deliveryErr != nil {
+				return claudeResponse.Type, deliveryErr
+			}
 			return claudeResponse.Type, types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
 	}
@@ -974,7 +989,7 @@ func FinalizeClaudeUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo
 	if claudeInfo.Usage.PromptTokens == 0 {
 		//上游出错
 	}
-	if claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done {
+	if (!claudeInfo.outputReported && claudeInfo.Usage.CompletionTokens == 0 || !claudeInfo.Done) && !info.IsResponsesIncomplete() {
 		if common.DebugEnabled {
 			common.SysLog("claude response usage is not complete, maybe upstream error")
 		}
@@ -983,15 +998,18 @@ func FinalizeClaudeUsage(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo
 		if claudeInfo.Usage.CompletionTokens == 0 ||
 			(!claudeInfo.Done && fallback.CompletionTokens > claudeInfo.Usage.CompletionTokens) {
 			claudeInfo.Usage.CompletionTokens = fallback.CompletionTokens
+			claudeInfo.outputEstimated = fallback.CompletionTokens > 0
 		}
-		if claudeInfo.Usage.PromptTokens == 0 {
+		if claudeInfo.Usage.PromptTokens == 0 && !claudeInfo.inputReported {
 			claudeInfo.Usage.PromptTokens = fallback.PromptTokens
+			claudeInfo.inputEstimated = fallback.PromptTokens > 0
 		}
 		claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
 	}
 	if claudeInfo.Usage != nil {
 		claudeInfo.Usage.UsageSemantic = "anthropic"
 	}
+	recordClaudeUsageSources(info, claudeInfo)
 }
 
 func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, claudeInfo *ClaudeResponseInfo) {
@@ -1009,9 +1027,13 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 			err := helper.ObjectData(c, response)
 			if err != nil {
 				common.SysLog("send final response failed: " + err.Error())
+				helper.DownstreamStreamError(c, info, err)
+				return
 			}
 		}
-		helper.Done(c)
+		if err := helper.StringData(c, "[DONE]"); err != nil {
+			helper.DownstreamStreamError(c, info, err)
+		}
 	}
 }
 
@@ -1035,7 +1057,13 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 			sr.Done()
 		}
 	})
+	info.FinalizeGenerationOutcome()
+	recordClaudeUsageSources(info, claudeInfo)
 	if err != nil {
+		if info.PartialStreamError == err {
+			FinalizeClaudeUsage(c, info, claudeInfo)
+			return claudeInfo.Usage, err
+		}
 		return nil, err
 	}
 	if streamErr := helper.PreOutputStreamError(c, info); streamErr != nil {
@@ -1046,6 +1074,10 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		HandleStreamFinalResponse(c, info, claudeInfo)
 	} else {
 		FinalizeClaudeUsage(c, info, claudeInfo)
+	}
+	info.FinalizeGenerationOutcome()
+	if info.PartialStreamError != nil {
+		return claudeInfo.Usage, info.PartialStreamError
 	}
 	return claudeInfo.Usage, nil
 }
@@ -1075,7 +1107,10 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 			}
 			helper.ExtendWriteDeadline(c)
 			if err := helper.ResponseChunkData(c, dto.ResponsesStreamResponse{Type: event.Type}, string(data)); err != nil {
-				streamErr = types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+				streamErr = helper.DownstreamStreamError(c, info, err)
+				if streamErr == nil {
+					streamErr = types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
+				}
 				return false
 			}
 		}
@@ -1121,6 +1156,7 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		}
 		chatChunk := StreamResponseClaude2OpenAI(&claudeResponse)
 		FormatClaudeResponseInfo(&claudeResponse, chatChunk, claudeInfo)
+		observeClaudeTerminal(info, claudeInfo, &claudeResponse, data)
 		if claudeResponse.Message != nil && claudeResponse.Message.Model != "" {
 			info.UpstreamModelName = claudeResponse.Message.Model
 		}
@@ -1152,7 +1188,13 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		}
 	})
 
+	info.FinalizeGenerationOutcome()
+	recordClaudeUsageSources(info, claudeInfo)
 	if streamErr != nil {
+		if info.PartialStreamError == streamErr {
+			FinalizeClaudeUsage(c, info, claudeInfo)
+			return claudeInfo.Usage, streamErr
+		}
 		return nil, streamErr
 	}
 	if preOutputErr := helper.PreOutputStreamError(c, info); preOutputErr != nil {
@@ -1187,6 +1229,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage.ClaudeCacheCreation5mTokens = claudeResponse.Usage.GetCacheCreation5mTokens()
 		claudeInfo.Usage.ClaudeCacheCreation1hTokens = claudeResponse.Usage.GetCacheCreation1hTokens()
 	}
+	observeClaudeTerminal(info, claudeInfo, &claudeResponse, string(data))
 	var responseData []byte
 	switch info.RelayFormat {
 	case types.RelayFormatOpenAI:

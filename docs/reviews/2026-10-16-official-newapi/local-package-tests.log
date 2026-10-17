@@ -1,0 +1,8 @@
+ok  	github.com/QuantumNous/new-api/dto	0.136s
+ok  	github.com/QuantumNous/new-api/types	0.132s
+ok  	github.com/QuantumNous/new-api/service/openaicompat	0.135s
+ok  	github.com/QuantumNous/new-api/relay/channel/claude	0.458s
+ok  	github.com/QuantumNous/new-api/relay/common	0.500s
+ok  	github.com/QuantumNous/new-api/service	4.765s
+ok  	github.com/QuantumNous/new-api/controller	4.352s
+ok  	github.com/QuantumNous/new-api/relay	1.286s

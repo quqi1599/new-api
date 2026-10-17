@@ -1,0 +1,5 @@
+--- FAIL: TestReviewGeminiImageCacheOverlap (0.00s)
+    image_compat_test.go:214: overlap counted twice: prompt=130 P=0 Img=115 CR=25 sum=140
+FAIL
+FAIL	github.com/QuantumNous/new-api/relay/channel/gemini	0.591s
+FAIL
