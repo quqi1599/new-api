@@ -239,6 +239,7 @@ func buildClaudeUsageFromOpenAIUsage(oaiUsage *dto.Usage) *dto.ClaudeUsage {
 		oaiUsage.ClaudeCacheCreation1hTokens,
 	)
 	usage := &dto.ClaudeUsage{
+		ServerToolUse:            dto.MergeServerToolUsage(nil, oaiUsage.ServerToolUse),
 		InputTokens:              oaiUsage.PromptTokens,
 		OutputTokens:             oaiUsage.CompletionTokens,
 		CacheCreationInputTokens: oaiUsage.PromptTokensDetails.CachedCreationTokens,

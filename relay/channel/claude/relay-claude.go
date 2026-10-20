@@ -836,6 +836,7 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 
 		// message_start, 获取usage
 		if claudeResponse.Message != nil && claudeResponse.Message.Usage != nil {
+			claudeInfo.Usage.ServerToolUse = dto.MergeServerToolUsage(claudeInfo.Usage.ServerToolUse, claudeResponse.Message.Usage.ServerToolUse)
 			claudeInfo.Usage.PromptTokens = claudeResponse.Message.Usage.InputTokens
 			claudeInfo.Usage.UsageSemantic = "anthropic"
 			claudeInfo.Usage.PromptTokensDetails.CachedTokens = claudeResponse.Message.Usage.CacheReadInputTokens
@@ -862,6 +863,7 @@ func FormatClaudeResponseInfo(claudeResponse *dto.ClaudeResponse, oaiResponse *d
 	} else if claudeResponse.Type == "message_delta" {
 		// 最终的usage获取
 		if claudeResponse.Usage != nil {
+			claudeInfo.Usage.ServerToolUse = dto.MergeServerToolUsage(claudeInfo.Usage.ServerToolUse, claudeResponse.Usage.ServerToolUse)
 			claudeInfo.Usage.UsageSemantic = "anthropic"
 			if claudeResponse.Usage.InputTokens > 0 {
 				// 不叠加，只取最新的
@@ -903,6 +905,9 @@ func HandleStreamResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	var claudeResponse dto.ClaudeResponse
 	err := common.UnmarshalJsonStr(data, &claudeResponse)
 	if err != nil {
+		if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+			return "", invalidUsage
+		}
 		common.SysLog("error unmarshalling stream response: " + err.Error())
 		return "", types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
@@ -1060,6 +1065,13 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	info.FinalizeGenerationOutcome()
 	recordClaudeUsageSources(info, claudeInfo)
 	if err != nil {
+		if relaycommon.IsServerToolUsageResponseError(err) && helper.StreamStarted(c) {
+			// Keep only earlier reported fields; malformed accounting must not
+			// erase accepted usage or cause estimation of a failed generation.
+			claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+			info.PartialStreamError = err
+			return claudeInfo.Usage, err
+		}
 		if info.PartialStreamError == err {
 			FinalizeClaudeUsage(c, info, claudeInfo)
 			return claudeInfo.Usage, err
@@ -1124,6 +1136,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		}
 		var claudeResponse dto.ClaudeResponse
 		if err := common.UnmarshalJsonStr(data, &claudeResponse); err != nil {
+			if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+				streamErr = invalidUsage
+				sr.Stop(streamErr)
+				return
+			}
 			streamErr = types.NewError(err, types.ErrorCodeBadResponseBody)
 			sr.Stop(streamErr)
 			return
@@ -1160,9 +1177,6 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 		if claudeResponse.Message != nil && claudeResponse.Message.Model != "" {
 			info.UpstreamModelName = claudeResponse.Message.Model
 		}
-		if claudeResponse.Usage != nil && claudeResponse.Usage.ServerToolUse != nil && claudeResponse.Usage.ServerToolUse.WebSearchRequests > 0 {
-			c.Set("claude_web_search_requests", claudeResponse.Usage.ServerToolUse.WebSearchRequests)
-		}
 		if chatChunk != nil {
 			events, err := openaicompat.ChatCompletionsStreamChunkToResponsesEvents(chatChunk, state)
 			if err != nil {
@@ -1191,6 +1205,11 @@ func ClaudeResponsesStreamHandler(c *gin.Context, resp *http.Response, info *rel
 	info.FinalizeGenerationOutcome()
 	recordClaudeUsageSources(info, claudeInfo)
 	if streamErr != nil {
+		if relaycommon.IsServerToolUsageResponseError(streamErr) && helper.StreamStarted(c) {
+			claudeInfo.Usage.TotalTokens = claudeInfo.Usage.PromptTokens + claudeInfo.Usage.CompletionTokens
+			info.PartialStreamError = streamErr
+			return claudeInfo.Usage, streamErr
+		}
 		if info.PartialStreamError == streamErr {
 			FinalizeClaudeUsage(c, info, claudeInfo)
 			return claudeInfo.Usage, streamErr
@@ -1210,6 +1229,9 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 	var claudeResponse dto.ClaudeResponse
 	err := common.Unmarshal(data, &claudeResponse)
 	if err != nil {
+		if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+			return invalidUsage
+		}
 		return types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	if claudeError := claudeResponse.GetClaudeError(); claudeError != nil && (claudeError.Type != "" || claudeError.Code != nil) {
@@ -1220,6 +1242,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		claudeInfo.Usage = &dto.Usage{}
 	}
 	if claudeResponse.Usage != nil {
+		claudeInfo.Usage.ServerToolUse = dto.MergeServerToolUsage(claudeInfo.Usage.ServerToolUse, claudeResponse.Usage.ServerToolUse)
 		claudeInfo.Usage.PromptTokens = claudeResponse.Usage.InputTokens
 		claudeInfo.Usage.CompletionTokens = claudeResponse.Usage.OutputTokens
 		claudeInfo.Usage.TotalTokens = claudeResponse.Usage.InputTokens + claudeResponse.Usage.OutputTokens
@@ -1252,10 +1275,6 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 		}
 	case types.RelayFormatClaude:
 		responseData = data
-	}
-
-	if claudeResponse.Usage != nil && claudeResponse.Usage.ServerToolUse != nil && claudeResponse.Usage.ServerToolUse.WebSearchRequests > 0 {
-		c.Set("claude_web_search_requests", claudeResponse.Usage.ServerToolUse.WebSearchRequests)
 	}
 
 	service.IOCopyBytesGracefully(c, httpResp, responseData)

@@ -116,6 +116,7 @@ func UsageFromResponsesUsage(src *dto.Usage) *dto.Usage {
 	if src == nil {
 		return usage
 	}
+	usage.ServerToolUse = dto.MergeServerToolUsage(nil, src.ServerToolUse)
 	if src.InputTokens != 0 {
 		usage.PromptTokens = src.InputTokens
 		usage.InputTokens = src.InputTokens

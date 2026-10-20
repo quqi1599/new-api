@@ -116,7 +116,43 @@ func (r GeneralOpenAIRequest) MarshalJSON() ([]byte, error) {
 	if !IsQwenThinkingBudgetModel(r.Model) {
 		r.ThinkingBudget = nil
 	}
-	return common.Marshal((*Alias)(&r))
+
+	hasToolLoadingMessage := false
+	for _, message := range r.Messages {
+		if message.HasToolDeclarations() && message.Content == nil {
+			hasToolLoadingMessage = true
+			break
+		}
+	}
+	if !hasToolLoadingMessage {
+		return common.Marshal((*Alias)(&r))
+	}
+
+	// Kimi K3 dynamic tool loading: a system message that carries tools must not
+	// carry a content key at all, otherwise the upstream rejects it. Only those
+	// messages drop the key; every other message keeps emitting "content": null.
+	type toolLoadingMessage struct {
+		Message
+		Content any `json:"content,omitempty"`
+	}
+	messages := make([]json.RawMessage, 0, len(r.Messages))
+	for _, message := range r.Messages {
+		var encoded []byte
+		var err error
+		if message.HasToolDeclarations() && message.Content == nil {
+			encoded, err = common.Marshal(toolLoadingMessage{Message: message})
+		} else {
+			encoded, err = common.Marshal(message)
+		}
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, encoded)
+	}
+	return common.Marshal(struct {
+		*Alias
+		Messages []json.RawMessage `json:"messages,omitempty"`
+	}{Alias: (*Alias)(&r), Messages: messages})
 }
 
 func IsQwenThinkingBudgetModel(modelName string) bool {
@@ -160,9 +196,18 @@ func (r *GeneralOpenAIRequest) GetTokenCountMeta() *types.TokenCountMeta {
 		tokenCountMeta.MaxTokens = int(maxTokens)
 	}
 
+	var dynamicTools []ToolCallRequest
 	for _, message := range r.Messages {
 		tokenCountMeta.MessagesCount++
 		texts = append(texts, message.Role)
+		if len(message.Tools) > 0 {
+			// Kimi K3 dynamic tool loading: tools declared on a message are
+			// visible to the model and are counted like top-level tools.
+			var messageTools []ToolCallRequest
+			if err := common.Unmarshal(message.Tools, &messageTools); err == nil {
+				dynamicTools = append(dynamicTools, messageTools...)
+			}
+		}
 		if message.Content != nil {
 			if message.Name != nil {
 				tokenCountMeta.NameCount++
@@ -194,22 +239,23 @@ func (r *GeneralOpenAIRequest) GetTokenCountMeta() *types.TokenCountMeta {
 		}
 	}
 
-	if r.Tools != nil {
-		openaiTools := r.Tools
-		for _, tool := range openaiTools {
-			tokenCountMeta.ToolsCount++
-			texts = append(texts, tool.Function.Name)
-			if tool.Function.Description != "" {
-				texts = append(texts, tool.Function.Description)
-			}
-			if tool.Function.Parameters != nil {
-				texts = append(texts, fmt.Sprintf("%v", tool.Function.Parameters))
-			}
-		}
-		//toolTokens := CountTokenInput(countStr, request.Model)
-		//tkm += 8
-		//tkm += toolTokens
+	tools := r.Tools
+	if len(dynamicTools) > 0 {
+		tools = append(dynamicTools, r.Tools...)
 	}
+	for _, tool := range tools {
+		tokenCountMeta.ToolsCount++
+		texts = append(texts, tool.Function.Name)
+		if tool.Function.Description != "" {
+			texts = append(texts, tool.Function.Description)
+		}
+		if tool.Function.Parameters != nil {
+			texts = append(texts, fmt.Sprintf("%v", tool.Function.Parameters))
+		}
+	}
+	//toolTokens := CountTokenInput(countStr, request.Model)
+	//tkm += 8
+	//tkm += toolTokens
 	tokenCountMeta.CombineText = strings.Join(texts, "\n")
 	tokenCountMeta.Files = fileMeta
 	return &tokenCountMeta
@@ -299,8 +345,24 @@ type Message struct {
 	Reasoning        *string         `json:"reasoning,omitempty"`
 	ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
 	ToolCallId       string          `json:"tool_call_id,omitempty"`
-	parsedContent    []MediaContent
+	// Tools preserves Kimi K3 system-message dynamic tool declarations.
+	Tools         json.RawMessage `json:"tools,omitempty"`
+	parsedContent []MediaContent
 	//parsedStringContent *string
+}
+
+// HasToolDeclarations distinguishes active message-level tool definitions from
+// absent/null/empty arrays. Invalid shapes stay present so a converter cannot
+// silently drop them before the request validator sees them.
+func (m Message) HasToolDeclarations() bool {
+	if len(m.Tools) == 0 {
+		return false
+	}
+	var declarations []json.RawMessage
+	if common.Unmarshal(m.Tools, &declarations) == nil {
+		return len(declarations) > 0
+	}
+	return true
 }
 
 type MediaContent struct {

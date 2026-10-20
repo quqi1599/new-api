@@ -56,6 +56,7 @@ type textQuotaSummary struct {
 	ImageGenerationCallPrice float64
 	ToolCallSurchargeQuota   decimal.Decimal
 	ToolSurchargeItems       []ToolSurchargeItem
+	ReportedServerToolUse    *dto.ServerToolUsage
 	FixedImageBilling        bool
 	CompletedImageCount      int
 	BillableImageCount       float64
@@ -100,7 +101,7 @@ func isLegacyClaudeDerivedOpenAIUsage(relayInfo *relaycommon.RelayInfo, usage *d
 	return usage.ClaudeCacheCreation5mTokens > 0 || usage.ClaudeCacheCreation1hTokens > 0
 }
 
-func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, summary *textQuotaSummary) decimal.Decimal {
+func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, summary *textQuotaSummary, usage *dto.Usage) decimal.Decimal {
 	dGroupRatio := decimal.NewFromFloat(summary.GroupRatio)
 	dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 	var surcharge decimal.Decimal
@@ -119,6 +120,23 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 	if summary.ClaudeWebSearchCallCount > 0 {
 		counts[dto.BuildInToolWebSearch] += summary.ClaudeWebSearchCallCount
 	}
+	if usage != nil && usage.ServerToolUse != nil && usage.ServerToolUse.WebSearchRequests != nil && *usage.ServerToolUse.WebSearchRequests >= 0 {
+		// The final upstream snapshot and output items describe the same search
+		// calls. Use the reported count (including zero), never add both views.
+		summary.ReportedServerToolUse = dto.MergeServerToolUsage(nil, usage.ServerToolUse)
+		name := dto.BuildInToolWebSearch
+		if tools := relayInfo.ResponsesUsageInfo; tools != nil {
+			// Match the existing event-counter precedence, including configured
+			// preview-specific model prices when both declarations are present.
+			if _, hasPreview := tools.BuiltInTools[dto.BuildInToolWebSearchPreview]; hasPreview {
+				name = dto.BuildInToolWebSearchPreview
+			}
+		}
+		delete(counts, dto.BuildInToolWebSearch)
+		delete(counts, dto.BuildInToolWebSearchPreview)
+		counts[name] = *usage.ServerToolUse.WebSearchRequests
+		summary.ClaudeWebSearchCallCount = 0
+	}
 
 	names := make([]string, 0, len(counts))
 	for name := range counts {
@@ -128,18 +146,9 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 	for _, name := range names {
 		count := counts[name]
 		price := operation_setting.GetToolPriceForModel(name, summary.ModelName)
-		if count <= 0 || price <= 0 {
+		if count <= 0 {
 			continue
 		}
-		itemQuota := decimal.NewFromFloat(price).
-			Mul(decimal.NewFromInt(int64(count))).
-			Div(decimal.NewFromInt(1000)).
-			Mul(dGroupRatio).
-			Mul(dQuotaPerUnit)
-		surcharge = surcharge.Add(itemQuota)
-		summary.ToolSurchargeItems = append(summary.ToolSurchargeItems, ToolSurchargeItem{
-			Name: name, Count: count, Price: price, Unit: "per_1k_calls", Quota: common.QuotaFromDecimal(itemQuota),
-		})
 		switch name {
 		case dto.BuildInToolWebSearchPreview:
 			summary.WebSearchCallCount = count
@@ -151,6 +160,20 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 			summary.FileSearchCallCount = count
 			summary.FileSearchPrice = price
 		}
+		// Observation is independent of pricing; a configured free call must
+		// remain visible without creating a surcharge or changing token totals.
+		if price <= 0 {
+			continue
+		}
+		itemQuota := decimal.NewFromFloat(price).
+			Mul(decimal.NewFromInt(int64(count))).
+			Div(decimal.NewFromInt(1000)).
+			Mul(dGroupRatio).
+			Mul(dQuotaPerUnit)
+		surcharge = surcharge.Add(itemQuota)
+		summary.ToolSurchargeItems = append(summary.ToolSurchargeItems, ToolSurchargeItem{
+			Name: name, Count: count, Price: price, Unit: "per_1k_calls", Quota: common.QuotaFromDecimal(itemQuota),
+		})
 	}
 
 	imageCalls := []relaycommon.ImageGenerationCallInfo(nil)
@@ -175,6 +198,13 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 	}
 
 	return surcharge
+}
+
+func injectReportedServerToolUsage(other map[string]interface{}, summary textQuotaSummary) {
+	if summary.ReportedServerToolUse != nil {
+		other["server_tool_use"] = dto.MergeServerToolUsage(nil, summary.ReportedServerToolUse)
+		other["tool_usage_source"] = "upstream_reported"
+	}
 }
 
 // noteQuotaClamp records the first quota saturation event onto relayInfo so it
@@ -295,7 +325,7 @@ func calculateTextQuotaSummary(ctx *gin.Context, relayInfo *relaycommon.RelayInf
 	dQuotaPerUnit := decimal.NewFromFloat(common.QuotaPerUnit)
 
 	ratio := dModelRatio.Mul(dGroupRatio)
-	summary.ToolCallSurchargeQuota = calculateTextToolCallSurcharge(ctx, relayInfo, &summary)
+	summary.ToolCallSurchargeQuota = calculateTextToolCallSurcharge(ctx, relayInfo, &summary, usage)
 
 	var audioInputQuota decimal.Decimal
 	if !relayInfo.PriceData.UsePrice {
@@ -433,6 +463,8 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	if !summary.hasBillableUsage() {
 		switch {
+		case summary.ReportedServerToolUse != nil:
+			extraContent = append(extraContent, "上游工具用量已记录，本次 token 与工具计费为零")
 		case summary.FixedImageBilling && summary.CompletedImageCount == 0:
 			extraContent = append(extraContent, "未确认完整图片，按张计费为零")
 		case relayInfo.ResponsesOutcome != nil && relayInfo.ResponsesOutcome.InputTokensSource == "reported" && relayInfo.ResponsesOutcome.OutputTokensSource == "reported":
@@ -515,6 +547,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if len(summary.ToolSurchargeItems) > 0 {
 		other["tool_surcharges"] = summary.ToolSurchargeItems
 	}
+	injectReportedServerToolUsage(other, summary)
 	if summary.CacheCreationTokens > 0 {
 		other["cache_creation_tokens"] = summary.CacheCreationTokens
 		other["cache_creation_ratio"] = summary.CacheCreationRatio

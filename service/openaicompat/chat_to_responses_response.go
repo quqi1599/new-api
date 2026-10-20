@@ -100,6 +100,7 @@ func responsesUsageFromChat(src *dto.Usage) *dto.Usage {
 		return usage
 	}
 	*usage = *src
+	usage.ServerToolUse = dto.MergeServerToolUsage(nil, src.ServerToolUse)
 	if usage.InputTokens == 0 {
 		usage.InputTokens = usage.PromptTokens
 	}

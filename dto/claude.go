@@ -600,6 +600,4 @@ func (u *ClaudeUsage) GetCacheCreationTotalTokens() int {
 	return u.GetCacheCreation5mTokens() + u.GetCacheCreation1hTokens()
 }
 
-type ClaudeServerToolUse struct {
-	WebSearchRequests int `json:"web_search_requests"`
-}
+type ClaudeServerToolUse = ServerToolUsage

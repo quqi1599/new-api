@@ -74,7 +74,10 @@ func mergeChatUsageFields(usage *dto.Usage, patch map[string]json.RawMessage) {
 		return
 	}
 	for key, value := range patch {
-		if strings.HasSuffix(key, "_details") && common.GetJsonType(value) == "object" {
+		if key == "server_tool_use" && common.GetJsonType(value) == "null" {
+			continue
+		}
+		if (strings.HasSuffix(key, "_details") || key == "server_tool_use") && common.GetJsonType(value) == "object" {
 			details := map[string]json.RawMessage{}
 			_ = common.Unmarshal(fields[key], &details)
 			if details == nil {
@@ -83,6 +86,9 @@ func mergeChatUsageFields(usage *dto.Usage, patch map[string]json.RawMessage) {
 			var changes map[string]json.RawMessage
 			if common.Unmarshal(value, &changes) == nil {
 				for field, datum := range changes {
+					if key == "server_tool_use" && common.GetJsonType(datum) == "null" {
+						continue
+					}
 					details[field] = datum
 				}
 				value, _ = common.Marshal(details)
@@ -92,6 +98,9 @@ func mergeChatUsageFields(usage *dto.Usage, patch map[string]json.RawMessage) {
 	}
 	merged, err := common.Marshal(fields)
 	if err == nil {
-		_ = common.Unmarshal(merged, usage)
+		var candidate dto.Usage
+		if common.Unmarshal(merged, &candidate) == nil {
+			*usage = candidate
+		}
 	}
 }

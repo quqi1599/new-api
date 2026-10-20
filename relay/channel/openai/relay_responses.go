@@ -27,6 +27,9 @@ func OaiResponsesHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http
 	}
 	err = common.Unmarshal(responseBody, &responsesResponse)
 	if err != nil {
+		if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+			return nil, invalidUsage
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 	if oaiError := responsesResponse.GetOpenAIError(); oaiError != nil && oaiError.Type != "" {
@@ -95,6 +98,11 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		// 检查当前数据是否包含 completed 状态和 usage 信息
 		var streamResponse dto.ResponsesStreamResponse
 		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+			if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+				terminalFailure = invalidUsage
+				sr.Stop(invalidUsage)
+				return
+			}
 			logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
 			sr.Error(err)
 			return
@@ -207,6 +215,9 @@ func OaiResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp
 		}
 	})
 	if terminalFailure != nil {
+		if relaycommon.IsServerToolUsageResponseError(terminalFailure) && helper.StreamStarted(c) {
+			info.PartialStreamError = terminalFailure
+		}
 		// Protocol-native error frames may already have committed an SSE 200. The
 		// controller suppresses a trailing JSON error in that case, but it still
 		// needs a non-nil result to avoid success settlement and success logging.

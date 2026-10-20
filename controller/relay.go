@@ -783,7 +783,7 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, r
 	if service.ShouldSkipRetryAfterChannelAffinityFailure(c) {
 		return false
 	}
-	if types.IsLocalOutputFormatRouteError(openaiErr) {
+	if types.IsLocalOutputFormatRouteError(openaiErr) || types.IsLocalMessageToolsRouteError(openaiErr) {
 		_, specific := c.Get("specific_channel_id")
 		return retryTimes > 0 && !specific
 	}

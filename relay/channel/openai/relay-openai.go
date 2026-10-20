@@ -139,6 +139,20 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			return
 		}
 
+		// Check accounting before generic numeric decoding, which cannot hold
+		// oversized exponents. An invalid count must not be skipped as a frame.
+		var accounting struct {
+			Usage struct {
+				ServerToolUse *dto.ServerToolUsage `json:"server_tool_use"`
+			} `json:"usage"`
+		}
+		if err := common.UnmarshalJsonStr(data, &accounting); err != nil {
+			if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+				terminalFailure = invalidUsage
+				sr.Stop(invalidUsage)
+				return
+			}
+		}
 		var parsedEvent map[string]any
 		if err := common.UnmarshalJsonStr(data, &parsedEvent); err != nil || len(parsedEvent) == 0 {
 			if err == nil {
@@ -249,7 +263,7 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	}
 
 	metadataOnlyFailure := !helper.ShouldFinalizeStream(info) && metadataOnlyStream
-	if info.IsResponsesIncomplete() || metadataOnlyFailure || (terminalObserver.promptReported && terminalObserver.completionReported) {
+	if info.IsResponsesIncomplete() || metadataOnlyFailure || relaycommon.IsServerToolUsageResponseError(terminalFailure) || (terminalObserver.promptReported && terminalObserver.completionReported) {
 		// Completion and usage may arrive in different frames. Missing fields
 		// stay unknown, while an explicit upstream zero remains authoritative.
 		// A failed metadata-only stream must not charge an estimated full prompt.
@@ -331,6 +345,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 
 	err = common.Unmarshal(responseBody, &simpleResponse)
 	if err != nil {
+		if invalidUsage := relaycommon.ServerToolUsageResponseError(err); invalidUsage != nil {
+			return nil, invalidUsage
+		}
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusInternalServerError)
 	}
 
@@ -366,6 +383,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 			}
 		}
 		simpleResponse.Usage = dto.Usage{
+			ServerToolUse:    simpleResponse.Usage.ServerToolUse,
 			PromptTokens:     info.GetEstimatePromptTokens(),
 			CompletionTokens: completionTokens,
 			TotalTokens:      info.GetEstimatePromptTokens() + completionTokens,

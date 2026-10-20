@@ -10,7 +10,7 @@ import (
 // repeating that entrance in a later round of the same request adds no useful
 // fallback. This is request-local; it never disables a channel or a model.
 func isKnownUnavailableRouteError(err *types.NewAPIError) bool {
-	if types.IsLocalOutputFormatRouteError(err) {
+	if types.IsLocalOutputFormatRouteError(err) || types.IsLocalMessageToolsRouteError(err) {
 		return true
 	}
 	if err == nil || !err.HasUpstreamResponse() {
