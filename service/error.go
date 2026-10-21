@@ -99,7 +99,8 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 				attempts := resp.Header.Values("X-CPA-Retry-Attempts")
 				if len(scopes) == 1 && strings.TrimSpace(scopes[0]) == "gateway" && len(attempts) == 1 {
 					value := strings.TrimSpace(attempts[0])
-					if len(value) == 1 && value[0] >= '1' && value[0] <= '8' {
+					count, parseErr := strconv.Atoi(value)
+					if parseErr == nil && count > 0 && count <= types.MaxGatewayRetryAttempts && strconv.Itoa(count) == value {
 						if !newApiErr.HasUpstreamResponse() {
 							// A truncated error body must not erase the already-received
 							// explicit rejection and completed retry budget. Keep the
@@ -107,7 +108,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 							newApiErr = types.NewError(newApiErr, newApiErr.GetErrorCode(),
 								types.ErrOptionWithUpstreamResponse(), types.ErrOptionWithStatusCode(resp.StatusCode))
 						}
-						newApiErr.SetGatewayRetryAttempts(int(value[0] - '0'))
+						newApiErr.SetGatewayRetryAttempts(count)
 					}
 				}
 			}

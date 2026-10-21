@@ -35,12 +35,15 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 				name      string
 				strip     bool
 				alternate bool
+				keys      int
 				calls     int32
 				status    int
 			}{
-				{"legacy_without_contract", true, false, 18, 429},
-				{"gateway_budget_once", false, false, 3, 429},
-				{"independent_fallback", false, true, 3, 200},
+				{"legacy_without_contract", true, false, 3, 18, 429},
+				{"gateway_budget_once", false, false, 3, 3, 429},
+				{"independent_fallback", false, true, 3, 3, 200},
+				{"large_pool_once", false, false, 25, 25, 429},
+				{"large_pool_independent_fallback", false, true, 25, 25, 200},
 			} {
 				t.Run(fmt.Sprintf("claude=%t/stream=%t/%s", claude, stream, scenario.name), func(t *testing.T) {
 					var upstreamCalls atomic.Int32
@@ -52,12 +55,15 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 						_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"synthetic concurrent request limit"}}`)
 					}))
 					t.Cleanup(origin.Close)
-					base := startNestedRetryCPA(t, binary, origin.URL)
+					base := startNestedRetryCPA(t, binary, origin.URL, scenario.keys)
 					target, err := url.Parse(base)
 					require.NoError(t, err)
 					proxy := httputil.NewSingleHostReverseProxy(target)
 					proxy.ModifyResponse = func(response *http.Response) error {
-						if response.StatusCode != 429 || response.Header.Get("X-CPA-Retry-Scope") != "gateway" || response.Header.Get("X-CPA-Retry-Attempts") != "3" {
+						// A negative control may re-enter after all keys have acquired
+						// a local pause. That zero-dispatch response has no marker.
+						marked := response.Header.Get("X-CPA-Retry-Scope") != ""
+						if response.StatusCode != 429 || (!scenario.strip || marked) && (response.Header.Get("X-CPA-Retry-Scope") != "gateway" || response.Header.Get("X-CPA-Retry-Attempts") != fmt.Sprint(scenario.keys)) {
 							t.Errorf("unexpected CPA contract: status=%d scope=%q attempts=%q", response.StatusCode, response.Header.Get("X-CPA-Retry-Scope"), response.Header.Get("X-CPA-Retry-Attempts"))
 						}
 						if scenario.strip {
@@ -71,8 +77,16 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 						cached: stream, ownerHeaderOverride: `{"*":true}`,
 					})
 					require.Equal(t, scenario.status, got.response.Code, got.response.Body.String())
-					require.Equal(t, scenario.calls, upstreamCalls.Load())
-					require.Equal(t, scenario.calls/3, got.ownerCalls)
+					if scenario.strip {
+						// The regression is repeated entrance traversal, even if the
+						// key-health guard later prevents some actual dispatches.
+						require.Greater(t, upstreamCalls.Load(), int32(scenario.keys))
+						require.LessOrEqual(t, upstreamCalls.Load(), scenario.calls)
+						require.Greater(t, got.ownerCalls, int32(1))
+					} else {
+						require.Equal(t, scenario.calls, upstreamCalls.Load())
+						require.Equal(t, scenario.calls/int32(scenario.keys), got.ownerCalls)
+					}
 					if scenario.alternate {
 						require.EqualValues(t, 1, got.alternateCalls)
 					} else {
@@ -85,10 +99,10 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 	}
 }
 
-func startNestedRetryCPA(t *testing.T, binary, origin string) string {
+func startNestedRetryCPA(t *testing.T, binary, origin string, count int) string {
 	t.Helper()
 	dir := t.TempDir()
-	keys := make([]map[string]any, 3)
+	keys := make([]map[string]any, count)
 	for i := range keys {
 		keys[i] = map[string]any{"id": fmt.Sprint(i), "enabled": true, "api_key_env": fmt.Sprintf("CPA_SYNTHETIC_RETRY_KEY_%d", i)}
 	}

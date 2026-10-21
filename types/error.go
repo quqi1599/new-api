@@ -456,10 +456,14 @@ func (e *NewAPIError) GatewayRetryAttempts() int {
 	return e.gatewayRetryAttempts
 }
 
+// MaxGatewayRetryAttempts bounds only the wire metadata integer, not the
+// gateway's candidate traversal. It accommodates large API-key pools.
+const MaxGatewayRetryAttempts = 1 << 20
+
 // SetGatewayRetryAttempts latches the original HTTP failure contract before
 // optional status mapping. It does not make independent-channel retry unsafe.
 func (e *NewAPIError) SetGatewayRetryAttempts(attempts int) {
-	if e == nil || !e.HasUpstreamResponse() || attempts < 1 || attempts > 8 ||
+	if e == nil || !e.HasUpstreamResponse() || attempts < 1 || attempts > MaxGatewayRetryAttempts ||
 		(e.StatusCode != http.StatusTooManyRequests && (e.StatusCode < 500 || e.StatusCode > 599)) {
 		return
 	}
