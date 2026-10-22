@@ -460,11 +460,14 @@ func (e *NewAPIError) GatewayRetryAttempts() int {
 // gateway's candidate traversal. It accommodates large API-key pools.
 const MaxGatewayRetryAttempts = 1 << 20
 
+const GatewayRetryReasonKimiConcurrency = "kimi_concurrent_request_limit"
+
 // SetGatewayRetryAttempts latches the original HTTP failure contract before
 // optional status mapping. It does not make independent-channel retry unsafe.
-func (e *NewAPIError) SetGatewayRetryAttempts(attempts int) {
+func (e *NewAPIError) SetGatewayRetryAttempts(attempts int, reasons ...string) {
+	concurrency := len(reasons) == 1 && reasons[0] == GatewayRetryReasonKimiConcurrency
 	if e == nil || !e.HasUpstreamResponse() || attempts < 1 || attempts > MaxGatewayRetryAttempts ||
-		(e.StatusCode != http.StatusTooManyRequests && (e.StatusCode < 500 || e.StatusCode > 599)) {
+		(e.StatusCode != http.StatusTooManyRequests && (e.StatusCode < 500 || e.StatusCode > 599) && !(e.StatusCode == http.StatusForbidden && concurrency)) {
 		return
 	}
 	e.gatewayRetryAttempts = attempts

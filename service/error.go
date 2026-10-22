@@ -91,7 +91,14 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.SetRetryAfter(retryAfter)
-			if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+			reason := ""
+			if resp != nil && resp.StatusCode == http.StatusForbidden {
+				values := resp.Header.Values("X-CPA-Retry-Reason")
+				if len(values) == 1 && strings.TrimSpace(values[0]) == types.GatewayRetryReasonKimiConcurrency {
+					reason = types.GatewayRetryReasonKimiConcurrency
+				}
+			}
+			if resp != nil && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 && resp.StatusCode <= 599 || reason != "") {
 				// Only the paired, bounded CPA contract establishes that retrying
 				// this gateway entrance would replay an already-finished budget.
 				// Ordinary 429/5xx responses keep their existing fallback policy.
@@ -108,7 +115,7 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 							newApiErr = types.NewError(newApiErr, newApiErr.GetErrorCode(),
 								types.ErrOptionWithUpstreamResponse(), types.ErrOptionWithStatusCode(resp.StatusCode))
 						}
-						newApiErr.SetGatewayRetryAttempts(count)
+						newApiErr.SetGatewayRetryAttempts(count, reason)
 					}
 				}
 			}

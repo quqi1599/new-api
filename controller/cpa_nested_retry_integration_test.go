@@ -32,30 +32,42 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 	for _, claude := range []bool{false, true} {
 		for _, stream := range []bool{false, true} {
 			for _, scenario := range []struct {
-				name      string
-				strip     bool
-				alternate bool
-				keys      int
-				calls     int32
-				status    int
+				name        string
+				strip       bool
+				alternate   bool
+				keys        int
+				calls       int32
+				status      int
+				concurrency bool
 			}{
-				{"legacy_without_contract", true, false, 3, 18, 429},
-				{"gateway_budget_once", false, false, 3, 3, 429},
-				{"independent_fallback", false, true, 3, 3, 200},
-				{"large_pool_once", false, false, 25, 25, 429},
-				{"large_pool_independent_fallback", false, true, 25, 25, 200},
+				{"legacy_without_contract", true, false, 3, 18, 429, false},
+				{"gateway_budget_once", false, false, 3, 3, 429, false},
+				{"independent_fallback", false, true, 3, 3, 200, false},
+				{"large_pool_once", false, false, 25, 25, 429, false},
+				{"large_pool_independent_fallback", false, true, 25, 25, 200, false},
+				{"concurrency_without_contract", true, false, 3, 18, 403, true},
+				{"concurrency_budget_once", false, false, 3, 3, 403, true},
+				{"concurrency_independent_fallback", false, true, 3, 3, 200, true},
 			} {
 				t.Run(fmt.Sprintf("claude=%t/stream=%t/%s", claude, stream, scenario.name), func(t *testing.T) {
+					upstreamStatus, errorCode, compatibility := 429, "rate_limit_exceeded", "generic"
+					if scenario.concurrency {
+						upstreamStatus, errorCode, compatibility = 403, "concurrent_request_limit", "kimi"
+					}
 					var upstreamCalls atomic.Int32
 					origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						upstreamCalls.Add(1)
 						_, _ = io.Copy(io.Discard, r.Body)
 						w.Header().Set("Content-Type", "application/json")
-						w.WriteHeader(http.StatusTooManyRequests)
+						w.WriteHeader(upstreamStatus)
+						if scenario.concurrency {
+							_, _ = io.WriteString(w, `{"error":{"message":"You've reached your concurrent request limit. Please wait for your ongoing requests to finish and try again."}}`)
+							return
+						}
 						_, _ = io.WriteString(w, `{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"synthetic concurrent request limit"}}`)
 					}))
 					t.Cleanup(origin.Close)
-					base := startNestedRetryCPA(t, binary, origin.URL, scenario.keys)
+					base := startNestedRetryCPA(t, binary, origin.URL, scenario.keys, compatibility)
 					target, err := url.Parse(base)
 					require.NoError(t, err)
 					proxy := httputil.NewSingleHostReverseProxy(target)
@@ -63,20 +75,33 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 						// A negative control may re-enter after all keys have acquired
 						// a local pause. That zero-dispatch response has no marker.
 						marked := response.Header.Get("X-CPA-Retry-Scope") != ""
-						if response.StatusCode != 429 || (!scenario.strip || marked) && (response.Header.Get("X-CPA-Retry-Scope") != "gateway" || response.Header.Get("X-CPA-Retry-Attempts") != fmt.Sprint(scenario.keys)) {
+						if scenario.strip && !marked && response.StatusCode == 503 {
+							// Repeated negative-control calls can trip the existing
+							// key-health circuit; no dispatch means no budget marker.
+							return nil
+						}
+						if response.StatusCode != upstreamStatus || (!scenario.strip || marked) && (response.Header.Get("X-CPA-Retry-Scope") != "gateway" || response.Header.Get("X-CPA-Retry-Attempts") != fmt.Sprint(scenario.keys)) {
 							t.Errorf("unexpected CPA contract: status=%d scope=%q attempts=%q", response.StatusCode, response.Header.Get("X-CPA-Retry-Scope"), response.Header.Get("X-CPA-Retry-Attempts"))
 						}
+						if scenario.concurrency && marked && response.Header.Get("X-CPA-Retry-Reason") != "kimi_concurrent_request_limit" {
+							t.Error("missing concurrency reason")
+						}
 						if scenario.strip {
+							response.Header.Del("X-CPA-Retry-Reason")
 							response.Header.Del("X-CPA-Retry-Scope")
 							response.Header.Del("X-CPA-Retry-Attempts")
 						}
 						return nil
 					}
-					got := runCPAStateRelay(t, "rate_limit_exceeded", 429, scenario.alternate, stream, cpaStateAliasOptions{
+					got := runCPAStateRelay(t, errorCode, upstreamStatus, scenario.alternate, stream, cpaStateAliasOptions{
 						claude: claude, ownerHandler: proxy, maxAttempts: 6,
 						cached: stream, ownerHeaderOverride: `{"*":true}`,
 					})
-					require.Equal(t, scenario.status, got.response.Code, got.response.Body.String())
+					if scenario.strip && scenario.concurrency && got.response.Code == 503 {
+						require.Contains(t, got.response.Body.String(), "model_cooldown")
+					} else {
+						require.Equal(t, scenario.status, got.response.Code, got.response.Body.String())
+					}
 					if scenario.strip {
 						// The regression is repeated entrance traversal, even if the
 						// key-health guard later prevents some actual dispatches.
@@ -99,7 +124,7 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 	}
 }
 
-func startNestedRetryCPA(t *testing.T, binary, origin string, count int) string {
+func startNestedRetryCPA(t *testing.T, binary, origin string, count int, compatibilities ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	keys := make([]map[string]any, count)
@@ -114,6 +139,13 @@ func startNestedRetryCPA(t *testing.T, binary, origin string, count int) string 
 		"capabilities":  map[string]bool{"chat": true, "responses": true, "claude_messages": true, "stream": true, "tools": true},
 		"keys":          keys,
 	}}}
+	if len(compatibilities) > 0 {
+		g := config["gateways"].([]map[string]any)[0]
+		g["compatibility"] = compatibilities[0]
+		if compatibilities[0] == "kimi" {
+			g["model_aliases"] = map[string]string{"gpt-6.1-sol": "kimi-k2.8"}
+		}
+	}
 	data, err := json.Marshal(config)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "gateways.json"), data, 0600))

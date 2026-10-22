@@ -73,6 +73,38 @@ func TestGatewayRetryContractCannotMarkLocalFailure(t *testing.T) {
 	require.Empty(t, got.GetRetryAfter())
 }
 
+func TestGatewayRetryConcurrencyRequiresExplicitReason(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reasons []string
+		want    int
+	}{
+		{"explicit", []string{types.GatewayRetryReasonKimiConcurrency}, 3},
+		{"missing", nil, 0},
+		{"generic permission", []string{"permission_denied"}, 0},
+		{"duplicate", []string{types.GatewayRetryReasonKimiConcurrency, types.GatewayRetryReasonKimiConcurrency}, 0},
+		{"combined", []string{types.GatewayRetryReasonKimiConcurrency + ",other"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, truncated := range []bool{false, true} {
+				var body io.ReadCloser = io.NopCloser(strings.NewReader(`{"error":{"code":"concurrent_request_limit","type":"cpa_error","message":"safe"}}`))
+				if truncated {
+					body = &relayErrorReadCloser{err: io.ErrUnexpectedEOF}
+				}
+				resp := &http.Response{StatusCode: 403, Header: http.Header{
+					"X-Cpa-Retry-Scope": {"gateway"}, "X-Cpa-Retry-Attempts": {"3"}, "X-Cpa-Retry-Reason": tc.reasons,
+				}, Body: body}
+				got := RelayErrorHandler(context.Background(), resp, false)
+				require.Equal(t, tc.want, got.GatewayRetryAttempts())
+				if tc.want > 0 {
+					require.Equal(t, 403, got.StatusCode)
+					require.True(t, got.HasUpstreamResponse())
+				}
+			}
+		})
+	}
+}
+
 func TestGatewayRetryContractSurvivesTruncatedErrorBody(t *testing.T) {
 	for _, marked := range []bool{false, true} {
 		for _, status := range []int{429, 503} {
