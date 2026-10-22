@@ -98,14 +98,21 @@ func TestCPANestedRetryWithRealGateway(t *testing.T) {
 						cached: stream, ownerHeaderOverride: `{"*":true}`,
 					})
 					if scenario.strip && scenario.concurrency && got.response.Code == 503 {
-						require.Contains(t, got.response.Body.String(), "model_cooldown")
+						// The current Kimi risk policy persists credential suspension.
+						require.Contains(t, got.response.Body.String(), "key_suspended")
 					} else {
 						require.Equal(t, scenario.status, got.response.Code, got.response.Body.String())
 					}
 					if scenario.strip {
 						// The regression is repeated entrance traversal, even if the
 						// key-health guard later prevents some actual dispatches.
-						require.Greater(t, upstreamCalls.Load(), int32(scenario.keys))
+						if scenario.concurrency {
+							// Re-entry is still wrong, but suspended credentials must not
+							// be called again without an operator recovery decision.
+							require.EqualValues(t, scenario.keys, upstreamCalls.Load())
+						} else {
+							require.Greater(t, upstreamCalls.Load(), int32(scenario.keys))
+						}
 						require.LessOrEqual(t, upstreamCalls.Load(), scenario.calls)
 						require.Greater(t, got.ownerCalls, int32(1))
 					} else {

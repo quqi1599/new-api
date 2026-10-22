@@ -35,6 +35,10 @@ type cpaStateAliasOptions struct {
 	ownerHandler                http.Handler
 	maxAttempts                 int
 	ownerHeaderOverride         string
+	trustedCPA                  bool
+	requestBody                 string
+	requestHeaders              http.Header
+	staleReplayBarrier          string
 }
 
 // Exercise Relay, real HTTP decoding and the selector across three rounds.
@@ -43,6 +47,11 @@ type cpaStateAliasOptions struct {
 func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream bool, sameServiceAlias ...cpaStateAliasOptions) cpaStateRelayResult {
 	t.Helper()
 	setupCPAContractChannels(t, alternate)
+	if len(sameServiceAlias) > 0 && sameServiceAlias[0].trustedCPA {
+		oldSecret := common.CPAAuditIdentitySecret
+		common.CPAAuditIdentitySecret = "synthetic-cpa-audit-secret"
+		t.Cleanup(func() { common.CPAAuditIdentitySecret = oldSecret })
+	}
 	require.NoError(t, model.DB.AutoMigrate(&model.Log{}, &model.Token{}))
 	oldRetry, oldConsume, oldError := common.RetryTimes, common.LogConsumeEnabled, constant.ErrorLogEnabled
 	oldFree := operation_setting.GetQuotaSetting().EnableFreeModelPreConsume
@@ -144,6 +153,9 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 		if isOwner && len(sameServiceAlias) > 0 && sameServiceAlias[0].ownerHeaderOverride != "" {
 			channel.HeaderOverride = common.GetPointer(sameServiceAlias[0].ownerHeaderOverride)
 		}
+		if isOwner && len(sameServiceAlias) > 0 && sameServiceAlias[0].trustedCPA {
+			channel.SetOtherSettings(dto.ChannelOtherSettings{CPAAuditIdentityEnabled: true})
+		}
 		require.NoError(t, model.DB.Save(&channel).Error)
 		require.NoError(t, model.DB.Save(&model.Ability{Group: "default", Model: "gpt-5.5", ChannelId: id, Enabled: true, Priority: &priority}).Error)
 		if isOwner {
@@ -175,6 +187,21 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 		if sameServiceAlias[0].recoverChat {
 			format = types.RelayFormatOpenAI
 			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.5","messages":[{"role":"user","content":"synthetic"}],"response_format":{"type":"json_object"}}`))
+		}
+	}
+	if len(sameServiceAlias) > 0 {
+		options := sameServiceAlias[0]
+		if options.requestBody != "" {
+			c.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.Path, strings.NewReader(options.requestBody))
+		}
+		for name, values := range options.requestHeaders {
+			c.Request.Header[name] = append([]string(nil), values...)
+		}
+		common.SetContextKey(c, constant.ContextKeyRelayGatewayNoReplayReason, options.staleReplayBarrier)
+		if options.trustedCPA {
+			common.SetContextKey(c, constant.ContextKeyUserId, 1)
+			common.SetContextKey(c, constant.ContextKeyTokenId, 1)
+			c.Set(common.RequestIdKey, "synthetic-replay-contract")
 		}
 	}
 	c.Request.Header.Set("Content-Type", "application/json")

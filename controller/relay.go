@@ -323,6 +323,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		retryState.RecordAttempt(channel.Id)
 		relayInfo.BeginUpstreamAttempt()
+		common.SetContextKey(c, constant.ContextKeyRelayGatewayNoReplayReason, "")
 		common.ResetRelayAttemptTimeoutContext(c)
 		// These are per-attempt transport diagnostics. Output, received events,
 		// usage and request-wide deadlines remain latched across the request.
@@ -448,7 +449,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			// returned an explicit retryable HTTP failure; transport ambiguity still
 			// blocks replay to avoid duplicate generation, tools, tasks, or billing.
 			retryAllowed = false
-			if relayProgressStarted(c, relayInfo) {
+			if reason := service.GatewayReplayStopReason(c); reason != "" {
+				retryState.StopReason = reason
+			} else if relayProgressStarted(c, relayInfo) {
 				retryState.StopReason = service.RetryStopReasonOutputStarted
 			} else {
 				retryState.StopReason = service.RetryStopReasonUpstreamUnknown
@@ -774,7 +777,7 @@ func excludeFailedChannelForRetry(retryParam *service.RetryParam, info *relaycom
 }
 
 func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, relayFormats ...types.RelayFormat) bool {
-	if openaiErr == nil {
+	if openaiErr == nil || service.GatewayReplayStopReason(c) != "" {
 		return false
 	}
 	if c != nil && c.Writer != nil && c.Writer.Written() {
@@ -839,6 +842,9 @@ func relayProgressStarted(c *gin.Context, info *relaycommon.RelayInfo) bool {
 }
 
 func relayRetryIsUnsafe(c *gin.Context, info *relaycommon.RelayInfo, relayFormat types.RelayFormat, relayErr *types.NewAPIError) bool {
+	if service.GatewayReplayStopReason(c) != "" {
+		return true
+	}
 	if isDecodeFailureCode(relayErr) && (!isDecodeRecoveryFailure(relayErr) || !relayErr.HasUpstreamResponse() || !decodeRecoveryRequestSafe(c, info, relayFormat)) {
 		return true
 	}

@@ -11,18 +11,20 @@ import (
 )
 
 const (
-	RetryStopReasonSuccess           = "success"
-	RetryStopReasonIncomplete        = "incomplete"
-	RetryStopReasonNotRetryable      = "not_retryable"
-	RetryStopReasonOutputStarted     = "output_started"
-	RetryStopReasonUpstreamUnknown   = "upstream_outcome_unknown"
-	RetryStopReasonCandidateLimit    = "candidate_limit_exhausted"
-	RetryStopReasonAttemptsExhausted = "attempts_exhausted"
-	RetryStopReasonRoundsExhausted   = "rounds_exhausted"
-	RetryStopReasonDeadlineExceeded  = "deadline_exceeded"
-	RetryStopReasonClientGone        = "client_gone"
-	RetryStopReasonNoChannel         = "no_channel"
-	RetryStopReasonAuthUnavailable   = "auth_unavailable_exhausted"
+	RetryStopReasonSuccess                = "success"
+	RetryStopReasonIncomplete             = "incomplete"
+	RetryStopReasonNotRetryable           = "not_retryable"
+	RetryStopReasonOutputStarted          = "output_started"
+	RetryStopReasonUpstreamOutputObserved = "upstream_output_observed"
+	RetryStopReasonAcceptedOutcomeUnknown = "accepted_outcome_unknown"
+	RetryStopReasonUpstreamUnknown        = "upstream_outcome_unknown"
+	RetryStopReasonCandidateLimit         = "candidate_limit_exhausted"
+	RetryStopReasonAttemptsExhausted      = "attempts_exhausted"
+	RetryStopReasonRoundsExhausted        = "rounds_exhausted"
+	RetryStopReasonDeadlineExceeded       = "deadline_exceeded"
+	RetryStopReasonClientGone             = "client_gone"
+	RetryStopReasonNoChannel              = "no_channel"
+	RetryStopReasonAuthUnavailable        = "auth_unavailable_exhausted"
 )
 
 type RelayRetryPolicy struct {

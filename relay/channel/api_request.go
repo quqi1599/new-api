@@ -971,6 +971,10 @@ func setRelayCancelOrigin(c *gin.Context, origin string) {
 }
 
 func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http.Response, error) {
+	if c != nil {
+		common2.SetContextKey(c, constant2.ContextKeyRelayGatewayNoReplayReason, "")
+	}
+	stripCPARetryRequestHeaders(req.Header)
 	applyCPAPrincipal(req.Header, info)
 	if err := applyCPAAuditIdentity(req, info); err != nil {
 		return nil, fmt.Errorf("apply CPA audit identity: %w", err)
@@ -1204,6 +1208,7 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 		return nil, errors.New("resp is nil")
 	}
 	common2.SetContextKey(c, constant2.ContextKeyRelayResponseHeaders, true)
+	captureCPARetryBarrier(c, req, resp, info)
 	if nonStreamTimer != nil && nonStreamTimer.Expired() {
 		if resp.Body != nil {
 			_ = resp.Body.Close()
