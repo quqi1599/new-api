@@ -461,6 +461,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			retryAllowed = false
 			_ = retryState.CanAttempt(c.Request.Context())
 		}
+		if retryAllowed && relayFormat == types.RelayFormatOpenAIImage {
+			service.ClearChannelAffinityForRequest(c)
+		}
 		lastRetryAllowed = canContinueRelayRetry(retryAllowed, gptFallback, canGPTFallback)
 		if lastRetryAllowed && remainingAttempts == 0 {
 			lastRetryAllowed = false
@@ -768,6 +771,9 @@ func excludeFailedChannelForRetry(retryParam *service.RetryParam, info *relaycom
 		relayErr = info.LastError
 	}
 	recordRelayChannelFailure(retryParam, channelID, relayErr)
+	if info != nil && info.RelayFormat == types.RelayFormatOpenAIImage && imageFailureExhaustsChannel(relayErr) {
+		retryParam.AddPersistentExcludedChannel(channelID)
+	}
 	if info != nil && info.ChannelMeta != nil && info.ChannelOtherSettings.ModelRoutingFirstEnabled {
 		// A model-routing-first channel is a one-shot attempt for this request.
 		// Keep it excluded even if a later retry round resets the ordinary
@@ -814,6 +820,9 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int, r
 	}
 	if operation_setting.IsAlwaysSkipRetryCode(openaiErr.GetErrorCode()) {
 		return false
+	}
+	if len(relayFormats) > 0 && relayFormats[0] == types.RelayFormatOpenAIImage && openaiErr.HasUpstreamResponse() {
+		return imageFailureRetryable(openaiErr)
 	}
 	if isRetryableExplicitUpstreamStatus(code) && len(relayFormats) > 0 && openaiErr.HasUpstreamResponse() {
 		return canRetryAfterExplicitUpstreamFailure(relayFormats[0], openaiErr)
@@ -880,6 +889,9 @@ func isGPTChannelFallbackError(info *relaycommon.RelayInfo, openaiErr *types.New
 	}
 	if isCompactionRouteUnavailableError(openaiErr) {
 		return false
+	}
+	if info.RelayFormat == types.RelayFormatOpenAIImage && openaiErr.HasUpstreamResponse() {
+		return imageFailureRetryable(openaiErr)
 	}
 	if types.IsChannelError(openaiErr) {
 		return true
