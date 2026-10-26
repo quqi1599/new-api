@@ -749,15 +749,19 @@ func getChannel(c *gin.Context, info *relaycommon.RelayInfo, retryParam *service
 			return channel, nil
 		}
 		service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, info.OriginModelName)
-		// A local key-selection rejection did not send anything upstream. Keep
+		// A local candidate rejection did not send anything upstream. Keep
 		// this candidate excluded for the request and try a different candidate.
 		// Bound selection separately; it must not spend an upstream attempt slot.
 		_, specificChannel := c.Get("specific_channel_id")
-		if retryState == nil || !retryParam.ExhaustCandidates || specificChannel || newAPIError.GetErrorCode() != types.ErrorCodeChannelNoAvailableKey {
+		formatAffinityStop := types.IsLocalOutputFormatRouteError(newAPIError) && service.ShouldSkipRetryAfterChannelAffinityFailure(c)
+		if retryState == nil || !retryParam.ExhaustCandidates || specificChannel || formatAffinityStop || !service.IsLocalChannelCandidateRejection(newAPIError) {
 			return nil, newAPIError
 		}
 		retryParam.AddPersistentExcludedChannel(channel.Id)
 		service.RecordRelayCandidateSkip(c, channel.Id)
+		if types.IsLocalOutputFormatRouteError(newAPIError) {
+			c.Set("retry_candidate_skip_reason", string(newAPIError.GetErrorCode()))
+		}
 		setRelayRetryDiagnostics(c, retryState)
 	}
 }

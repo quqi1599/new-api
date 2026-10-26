@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -23,8 +24,10 @@ import (
 )
 
 type ModelRequest struct {
-	Model string `json:"model"`
-	Group string `json:"group,omitempty"`
+	Model          string          `json:"model"`
+	Group          string          `json:"group,omitempty"`
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+	Text           json.RawMessage `json:"text,omitempty"`
 }
 
 func Distribute() func(c *gin.Context) {
@@ -245,12 +248,15 @@ func Distribute() func(c *gin.Context) {
 				service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, modelRequest.Model)
 			}
 			// Keep explicit channel/affinity constraints and every auth/group/model
-			// check above. Only a local key rejection permits another candidate.
-			if ok || selectionParam == nil || service.ShouldSkipRetryAfterChannelAffinityFailure(c) || setupErr.GetErrorCode() != types.ErrorCodeChannelNoAvailableKey {
+			// check above. Only a local pre-send rejection permits another candidate.
+			if ok || selectionParam == nil || service.ShouldSkipRetryAfterChannelAffinityFailure(c) || !service.IsLocalChannelCandidateRejection(setupErr) {
 				abortWithOpenAiMessage(c, setupErr.StatusCode, setupErr.Error(), setupErr.GetErrorCode())
 				return
 			}
 			service.RecordRelayCandidateSkip(c, channel.Id)
+			if types.IsLocalOutputFormatRouteError(setupErr) {
+				c.Set("retry_candidate_skip_reason", string(setupErr.GetErrorCode()))
+			}
 			selectionParam.AddPersistentExcludedChannel(channel.Id)
 			selectionParam.ExhaustCandidates = true
 			service.ClearChannelAffinityForRequest(c)
@@ -296,6 +302,7 @@ func getModelFromRequest(c *gin.Context) (*ModelRequest, error) {
 		// admission exhaustion to a stable 503 instead of flattening it into 400.
 		return nil, err
 	}
+	service.SetRequestJSONMode(c, modelRequest.ResponseFormat, modelRequest.Text)
 	return &modelRequest, nil
 }
 
@@ -467,6 +474,9 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	c.Set("original_model", modelName) // for retry
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+	}
+	if err := service.PreflightChannelOutputFormat(c, channel); err != nil {
+		return err
 	}
 	common.SetContextKey(c, constant.ContextKeyChannelId, channel.Id)
 	common.SetContextKey(c, constant.ContextKeyChannelName, channel.Name)

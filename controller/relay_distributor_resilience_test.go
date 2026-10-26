@@ -14,6 +14,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -26,6 +27,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 var distributorResilienceIdentity atomic.Int64
@@ -45,6 +47,7 @@ type distributorResilienceFixture struct {
 	chat           bool
 	nonStream      bool
 	errorDelay     time.Duration
+	jsonObject     bool
 }
 
 func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture) streamResilienceResult {
@@ -103,6 +106,15 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 	for index, kind := range fixture.candidates {
 		id := 9 + index
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if fixture.jsonObject {
+				body, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				formatPath := "text.format.type"
+				if fixture.chat {
+					formatPath = "response_format.type"
+				}
+				require.Equal(t, "json_object", gjson.GetBytes(body, formatPath).String(), "the compatible route must retain JSON mode")
+			}
 			mu.Lock()
 			calls = append(calls, id)
 			mu.Unlock()
@@ -140,6 +152,11 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 				}
 				return
 			}
+			if fixture.nonStream {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"id":"resp_initial_healthy","object":"response","status":"completed","model":"gpt-5.6-sol","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)
+				return
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initial_healthy\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.6-sol\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
 		}))
@@ -154,6 +171,10 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 		if kind == "empty" {
 			channel.ChannelInfo.IsMultiKey = true
 			channel.ChannelInfo.MultiKeyStatusList = map[int]int{0: common.ChannelStatusManuallyDisabled}
+		}
+		if kind == "messages" || kind == "messages-retry" {
+			channel.Type = constant.ChannelTypeAnthropic
+			channel.SetOtherSettings(dto.ChannelOtherSettings{ModelRoutingFirstEnabled: kind == "messages"})
 		}
 		require.NoError(t, model.DB.Save(&channel).Error)
 		require.NoError(t, model.DB.Save(&model.Ability{Group: group, Model: "gpt-5.6-sol", ChannelId: id, Enabled: true, Priority: &priority}).Error)
@@ -173,10 +194,17 @@ func runDistributorResilience(t *testing.T, fixture distributorResilienceFixture
 	}, middleware.Distribute())
 	path := "/v1/responses"
 	var format types.RelayFormat = types.RelayFormatOpenAIResponses
-	body := `{"model":"gpt-5.6-sol","input":"synthetic","stream":true}`
+	body := fmt.Sprintf(`{"model":"gpt-5.6-sol","input":"synthetic","stream":%t}`, !fixture.nonStream)
 	if fixture.chat {
 		path, format = "/v1/chat/completions", types.RelayFormatOpenAI
 		body = fmt.Sprintf(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"synthetic"}],"stream":%t}`, !fixture.nonStream)
+	}
+	if fixture.jsonObject {
+		format := `,"text":{"format":{"type":"json_object"}}}`
+		if fixture.chat {
+			format = `,"response_format":{"type":"json_object"}}`
+		}
+		body = strings.TrimSuffix(body, "}") + format
 	}
 	router.POST(path, func(c *gin.Context) { Relay(c, format) })
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
