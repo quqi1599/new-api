@@ -45,20 +45,8 @@ const (
 var moderationReviewIdPattern = regexp.MustCompile(`(?i)\bmoderation(?:[\s_-]+review)?[\s_-]+id\s*[:=]\s*([a-z0-9][a-z0-9_-]{7,127})\b`)
 
 func requestBodyFailureClassification(err error) (statusCode int, errorCode types.ErrorCode, classified bool) {
-	switch {
-	case common.IsRequestBodyTooLargeError(err), errors.Is(err, common.ErrRequestBodyTooLarge):
-		return http.StatusRequestEntityTooLarge, types.ErrorCodeRequestBodyTooLarge, true
-	case common.IsIncompleteBodyError(err):
-		return http.StatusBadRequest, types.ErrorCodeRequestBodyIncomplete, true
-	case common.IsBodyReadError(err):
-		return http.StatusBadRequest, types.ErrorCodeReadRequestBodyFailed, true
-	case common.IsBodyAdmissionError(err):
-		return http.StatusServiceUnavailable, types.ErrorCodeRequestBodyCapacity, true
-	case common.IsInternalBodyStorageError(err):
-		return http.StatusInternalServerError, types.ErrorCodeInternalStorageError, true
-	default:
-		return http.StatusBadRequest, types.ErrorCodeReadRequestBodyFailed, false
-	}
+	statusCode, errorCode, _, classified = service.ClassifyRequestBodyFailure(err)
+	return statusCode, errorCode, classified
 }
 
 func requestBodyFailureStatus(err error) (statusCode int, classified bool) {

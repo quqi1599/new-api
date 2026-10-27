@@ -43,5 +43,8 @@ func TestDistributorReturnsStructuredServiceUnavailableWhenBodyAdmissionIsFull(t
 	require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &payload))
 	require.Equal(t, string(types.ErrorCodeRequestBodyCapacity), payload.Error.Code)
 	require.Contains(t, payload.Error.Message, "request body capacity is temporarily exhausted")
+	require.True(t, c.IsAborted())
+	require.True(t, c.GetTime("relay_retry_started_at").IsZero(), "selection budget must not start")
+	require.Zero(t, c.GetInt("channel_id"))
 	require.Equal(t, int64(1), common.GetRequestBodyStats().RejectedLargeBodyAdmissionsTotal)
 }
