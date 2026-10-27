@@ -92,6 +92,14 @@ func authHelper(c *gin.Context, minRole int) {
 			return
 		}
 	}
+	// Gift owners can relay using their restricted API key, never log into the console.
+	if userID, ok := id.(int); ok {
+		gift, err := model.IsSaaSGiftUser(userID)
+		if err != nil || gift {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "account is not available for interactive access"})
+			return
+		}
+	}
 	// get header New-Api-User
 	apiUserIdStr := c.Request.Header.Get("New-Api-User")
 	if apiUserIdStr == "" {
@@ -339,6 +347,13 @@ func TokenAuth() func(c *gin.Context) {
 			return
 		}
 
+		if token.SaaSGiftAccountID != "" {
+			if err := model.ValidateSaaSGiftToken(c.Request.Context(), token); err != nil {
+				abortWithOpenAiMessage(c, http.StatusForbidden, "gift key is unavailable or its policy changed")
+				return
+			}
+		}
+
 		allowIps := token.GetIpLimits()
 		if len(allowIps) > 0 {
 			clientIp := c.ClientIP()
@@ -400,6 +415,14 @@ func TokenAuth() func(c *gin.Context) {
 func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) error {
 	if token == nil {
 		return fmt.Errorf("token is nil")
+	}
+	if token.SaaSGiftAccountID != "" {
+		if len(parts) > 1 {
+			abortWithOpenAiMessage(c, http.StatusForbidden, "gift keys cannot select a channel")
+			return fmt.Errorf("gift keys cannot select a channel")
+		}
+		c.Set("saas_gift_model", model.SaaSGiftModel)
+		c.Set("saas_gift_group", token.Group)
 	}
 	c.Set("id", token.UserId)
 	c.Set("token_id", token.Id)

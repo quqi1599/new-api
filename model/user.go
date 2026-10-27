@@ -51,6 +51,9 @@ type User struct {
 	StripeCustomer   string         `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
 	CreatedAt        int64          `json:"created_at" gorm:"autoCreateTime;column:created_at"`
 	LastLoginAt      int64          `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+
+	SaaSGiftAccountID string `json:"-" gorm:"column:saas_gift_account_id;size:64;not null;default:'';index"`
+	SaaSGiftFrozen    bool   `json:"-" gorm:"column:saas_gift_frozen;not null;default:false"`
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -663,6 +666,9 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 	if err = tx.First(&current, user.Id).Error; err != nil {
 		return err
 	}
+	if current.SaaSGiftAccountID != "" {
+		return ErrSaaSGiftRestricted
+	}
 	if err = tx.Model(&current).Omit("quota", "used_quota", "request_count").Updates(newUser).Error; err != nil {
 		return err
 	}
@@ -700,6 +706,9 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 	current := User{}
 	if err = tx.First(&current, user.Id).Error; err != nil {
 		return err
+	}
+	if current.SaaSGiftAccountID != "" {
+		return ErrSaaSGiftRestricted
 	}
 	if err = tx.Model(&current).Updates(updates).Error; err != nil {
 		return err
@@ -780,7 +789,7 @@ func (user *User) ValidateAndFill() (err error) {
 		}
 		return fmt.Errorf("%w: %v", ErrDatabase, err)
 	}
-	if user.Password == "" {
+	if user.Password == "" || user.SaaSGiftAccountID != "" {
 		return ErrInvalidCredentials
 	}
 	okay := common.ValidatePasswordAndHash(password, user.Password)
@@ -943,6 +952,9 @@ func ValidateAccessToken(token string) (*User, error) {
 		}
 		return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
 	}
+	if user.SaaSGiftAccountID != "" {
+		return nil, nil
+	}
 	return user, nil
 }
 
@@ -1068,16 +1080,36 @@ var ErrInsufficientUserQuota = errors.New("user quota is insufficient")
 // updater: provider work may begin only after the authoritative database row
 // has both proved sufficient funds and recorded the debit.
 func ReserveUserQuota(id int, quota int) error {
+	return reserveUserQuota(id, quota, false)
+}
+
+// A request accepted before a gift freeze may still settle its final usage.
+func ReserveUserQuotaForSettlement(id int, quota int) error {
+	return reserveUserQuota(id, quota, true)
+}
+
+func reserveUserQuota(id int, quota int, settling bool) error {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
 	if quota == 0 {
+		if !settling && DB != nil {
+			var frozen int64
+			if err := DB.Model(&User{}).Where("id = ? AND saas_gift_frozen = ?", id, true).Count(&frozen).Error; err != nil {
+				return err
+			}
+			if frozen > 0 {
+				return ErrSaaSGiftFrozen
+			}
+		}
 		return nil
 	}
 
-	result := DB.Model(&User{}).
-		Where("id = ? AND quota >= ?", id, quota).
-		UpdateColumn("quota", gorm.Expr("quota - ?", quota))
+	query := DB.Model(&User{}).Where("id = ? AND quota >= ?", id, quota)
+	if !settling {
+		query = query.Where("saas_gift_frozen = ?", false)
+	}
+	result := query.UpdateColumn("quota", gorm.Expr("quota - ?", quota))
 	if result.Error != nil {
 		return result.Error
 	}

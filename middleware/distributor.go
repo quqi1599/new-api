@@ -55,6 +55,12 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
+		if giftModel := c.GetString("saas_gift_model"); giftModel != "" {
+			if modelRequest.Model != giftModel || ok || (modelRequest.Group != "" && modelRequest.Group != c.GetString("saas_gift_group")) {
+				abortWithOpenAiMessage(c, http.StatusForbidden, "gift key only supports its assigned aggregate model and group")
+				return
+			}
+		}
 		// Start the shared selection/retry budget only after receiving and parsing
 		// the upload. Slow clients must not consume it before routing can begin.
 		// An existing budget and the request context still retain their deadlines.

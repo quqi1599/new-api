@@ -144,96 +144,106 @@ func ApplySaaSCreditOperation(ctx context.Context, req SaaSCreditOperationReques
 }
 
 func applySaaSCreditOperationOnce(ctx context.Context, req SaaSCreditOperationRequest) (*SaaSCreditOperation, error) {
-	op := &SaaSCreditOperation{
+	op := newSaaSCreditOperation(req)
+	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return applySaaSCreditOperationTx(tx, req, op, false)
+	})
+	return op, err
+}
+
+func newSaaSCreditOperation(req SaaSCreditOperationRequest) *SaaSCreditOperation {
+	return &SaaSCreditOperation{
 		ID: saasCreditOperationKey(req.OperationID), OperationID: req.OperationID,
 		UserID: req.UserID, TokenID: req.TokenID, Amount: req.Amount,
 		CreditUserQuota: req.CreditUserQuota, Note: req.Note,
 	}
-	err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Acquire the unique operation slot before any reads. SQLite therefore
-		// takes its writer lock without attempting a read-to-write lock upgrade.
-		if err := tx.Create(op).Error; err != nil {
-			return err
-		}
-		if _, excluded := constant.SaaSTopupExcludedUserIDs[req.UserID]; excluded {
+}
+
+// Gift calls enter only after locking and validating their immutable binding.
+// The public credit contract never accepts this internal accounting permission.
+func applySaaSCreditOperationTx(tx *gorm.DB, req SaaSCreditOperationRequest, op *SaaSCreditOperation, gift bool) error {
+	// Acquire the unique operation slot before any reads. SQLite therefore
+	// takes its writer lock without attempting a read-to-write lock upgrade.
+	if err := tx.Create(op).Error; err != nil {
+		return err
+	}
+	if _, excluded := constant.SaaSTopupExcludedUserIDs[req.UserID]; excluded {
+		return ErrSaaSCreditTargetNotFound
+	}
+	locked := tx
+	if tx.Dialector.Name() != "sqlite" {
+		locked = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Session(&gorm.Session{})
+	}
+	var user User
+	if err := locked.Select("id", "quota", "status", "username", "saas_gift_account_id", "saas_gift_frozen").Where("id = ?", req.UserID).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrSaaSCreditTargetNotFound
 		}
-		locked := tx
-		if tx.Dialector.Name() != "sqlite" {
-			locked = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Session(&gorm.Session{})
-		}
-		var user User
-		if err := locked.Select("id", "quota", "status", "username").Where("id = ?", req.UserID).First(&user).Error; err != nil {
+		return err
+	}
+	if user.Status != common.UserStatusEnabled || (!gift && user.SaaSGiftAccountID != "") || (gift && (user.SaaSGiftAccountID == "" || user.SaaSGiftFrozen)) {
+		return ErrSaaSCreditTargetNotFound
+	}
+	if !isSafeSaaSCreditQuota(user.Quota) {
+		return ErrSaaSCreditOverflow
+	}
+	op.BeforeUserQuota, op.AfterUserQuota = user.Quota, user.Quota
+	var token Token
+	if req.TokenID != nil {
+		if err := locked.Where("id = ? AND user_id = ?", *req.TokenID, req.UserID).First(&token).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrSaaSCreditTargetNotFound
 			}
 			return err
 		}
-		if user.Status != common.UserStatusEnabled {
+		if token.Status == common.TokenStatusDisabled {
 			return ErrSaaSCreditTargetNotFound
 		}
-		if !isSafeSaaSCreditQuota(user.Quota) {
+		after, err := addSaaSCreditQuota(token.RemainQuota, req.Amount)
+		if err != nil {
+			return err
+		}
+		if token.SaaSCreditedQuota < 0 || token.SaaSCreditedQuota > MaxSaaSCreditQuota-int64(req.Amount) {
 			return ErrSaaSCreditOverflow
 		}
-		op.BeforeUserQuota, op.AfterUserQuota = user.Quota, user.Quota
-		var token Token
-		if req.TokenID != nil {
-			if err := locked.Where("id = ? AND user_id = ?", *req.TokenID, req.UserID).First(&token).Error; err != nil {
-				if errors.Is(err, gorm.ErrRecordNotFound) {
-					return ErrSaaSCreditTargetNotFound
-				}
-				return err
-			}
-			if token.Status == common.TokenStatusDisabled {
-				return ErrSaaSCreditTargetNotFound
-			}
-			after, err := addSaaSCreditQuota(token.RemainQuota, req.Amount)
-			if err != nil {
-				return err
-			}
-			if token.SaaSCreditedQuota < 0 || token.SaaSCreditedQuota > MaxSaaSCreditQuota-int64(req.Amount) {
-				return ErrSaaSCreditOverflow
-			}
-			before := token.RemainQuota
-			op.BeforeRemainQuota, op.AfterRemainQuota = &before, &after
-			op.AfterTokenCreditTotal = token.SaaSCreditedQuota + int64(req.Amount)
+		before := token.RemainQuota
+		op.BeforeRemainQuota, op.AfterRemainQuota = &before, &after
+		op.AfterTokenCreditTotal = token.SaaSCreditedQuota + int64(req.Amount)
+	}
+	if req.CreditUserQuota {
+		after, err := addSaaSCreditQuota(user.Quota, req.Amount)
+		if err != nil {
+			return err
 		}
-		if req.CreditUserQuota {
-			after, err := addSaaSCreditQuota(user.Quota, req.Amount)
-			if err != nil {
-				return err
-			}
-			op.AfterUserQuota = after
-			result := tx.Model(&User{}).Where("id = ?", req.UserID).UpdateColumn("quota", gorm.Expr("quota + ?", req.Amount))
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected != 1 {
-				return ErrSaaSCreditTargetNotFound
-			}
+		op.AfterUserQuota = after
+		result := tx.Model(&User{}).Where("id = ?", req.UserID).UpdateColumn("quota", gorm.Expr("quota + ?", req.Amount))
+		if result.Error != nil {
+			return result.Error
 		}
-		if req.TokenID != nil {
-			updates := map[string]interface{}{
-				"remain_quota":        gorm.Expr("remain_quota + ?", req.Amount),
-				"saas_credited_quota": gorm.Expr("saas_credited_quota + ?", req.Amount),
-			}
-			if token.Status == common.TokenStatusExhausted && token.RemainQuota+req.Amount > 0 {
-				updates["status"] = common.TokenStatusEnabled
-			}
-			result := tx.Model(&Token{}).Where("id = ?", *req.TokenID).Updates(updates)
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected != 1 {
-				return ErrSaaSCreditTargetNotFound
-			}
+		if result.RowsAffected != 1 {
+			return ErrSaaSCreditTargetNotFound
 		}
-		op.AppliedAt = common.GetTimestamp()
-		op.LogTokenName = token.Name
+	}
+	if req.TokenID != nil {
+		updates := map[string]interface{}{
+			"remain_quota":        gorm.Expr("remain_quota + ?", req.Amount),
+			"saas_credited_quota": gorm.Expr("saas_credited_quota + ?", req.Amount),
+		}
+		if token.Status == common.TokenStatusExhausted && token.RemainQuota+req.Amount > 0 {
+			updates["status"] = common.TokenStatusEnabled
+		}
+		result := tx.Model(&Token{}).Where("id = ?", *req.TokenID).Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrSaaSCreditTargetNotFound
+		}
+	}
+	op.AppliedAt = common.GetTimestamp()
+	op.LogTokenName = token.Name
 
-		return tx.Model(op).Select("before_user_quota", "after_user_quota", "before_remain_quota", "after_remain_quota", "applied_at", "after_token_credit_total").Updates(op).Error
-	})
-	return op, err
+	return tx.Model(op).Select("before_user_quota", "after_user_quota", "before_remain_quota", "after_remain_quota", "applied_at", "after_token_credit_total").Updates(op).Error
 }
 
 func isSafeSaaSCreditQuota(quota int) bool {

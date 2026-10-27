@@ -256,6 +256,9 @@ func SetApiRouter(router *gin.Engine) {
 		{
 			tokenAdminRoute.GET("/", controller.AdminGetAllTokens)
 			tokenAdminRoute.GET("/search", controller.AdminSearchTokens)
+			tokenAdminRoute.POST("/saas-gifts/accounts/ensure", middleware.DisableCache(), controller.EnsureSaaSGiftAccount)
+			tokenAdminRoute.POST("/saas-gifts/operations", middleware.DisableCache(), controller.CreateSaaSGiftOperation)
+			tokenAdminRoute.GET("/saas-gifts/operations/:operationId", middleware.DisableCache(), controller.GetSaaSGiftOperation)
 			tokenAdminRoute.POST("/saas-topup/resolve", middleware.DisableCache(), controller.ResolveSaaSTopupToken)
 			tokenAdminRoute.POST("/saas-topup/validate", middleware.DisableCache(), controller.ValidateSaaSTopupTokenTarget)
 			tokenAdminRoute.POST("/saas-topup/grant-quota", middleware.DisableCache(), controller.GrantSaaSTopupTokenQuota)

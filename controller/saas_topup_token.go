@@ -42,7 +42,7 @@ func isSaaSTopupUserExcluded(userID int) bool {
 }
 
 func isSaaSTopupTokenEligible(token *model.Token) (bool, error) {
-	if token == nil || isSaaSTopupUserExcluded(token.UserId) || token.Status == common.TokenStatusDisabled {
+	if token == nil || token.SaaSGiftAccountID != "" || isSaaSTopupUserExcluded(token.UserId) || token.Status == common.TokenStatusDisabled {
 		return false, nil
 	}
 

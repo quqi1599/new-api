@@ -249,7 +249,7 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
 	case *WalletFunding:
-		if err := model.ReserveUserQuota(funding.userId, delta); err != nil {
+		if err := model.ReserveUserQuotaForSettlement(funding.userId, delta); err != nil {
 			if errors.Is(err, model.ErrInsufficientUserQuota) {
 				return types.NewErrorWithStatusCode(
 					fmt.Errorf("预扣费额度失败: %w", err),

@@ -96,6 +96,10 @@ func Login(c *gin.Context) {
 
 // setup session & cookies and then return user info
 func setupLogin(user *model.User, c *gin.Context) {
+	if gift, err := model.IsSaaSGiftUser(user.Id); err != nil || gift {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"success": false, "message": "account is not available for interactive access"})
+		return
+	}
 	model.UpdateUserLastLoginAt(user.Id)
 	session := sessions.Default(c)
 	session.Set("id", user.Id)
@@ -897,6 +901,10 @@ func ManageUser(c *gin.Context) {
 	model.DB.Unscoped().Where(&user).First(&user)
 	if user.Id == 0 {
 		common.ApiErrorI18n(c, i18n.MsgUserNotExists)
+		return
+	}
+	if user.SaaSGiftAccountID != "" {
+		common.ApiError(c, model.ErrSaaSGiftRestricted)
 		return
 	}
 	myRole := c.GetInt("role")

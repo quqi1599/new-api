@@ -456,7 +456,7 @@ func PostConsumeQuota(relayInfo *relaycommon.RelayInfo, quota int, preConsumedQu
 	} else {
 		// Wallet
 		if quota > 0 {
-			err = model.ReserveUserQuota(relayInfo.UserId, quota)
+			err = model.ReserveUserQuotaForSettlement(relayInfo.UserId, quota)
 		} else {
 			err = model.IncreaseUserQuota(relayInfo.UserId, -quota, false)
 		}

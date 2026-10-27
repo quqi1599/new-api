@@ -13,6 +13,7 @@ import (
 )
 
 type Token struct {
+	SaaSGiftAccountID string `json:"-" gorm:"column:saas_gift_account_id;size:64;not null;default:'';index"`
 	// SaaSCreditedQuota is a cumulative credit watermark for cache reconciliation.
 	SaaSCreditedQuota int64 `json:"-" gorm:"column:saas_credited_quota;not null;default:0"`
 	// SaaSQuotaRevision orders explicit balance assignments separately from credits.
@@ -391,6 +392,11 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 }
 
 func (token *Token) Insert() error {
+	if gift, err := IsSaaSGiftUser(token.UserId); err != nil {
+		return err
+	} else if gift {
+		return ErrSaaSGiftRestricted
+	}
 	var err error
 	err = DB.Create(token).Error
 	return err
@@ -398,6 +404,11 @@ func (token *Token) Insert() error {
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (token *Token) Update() (err error) {
+	if gift, err := isSaaSGiftToken(token.Id); err != nil {
+		return err
+	} else if gift {
+		return ErrSaaSGiftRestricted
+	}
 	defer func() {
 		if shouldUpdateRedis(true, err) {
 			gopool.Go(func() {
@@ -452,6 +463,11 @@ func (token *Token) SelectUpdate() (err error) {
 }
 
 func (token *Token) Delete() (err error) {
+	if gift, err := isSaaSGiftToken(token.Id); err != nil {
+		return err
+	} else if gift {
+		return ErrSaaSGiftRestricted
+	}
 	defer func() {
 		if shouldUpdateRedis(true, err) {
 			gopool.Go(func() {
@@ -564,7 +580,7 @@ func grantTokenRemainQuota(id int, quota int) (*Token, error) {
 	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		// Write first also serializes SQLite without upgrading a read transaction.
-		result := tx.Model(&Token{}).Where("id = ?", id).
+		result := tx.Model(&Token{}).Where("id = ? AND saas_gift_account_id = ?", id, "").
 			Where("remain_quota >= ? AND remain_quota <= ?", -MaxSaaSCreditQuota, MaxSaaSCreditQuota-int64(quota)).
 			Where("saas_credited_quota >= 0 AND saas_credited_quota <= ?", MaxSaaSCreditQuota-int64(quota)).
 			Updates(map[string]interface{}{
@@ -577,6 +593,9 @@ func grantTokenRemainQuota(id int, quota int) (*Token, error) {
 		}
 		if err := tx.Where("id = ?", id).First(&token).Error; err != nil {
 			return err
+		}
+		if token.SaaSGiftAccountID != "" {
+			return ErrSaaSGiftRestricted
 		}
 		if result.RowsAffected != 1 && quota != 0 {
 			return ErrSaaSCreditOverflow
@@ -642,6 +661,12 @@ func BatchDeleteTokensByIds(ids []int) (int, error) {
 		return 0, err
 	}
 
+	for _, token := range tokens {
+		if token.SaaSGiftAccountID != "" {
+			tx.Rollback()
+			return 0, ErrSaaSGiftRestricted
+		}
+	}
 	if err := tx.Where("id IN (?)", ids).Delete(&Token{}).Error; err != nil {
 		tx.Rollback()
 		return 0, err
@@ -676,6 +701,12 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 		return 0, err
 	}
 
+	for _, token := range tokens {
+		if token.SaaSGiftAccountID != "" {
+			tx.Rollback()
+			return 0, ErrSaaSGiftRestricted
+		}
+	}
 	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
 		tx.Rollback()
 		return 0, err
