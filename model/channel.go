@@ -914,6 +914,11 @@ func (channel *Channel) SupportsEndpointType(endpointType constant.EndpointType)
 	if channel == nil || endpointType == "" {
 		return channel != nil && endpointType == ""
 	}
+	// The Anthropic adapter only exposes Messages and cannot convert an
+	// embedding request. Other adapters retain their existing capabilities.
+	if endpointType == constant.EndpointTypeEmbeddings {
+		return channel.Type != constant.ChannelTypeAnthropic
+	}
 	if endpointType != constant.EndpointTypeOpenAIAlphaSearch {
 		return true
 	}

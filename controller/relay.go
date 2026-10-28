@@ -239,6 +239,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		PreferredChannelTypes: types.RelayFormatToPreferredChannelTypes(relayInfo.RelayFormat),
 		RequiredEndpointType:  types.RelayFormatToRequiredEndpointType(relayInfo.RelayFormat),
 	}
+	// Legacy embedding URLs use the Gemini dispatcher; preserve their path
+	// capability when the relay format itself has no strict endpoint gate.
+	if retryParam.RequiredEndpointType == "" && c.Request != nil {
+		retryParam.RequiredEndpointType = types.PathToRequiredEndpointType(c.Request.URL.Path)
+	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 	retryState := service.NewRelayRetryStateForRequest(c, relayFormat, common.RetryTimes)

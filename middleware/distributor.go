@@ -476,6 +476,11 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	if channel == nil {
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
+	// Explicit channel selection also needs the pre-send capability check;
+	// automatic selection already filters incompatible embedding routes.
+	if c.Request != nil && types.PathToRequiredEndpointType(c.Request.URL.Path) == constant.EndpointTypeEmbeddings && !channel.SupportsEndpointType(constant.EndpointTypeEmbeddings) {
+		return types.NewEmbeddingRouteUnsupportedError()
+	}
 	if err := service.PreflightChannelOutputFormat(c, channel); err != nil {
 		return err
 	}

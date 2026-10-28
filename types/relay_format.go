@@ -48,6 +48,9 @@ func RelayFormatToPreferredChannelTypes(format RelayFormat) []int {
 // RelayFormatToRequiredEndpointType returns a strict channel capability. A
 // zero value means the existing preference-only selection behavior is used.
 func RelayFormatToRequiredEndpointType(format RelayFormat) constant.EndpointType {
+	if format == RelayFormatEmbedding {
+		return constant.EndpointTypeEmbeddings
+	}
 	if format == RelayFormatDecisions {
 		return constant.EndpointTypeDecisions
 	}
@@ -76,6 +79,9 @@ func PathToPreferredChannelTypes(path string) []int {
 }
 
 func PathToRequiredEndpointType(path string) constant.EndpointType {
+	if path == "/v1/embeddings" || strings.HasPrefix(path, "/v1/engines/") && strings.HasSuffix(path, "/embeddings") {
+		return constant.EndpointTypeEmbeddings
+	}
 	if path == "/v1/decisions" || path == "/v1/systemone" || path == "/typesafe/v1/systemone" {
 		return constant.EndpointTypeDecisions
 	}
