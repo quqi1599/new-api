@@ -49,6 +49,29 @@ func maybeMarkClaudeRefusal(c *gin.Context, stopReason string) {
 	}
 }
 
+func parseClaudeStopSequences(stop any) ([]string, error) {
+	switch value := stop.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return []string{value}, nil
+	case []string:
+		return value, nil
+	case []any:
+		sequences := make([]string, 0, len(value))
+		for _, item := range value {
+			sequence, ok := item.(string)
+			if !ok {
+				return nil, types.NewErrorWithStatusCode(fmt.Errorf("stop must be a string or an array of strings"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+			sequences = append(sequences, sequence)
+		}
+		return sequences, nil
+	default:
+		return nil, types.NewErrorWithStatusCode(fmt.Errorf("stop must be a string or an array of strings"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+	}
+}
+
 func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRequest) (*dto.ClaudeRequest, error) {
 	claudeTools := make([]any, 0, len(textRequest.Tools))
 
@@ -252,23 +275,16 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		return nil, err
 	}
 
-	if textRequest.Stop != nil {
-		// stop maybe string/array string, convert to array string
-		switch textRequest.Stop.(type) {
-		case string:
-			claudeRequest.StopSequences = []string{textRequest.Stop.(string)}
-		case []interface{}:
-			stopSequences := make([]string, 0)
-			for _, stop := range textRequest.Stop.([]interface{}) {
-				stopSequences = append(stopSequences, stop.(string))
-			}
-			claudeRequest.StopSequences = stopSequences
-		}
+	stopSequences, err := parseClaudeStopSequences(textRequest.Stop)
+	if err != nil {
+		return nil, err
 	}
+	claudeRequest.StopSequences = stopSequences
 	formatMessages := make([]dto.Message, 0)
 	lastMessage := dto.Message{
 		Role: "tool",
 	}
+	lastMessageHasPlaceholder := false
 	for i, message := range textRequest.Messages {
 		if message.Role == "" {
 			textRequest.Messages[i].Role = "user"
@@ -285,16 +301,31 @@ func RequestOpenAI2ClaudeMessage(c *gin.Context, textRequest dto.GeneralOpenAIRe
 		}
 		if lastMessage.Role == message.Role && lastMessage.Role != "tool" {
 			if lastMessage.IsStringContent() && message.IsStringContent() {
-				fmtMessage.SetStringContent(strings.Trim(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()), "\""))
+				previousCalls, currentCalls := lastMessage.ParseToolCalls(), fmtMessage.ParseToolCalls()
+				if len(previousCalls) > 0 || len(currentCalls) > 0 {
+					texts := make([]string, 0, 2)
+					if text := lastMessage.StringContent(); text != "" && !(lastMessageHasPlaceholder && len(previousCalls) > 0) {
+						texts = append(texts, text)
+					}
+					if text := message.StringContent(); text != "" {
+						texts = append(texts, text)
+					}
+					fmtMessage.SetStringContent(strings.Join(texts, " "))
+					fmtMessage.SetToolCalls(append(previousCalls, currentCalls...))
+				} else {
+					fmtMessage.SetStringContent(strings.Trim(fmt.Sprintf("%s %s", lastMessage.StringContent(), message.StringContent()), "\""))
+				}
 				// delete last message
 				formatMessages = formatMessages[:len(formatMessages)-1]
 			}
 		}
-		if fmtMessage.Content == nil || (fmtMessage.IsStringContent() && fmtMessage.StringContent() == "") {
+		hasPlaceholder := fmtMessage.Content == nil || (fmtMessage.IsStringContent() && fmtMessage.StringContent() == "")
+		if hasPlaceholder {
 			fmtMessage.SetStringContent("...")
 		}
 		formatMessages = append(formatMessages, fmtMessage)
 		lastMessage = fmtMessage
+		lastMessageHasPlaceholder = hasPlaceholder
 	}
 
 	claudeMessages := make([]dto.ClaudeMessage, 0)

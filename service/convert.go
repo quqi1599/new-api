@@ -631,7 +631,7 @@ func ResponseOpenAI2Claude(openAIResponse *dto.OpenAITextResponse, info *relayco
 				claudeContent.Type = "tool_use"
 				claudeContent.Id = toolUse.ID
 				claudeContent.Name = toolUse.Function.Name
-				var mapParams map[string]interface{}
+				var mapParams map[string]json.RawMessage
 				if err := common.Unmarshal([]byte(toolUse.Function.Arguments), &mapParams); err == nil && (mapParams != nil || !info.IsResponsesIncomplete()) {
 					claudeContent.Input = mapParams
 				} else if info.IsResponsesIncomplete() {
@@ -741,7 +741,8 @@ func GeminiToOpenAIRequest(geminiRequest *dto.GeminiChatRequest, info *relaycomm
 		if len(toolCalls) > 0 {
 			// 如果有工具调用，设置工具调用
 			message.SetToolCalls(toolCalls)
-		} else if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
+		}
+		if len(mediaContents) == 1 && mediaContents[0].Type == "text" {
 			// 如果只有一个文本内容，直接设置字符串
 			message.Content = mediaContents[0].Text
 		} else if len(mediaContents) > 0 {
