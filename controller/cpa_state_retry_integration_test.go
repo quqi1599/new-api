@@ -31,14 +31,14 @@ type cpaStateRelayResult struct {
 }
 
 type cpaStateAliasOptions struct {
-	cached, claude, recoverChat bool
-	ownerHandler                http.Handler
-	maxAttempts                 int
-	ownerHeaderOverride         string
-	trustedCPA                  bool
-	requestBody                 string
-	requestHeaders              http.Header
-	staleReplayBarrier          string
+	cached, claude, recoverChat, chat bool
+	ownerHandler                      http.Handler
+	maxAttempts                       int
+	ownerHeaderOverride               string
+	trustedCPA                        bool
+	requestBody                       string
+	requestHeaders                    http.Header
+	staleReplayBarrier                string
 }
 
 // Exercise Relay, real HTTP decoding and the selector across three rounds.
@@ -191,6 +191,10 @@ func runCPAStateRelay(t *testing.T, code string, status int, alternate, stream b
 	}
 	if len(sameServiceAlias) > 0 {
 		options := sameServiceAlias[0]
+		if options.chat {
+			format = types.RelayFormatOpenAI
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":"gpt-5.5","messages":[{"role":"user","content":"synthetic"}],"stream":%t}`, stream)))
+		}
 		if options.requestBody != "" {
 			c.Request = httptest.NewRequest(http.MethodPost, c.Request.URL.Path, strings.NewReader(options.requestBody))
 		}

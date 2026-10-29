@@ -137,7 +137,7 @@ func TestLegacyCPARetryWithRealGateway(t *testing.T) {
 	}
 }
 
-func startLegacyRetryCPA(t *testing.T, binary, upstream string, keys int) string {
+func startLegacyRetryCPA(t *testing.T, binary, upstream string, keys int, overrides ...map[string]any) string {
 	t.Helper()
 	dir := t.TempDir()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -159,6 +159,11 @@ func startLegacyRetryCPA(t *testing.T, binary, upstream string, keys int) string
 		"request-retry": 0, "max-retry-credentials": keys, "disable-cooling": true,
 		"content-audit":     map[string]any{"enabled": false},
 		"remote-management": map[string]any{"disable-control-panel": true, "disable-auto-update-panel": true},
+	}
+	for _, values := range overrides {
+		for key, value := range values {
+			config[key] = value
+		}
 	}
 	data, err := common.Marshal(config)
 	require.NoError(t, err)
