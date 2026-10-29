@@ -82,7 +82,7 @@ func isExhaustedGatewayError(err *types.NewAPIError) bool {
 	if err == nil || !err.HasUpstreamResponse() {
 		return false
 	}
-	if err.GatewayRetryAttempts() > 0 {
+	if err.HasGatewayRetryScope() {
 		return true
 	}
 	switch err.GetErrorCode() {
@@ -102,7 +102,7 @@ func recordExhaustedGateway(retryParam *service.RetryParam, channel *model.Chann
 	if channel == nil {
 		return
 	}
-	if err.GatewayRetryAttempts() > 0 {
+	if err.HasGatewayRetryScope() {
 		// The selected entrance is exhausted even when overrides or a multi-key
 		// configuration prevent proving that other records use the same pool.
 		retryParam.AddPersistentExcludedChannel(channel.Id)
@@ -110,7 +110,7 @@ func recordExhaustedGateway(retryParam *service.RetryParam, channel *model.Chann
 	// Affinity templates may add overrides even when the channel record has
 	// none. The selected request's effective context is authoritative.
 	c := retryParam.Ctx
-	gatewayScope := err.GatewayRetryAttempts() > 0
+	gatewayScope := err.HasGatewayRetryScope()
 	effectiveHeaders := common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)
 	effectiveHeaderIdentity, safeHeaders := gatewayHeaderIdentity(effectiveHeaders, gatewayScope)
 	if len(common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)) > 0 || !safeHeaders {

@@ -91,6 +91,12 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	defer func() {
 		if newApiErr != nil {
 			newApiErr.SetRetryAfter(retryAfter)
+			if resp != nil && resp.StatusCode == http.StatusServiceUnavailable && trustedCPAPoolResponse(resp) {
+				values := resp.Header.Values("X-CPA-Pool-Exhausted")
+				if len(values) == 1 && values[0] == "capacity-v1" {
+					newApiErr.SetGatewayPoolExhausted()
+				}
+			}
 			reason := ""
 			if resp != nil && resp.StatusCode == http.StatusForbidden {
 				values := resp.Header.Values("X-CPA-Retry-Reason")

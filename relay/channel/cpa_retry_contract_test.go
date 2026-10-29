@@ -2,6 +2,7 @@ package channel
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -242,4 +243,26 @@ func TestStripCPARetryRequestHeadersIsCaseInsensitive(t *testing.T) {
 		"Retry-After":     {"17"},
 	}, header)
 	require.NotPanics(t, func() { stripCPARetryRequestHeaders(nil) })
+}
+
+func TestCPAPoolExhaustionTransportTrustAndReset(t *testing.T) {
+	for _, trusted := range []bool{false, true} {
+		f := newCPARetryBarrierFixture()
+		f.info.ChannelOtherSettings.CPAAuditIdentityEnabled = trusted
+		f.response.StatusCode = 503
+		f.response.Header = http.Header{"X-Cpa-Pool-Exhausted": {"capacity-v1"}}
+		captureCPARetryBarrier(f.context, f.request, f.response, f.info)
+		f.response.Body = io.NopCloser(strings.NewReader(`{"error":{"code":"model_cooldown","message":"synthetic"}}`))
+		parsed := service.RelayErrorHandler(f.context.Request.Context(), f.response, false)
+		require.Equal(t, trusted, parsed.GatewayPoolExhausted())
+		f.response.Request.URL.Host = "untrusted.example"
+		captureCPARetryBarrier(f.context, f.request, f.response, f.info)
+		f.response.Body = io.NopCloser(strings.NewReader(`{"error":{"code":"model_cooldown","message":"synthetic"}}`))
+		parsed = service.RelayErrorHandler(f.context.Request.Context(), f.response, false)
+		require.False(t, parsed.GatewayPoolExhausted())
+	}
+	h := http.Header{"X-Cpa-Pool-Exhausted": {"capacity-v1"}, "X-Cpa-Retry-Scope": {"gateway"}, "Accept": {"application/json"}}
+	stripCPARetryRequestHeaders(h)
+	require.Empty(t, h.Get("X-CPA-Pool-Exhausted"))
+	require.Equal(t, "application/json", h.Get("Accept"))
 }

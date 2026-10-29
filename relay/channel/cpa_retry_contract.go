@@ -16,7 +16,7 @@ import (
 // passthrough or request overrides, including an upstream that reflects them.
 func stripCPARetryRequestHeaders(header http.Header) {
 	for name := range header {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "x-cpa-retry-") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "x-cpa-retry-") || strings.HasPrefix(strings.ToLower(strings.TrimSpace(name)), "x-cpa-pool-") {
 			delete(header, name)
 		}
 	}
@@ -27,12 +27,16 @@ func captureCPARetryBarrier(c *gin.Context, req *http.Request, resp *http.Respon
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyRelayGatewayNoReplayReason, "")
+	service.SetCPAPoolResponseTrusted(resp, false)
 	// This administrator-owned setting already declares a CPA identity channel.
 	// It is not inferred from a channel name, client header or generic gateway
 	// fingerprint. Missing source metadata and cross-origin redirects fail closed.
 	if info == nil || info.ChannelMeta == nil || !info.ChannelOtherSettings.CPAAuditIdentityEnabled ||
 		req == nil || !sameCPAResponseChain(req.URL, resp) {
 		return
+	}
+	if values := resp.Header.Values("X-CPA-Pool-Exhausted"); resp.StatusCode == http.StatusServiceUnavailable && len(values) == 1 && values[0] == "capacity-v1" {
+		service.SetCPAPoolResponseTrusted(resp, true)
 	}
 	if reason := service.ParseGatewayReplayBarrier(resp.Header, resp.StatusCode); reason != "" {
 		common.SetContextKey(c, constant.ContextKeyRelayGatewayNoReplayReason, reason)

@@ -507,7 +507,7 @@ func writeRelayError(c *gin.Context, ws *websocket.Conn, relayFormat types.Relay
 	for _, header := range []string{"Content-Type", "Cache-Control", "Connection", "Transfer-Encoding", "X-Accel-Buffering"} {
 		c.Writer.Header().Del(header)
 	}
-	if relayErr.GatewayRetryAttempts() > 0 && relayErr.GetRetryAfter() != "" {
+	if relayErr.HasGatewayRetryScope() && relayErr.GetRetryAfter() != "" {
 		c.Header("Retry-After", relayErr.GetRetryAfter())
 	} else if isCompactionRouteUnavailableError(relayErr) {
 		retryAfter := relayErr.GetRetryAfter()

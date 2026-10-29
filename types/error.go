@@ -113,6 +113,7 @@ type NewAPIError struct {
 	upstreamResponded    bool
 	retryAfter           string
 	gatewayRetryAttempts int
+	gatewayPoolExhausted bool
 	recordErrorLog       *bool
 	errorType            ErrorType
 	errorCode            ErrorCode
@@ -454,6 +455,22 @@ func (e *NewAPIError) GatewayRetryAttempts() int {
 		return 0
 	}
 	return e.gatewayRetryAttempts
+}
+
+// GatewayPoolExhausted is a validated zero-dispatch, entrance-independent
+// capacity statement. It never fabricates an upstream attempt count.
+func (e *NewAPIError) GatewayPoolExhausted() bool { return e != nil && e.gatewayPoolExhausted }
+func (e *NewAPIError) HasGatewayRetryScope() bool {
+	return e != nil && (e.gatewayRetryAttempts > 0 || e.gatewayPoolExhausted)
+}
+func (e *NewAPIError) SetGatewayPoolExhausted() {
+	if e == nil || !e.HasUpstreamResponse() || e.StatusCode != http.StatusServiceUnavailable {
+		return
+	}
+	switch e.GetErrorCode() {
+	case "model_cooldown", "key_suspended", "auth_unavailable":
+		e.gatewayPoolExhausted = true
+	}
 }
 
 // MaxGatewayRetryAttempts bounds only the wire metadata integer, not the
