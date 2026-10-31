@@ -158,7 +158,7 @@ func TestManagedWebRelaySettlesModelRoundsAndSearchExactlyOnce(t *testing.T) {
 					require.Nil(t, apiErr)
 					require.Equal(t, 2, rounds)
 					require.Equal(t, 1, backend.calls)
-					want := 1712 + int(24*group)
+					want := 62500 + int(24*group)
 					wallet, remaining := persistedMidjourneyQuota(t, user.Id, token.Id)
 					require.Equal(t, 1000000-want, wallet)
 					require.Equal(t, wallet, remaining)
@@ -211,14 +211,14 @@ func TestManagedAlphaInitializesSelectedChannelAndLogsExactlyOnce(t *testing.T) 
 			t.Cleanup(func() { common.CleanupBodyStorage(c) })
 			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "gpt-6.1-sol", UsingGroup: "default", TokenGroup: "default", UserGroup: "default", StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAIAlphaSearch, RelayMode: relayconstant.RelayModeAlphaSearch, UserSetting: dto.UserSetting{BillingPreference: "wallet_only", QuotaWarningThreshold: 1}, PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
 			require.Nil(t, info.ChannelMeta)
-			require.Nil(t, service.PreConsumeBilling(c, 1712, info))
+			require.Nil(t, service.PreConsumeBilling(c, 62500, info))
 			session := &websearch.Session{Backend: &webTestBackend{}, Store: store}
 			require.NotPanics(t, func() {
 				require.Nil(t, runManagedWeb(c, info, func() *types.NewAPIError { t.Fatal("standalone search must not invoke model"); return nil }, []byte(body), nil, session))
 			})
 			require.Equal(t, 143, info.ChannelId)
 			require.True(t, gjson.Valid(writer.Body.String()), writer.Body.String())
-			expected := 1712
+			expected := 62500
 			if scenario == "cached_find" {
 				expected = 0
 			}

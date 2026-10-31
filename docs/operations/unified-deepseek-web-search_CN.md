@@ -18,7 +18,7 @@ NewAPI 接管客户声明的服务端联网工具，原模型生成搜索词，C
 - 每轮模型调用使用原有适配器、渠道、审核和计费规则计算费用，所有轮次最后统一结算一次。已成功检索或已产生可计量模型用量后，不因后续失败重新执行整条请求。
 - 多轮输出在服务端暂存，完成工具循环后按原 JSON/SSE 协议交付；等待期间每 15 秒发送 SSE 注释。单请求最多 16 轮模型、32 次工具尝试；并发 8；请求/模型响应/合并历史分别有 32 MiB 上限。
 - 客户中途断开或后续模型失败，仍保存实际已经发生的 token 与工具用量，最终状态为 failed/cancelled；成功响应在余额结算后交付，不靠 HTTP 200 判断是否真正搜索。
-- 费率固定记录人民币 25 元/千次及本请求的 USDExchangeRate；按当前 7.3 换算为 $3.424657534/千次。整数 quota 只在整笔费用末尾舍入。账单的 `managed_web` 保存搜索/抓取次数、模型轮数、模型费、人民币单价、汇率、总 quota 和最终状态。
+- 费率固定记录人民币 25 元/千次及本请求的 USDExchangeRate；用户确认充值 40 元获得 $200 平台额度，故每 $1 额度实收 ¥0.2；实际五倍售价应扣 $125 平台额度/千次（每次 62500 quota），不能用显示用外汇率 7.3 换算。通过 DEEPSEEK_SEARCH_CNY_PER_CREDIT=0.2 固定并逐请求记录充值折算。旧日志保留原值，不追补历史扣费。整数 quota 只在整笔费用末尾舍入。账单的 `managed_web` 保存搜索/抓取次数、模型轮数、模型费、人民币单价、汇率、总 quota 和最终状态。
 - 管理界面按最终记录展示 Search/Fetch 和模型费用，不再拿搜索价格乘分组倍率。原工具价格表保留作为功能关闭时的旧行为，统一功能启用后这些工具不从旧表结算。
 
 ## 启用和回退
@@ -29,6 +29,7 @@ NewAPI 环境：
 UNIFIED_WEB_SEARCH_ENABLED=true
 DEEPSEEK_SEARCH_PROXY_URL=http://<现有 CPA 内网地址>:18317
 DEEPSEEK_SEARCH_PROXY_KEY_FILE=/run/secrets/deepseek-search-proxy-key
+DEEPSEEK_SEARCH_CNY_PER_CREDIT=0.2
 ```
 
 密钥文件内容是现有 CPA 入口 Key，以只读文件挂载；不是 DeepSeek 上游凭据。CPA 容器配置 `CPA_WEB_TOOLS_ENABLED=true`、`CPA_WEB_SEARCH_GATEWAY_ID`、`CPA_WEB_SEARCH_KEY_ID`，指定现有加密存储中的官方渠道与 Key。上游凭据保持在 CPA，NewAPI 使用现有 `CPA_AUDIT_IDENTITY_SECRET` 签名客户身份。缺少凭据、审核签名或 Redis 时失败关闭。

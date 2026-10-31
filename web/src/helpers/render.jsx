@@ -1553,9 +1553,12 @@ function renderManagedWebPrice(opts) {
       search: web.search_requests,
       fetch: web.fetch_requests,
     }),
-    buildBillingText('搜索与抓取：¥{{price}} / 千次，不叠加分组倍率', {
-      price: web.cny_per_1k_calls,
+    buildBillingText('搜索与抓取：每千次 ${{credits}} 平台额度，不叠加分组倍率', {
+      credits: (Number(web.cny_per_1k_calls) / Number(web.cny_per_credit || web.usd_to_cny)).toFixed(6),
     }),
+    web.cny_per_credit ? buildBillingText('充值折算：每 $1 平台额度实收 ¥{{rate}}，工具费折合 ¥{{price}} / 千次', {
+      rate: web.cny_per_credit, price: web.cny_per_1k_calls,
+    }) : null,
     buildBillingText('合计：{{total}}', { total: renderQuota(web.quota, 6) }),
   ]);
 }
@@ -2016,10 +2019,10 @@ export function renderModelPrice(opts) {
 
 export function renderLogContent(opts) {
   if (opts.managed_web?.provider === 'deepseek') {
-    return i18next.t('DeepSeek 搜索 {{search}} 次，抓取 {{fetch}} 次；¥{{price}} / 千次，不叠加分组倍率', {
+    return i18next.t('DeepSeek 搜索 {{search}} 次，抓取 {{fetch}} 次；每千次 ${{price}} 平台额度，不叠加分组倍率', {
       search: opts.managed_web.search_requests,
       fetch: opts.managed_web.fetch_requests,
-      price: opts.managed_web.cny_per_1k_calls,
+      price: (Number(opts.managed_web.cny_per_1k_calls) / Number(opts.managed_web.cny_per_credit || opts.managed_web.usd_to_cny)).toFixed(6),
     });
   }
   const {

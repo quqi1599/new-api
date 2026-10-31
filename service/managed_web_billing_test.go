@@ -25,7 +25,7 @@ func TestManagedWebPriceIgnoresEveryModelAndGroupMultiplier(t *testing.T) {
 			info.ResponsesUsageInfo = &relaycommon.ResponsesUsageInfo{BuiltInTools: map[string]*relaycommon.BuildInToolInfo{dto.BuildInToolWebSearchPreview: {CallCount: 999}}}
 			c.Set("claude_web_search_requests", 999)
 			summary := calculateTextQuotaSummary(c, info, &dto.Usage{ServerToolUse: &dto.ServerToolUsage{WebSearchRequests: common.GetPointer(999)}})
-			require.Equal(t, 5137, common.QuotaFromDecimal(summary.ToolCallSurchargeQuota))
+			require.Equal(t, 187500, common.QuotaFromDecimal(summary.ToolCallSurchargeQuota))
 			require.Len(t, summary.ToolSurchargeItems, 2)
 		}
 	}
@@ -37,8 +37,29 @@ func TestManagedWebPriceCurrencyAndRounding(t *testing.T) {
 	}
 	m, err := NewManagedWebBilling(7.3)
 	require.NoError(t, err)
-	for _, tc := range []struct{ calls, quota int }{{0, 0}, {1, 1712}, {2, 3425}, {50, 85616}, {613, 1049658}, {1000, 1712329}} {
+	for _, tc := range []struct{ calls, quota int }{{0, 0}, {1, 62500}, {2, 125000}, {50, 3125000}, {613, 38312500}, {1000, 62500000}} {
 		m.SearchRequests = tc.calls
 		require.Equal(t, tc.quota, common.QuotaFromDecimal(ManagedWebQuota(m)))
 	}
+}
+
+func TestManagedWebCashConversionIgnoresDisplayFX(t *testing.T) {
+	t.Setenv("DEEPSEEK_SEARCH_CNY_PER_CREDIT", "0.2")
+	for _, fx := range []float64{1, 7.3, 10} {
+		m, err := NewManagedWebBilling(fx)
+		require.NoError(t, err)
+		m.SearchRequests = 1
+		require.Equal(t, 62500, common.QuotaFromDecimal(ManagedWebQuota(m)))
+		require.Equal(t, 125.0, managedWebSurcharges(m)[0].Price)
+	}
+	for _, bad := range []string{"0", "-1", "NaN", "Inf", "invalid"} {
+		t.Setenv("DEEPSEEK_SEARCH_CNY_PER_CREDIT", bad)
+		_, err := NewManagedWebBilling(7.3)
+		require.Error(t, err)
+	}
+	t.Setenv("DEEPSEEK_SEARCH_CNY_PER_CREDIT", "0.3")
+	m, err := NewManagedWebBilling(7.3)
+	require.NoError(t, err)
+	m.SearchRequests = 3
+	require.Equal(t, 125000, common.QuotaFromDecimal(ManagedWebQuota(m)), "round the combined charge, not each call")
 }

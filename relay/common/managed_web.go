@@ -10,6 +10,7 @@ type ManagedWebBilling struct {
 	Quota           int     `json:"quota"`
 	CNYPerThousand  float64 `json:"cny_per_1k_calls"`
 	USDToCNY        float64 `json:"usd_to_cny"`
+	CNYPerCredit    float64 `json:"cny_per_credit,omitempty"`
 	ApplyGroupRatio bool    `json:"apply_group_ratio"`
 	SettlementError error   `json:"-"`
 	ModelFailure    bool    `json:"-"`

@@ -82,7 +82,7 @@ func TestManagedWebFailurePreservesMeasuredUsageWithoutReplay(t *testing.T) {
 			if scenario == "model_failure" || scenario == "store_failure" {
 				modelRounds = 1
 			}
-			fee := 1712
+			fee := 62500
 			if scenario == "empty_search" {
 				fee = 0
 			}
