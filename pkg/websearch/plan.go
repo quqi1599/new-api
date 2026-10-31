@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,14 +28,17 @@ func Arr(b []byte) []json.RawMessage { var v []json.RawMessage; _ = common.Unmar
 func Text(b []byte) string           { var s string; _ = common.Unmarshal(b, &s); return s }
 
 type Plan struct {
-	Protocol              string
-	Body                  Object
-	OriginalTools         json.RawMessage
-	OriginalToolChoice    json.RawMessage
-	Search, Fetch         bool
-	Limit                 int
-	Allowed, Blocked      []string
-	SearchUsed, FetchUsed int
+	Protocol                   string
+	Body                       Object
+	OriginalTools              json.RawMessage
+	OriginalToolChoice         json.RawMessage
+	Search, Fetch              bool
+	Limit                      int
+	SearchLimit, FetchLimit    int
+	FetchAllowed, FetchBlocked []string
+	FetchSettings              bool
+	Allowed, Blocked           []string
+	SearchUsed, FetchUsed      int
 }
 
 func NewPlan(body []byte, protocol string) (*Plan, error) {
@@ -51,9 +55,15 @@ func NewPlan(body []byte, protocol string) (*Plan, error) {
 		t := gjson.ParseBytes(raw)
 		typ := t.Get("type").String()
 		if typ == "web_search" || strings.HasPrefix(typ, "web_search_") {
+			if p.Search {
+				return nil, errors.New("duplicate hosted web search tool")
+			}
 			p.Search = true
 			p.Fetch = true
 		} else if strings.HasPrefix(typ, "web_fetch") {
+			if p.FetchSettings {
+				return nil, errors.New("duplicate hosted web fetch tool")
+			}
 			p.Fetch = true
 		} else {
 			continue
@@ -62,9 +72,21 @@ func NewPlan(body []byte, protocol string) (*Plan, error) {
 			if m.Type != gjson.Number || m.Int() < 1 || m.Int() > MaxCalls || m.Float() != float64(m.Int()) {
 				return nil, errors.New("web tool max_uses must be an integer between 1 and 32")
 			}
-			p.Limit = int(m.Int())
+			limit := int(m.Int())
+			p.Limit = min(p.Limit, limit)
+			if strings.HasPrefix(typ, "web_search") {
+				p.SearchLimit = limit
+			} else {
+				p.FetchLimit = limit
+			}
 		}
-		if err := p.settings(t); err != nil {
+		if strings.HasPrefix(typ, "web_fetch") {
+			settings := &Plan{}
+			if err := settings.settings(t); err != nil {
+				return nil, err
+			}
+			p.FetchAllowed, p.FetchBlocked, p.FetchSettings = settings.Allowed, settings.Blocked, true
+		} else if err := p.settings(t); err != nil {
 			return nil, err
 		}
 	}
@@ -308,7 +330,11 @@ func (p *Plan) Execute(ctx context.Context, s *Session, c Call) (Executed, error
 		if !p.Search {
 			return e, errors.New("model called an undeclared search tool")
 		}
-		if p.SearchUsed >= p.Limit {
+		limit := p.Limit
+		if p.SearchLimit > 0 {
+			limit = p.SearchLimit
+		}
+		if p.SearchUsed >= limit {
 			err = errors.New("search max_uses reached")
 		} else {
 			p.SearchUsed++
@@ -321,18 +347,43 @@ func (p *Plan) Execute(ctx context.Context, s *Session, c Call) (Executed, error
 			}
 			var hits []Hit
 			hits, err = s.Search(ctx, SearchRequest{Query: query, Count: 10})
+			if err == nil && len(hits) > 0 {
+				kept := make([]Hit, 0, len(hits))
+				for _, hit := range hits {
+					if allowedToolURL(hit.URL, p.Allowed, p.Blocked) {
+						kept = append(kept, hit)
+					}
+				}
+				if len(kept) == 0 {
+					s.Meter.Search--
+				}
+				hits = kept
+			}
 			data = map[string]any{"provider": "deepseek", "results": hits}
 		}
 	} else {
 		if !p.Fetch {
 			return e, errors.New("model called an undeclared fetch tool")
 		}
-		if p.FetchUsed >= p.Limit {
+		limit := p.Limit
+		if p.FetchLimit > 0 {
+			limit = p.FetchLimit
+		}
+		if p.FetchUsed >= limit {
 			err = errors.New("fetch max_uses reached")
 		} else {
 			p.FetchUsed++
 			var page Page
-			page, err = s.Fetch(ctx, Text(arg["url"]))
+			target := Text(arg["url"])
+			allowed, blocked := p.Allowed, p.Blocked
+			if p.FetchSettings {
+				allowed, blocked = p.FetchAllowed, p.FetchBlocked
+			}
+			if !allowedToolURL(target, allowed, blocked) {
+				err = errors.New("fetch URL is not allowed")
+			} else {
+				page, err = s.Fetch(ctx, target)
+			}
 			data = map[string]any{"provider": "deepseek", "url": Text(arg["url"]), "title": page.Title, "content": page.Content}
 		}
 	}
@@ -489,7 +540,15 @@ func (e Executed) Public(protocol string) []json.RawMessage {
 		}
 		var content any
 		if e.Failed {
-			content = map[string]any{"type": "web_search_tool_result_error", "error_code": "unavailable"}
+			code := "unavailable"
+			reason := gjson.GetBytes(e.Data, "error").String()
+			if strings.Contains(reason, "max_uses reached") {
+				code = "max_uses_exceeded"
+			}
+			if reason == "fetch URL is not allowed" {
+				code = "url_not_allowed"
+			}
+			content = map[string]any{"type": resultType + "_error", "error_code": code}
 		} else if e.Call.Name == SearchFunction {
 			var hits []any
 			for _, h := range gjson.GetBytes(e.Data, "results").Array() {
@@ -529,4 +588,33 @@ func PublicParts(protocol string, response Object, executed []Executed) []json.R
 		}
 	}
 	return parts
+}
+
+func allowedToolURL(target string, allowed, blocked []string) bool {
+	if !PublicURL(target) {
+		return false
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	matches := func(domain string) bool {
+		domain = strings.ToLower(domain)
+		return host == domain || strings.HasSuffix(host, "."+domain)
+	}
+	for _, domain := range blocked {
+		if matches(domain) {
+			return false
+		}
+	}
+	if len(allowed) == 0 {
+		return true
+	}
+	for _, domain := range allowed {
+		if matches(domain) {
+			return true
+		}
+	}
+	return false
 }

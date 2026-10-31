@@ -228,3 +228,69 @@ func TestDeepSeekHTTPAuditContextAndGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedSeparateSearchFetchLimitsAndErrorTypes(t *testing.T) {
+	for _, limits := range [][2]int{{1, 3}, {3, 1}} {
+		body := Raw(map[string]any{"tools": []any{map[string]any{"type": "web_search_20250305", "max_uses": limits[0]}, map[string]any{"type": "web_fetch_20250910", "max_uses": limits[1]}}})
+		plan, err := NewPlan(body, "claude")
+		require.NoError(t, err)
+		backend := &fakeBackend{}
+		session := &Session{Backend: backend, Store: memoryStore{}}
+		for j, name := range []string{SearchFunction, FetchFunction} {
+			for i := 0; i <= limits[j]; i++ {
+				call := Call{ID: "c", Name: name, Arguments: Raw(map[string]string{"query": "test"}), Original: Raw(map[string]string{"id": "c"})}
+				if name == FetchFunction {
+					call.Arguments = Raw(map[string]string{"url": "https://example.com"})
+				}
+				e, err := plan.Execute(context.Background(), session, call)
+				require.NoError(t, err)
+				require.Equal(t, i == limits[j], e.Failed)
+				if e.Failed {
+					expected := "web_search_tool_result_error"
+					if name == FetchFunction {
+						expected = "web_fetch_tool_result_error"
+					}
+					require.Equal(t, expected, gjson.GetBytes(e.Public("claude")[1], "content.type").String())
+				}
+			}
+		}
+		require.Equal(t, limits[0], backend.searches)
+		require.Equal(t, limits[1], backend.fetches)
+	}
+}
+
+func TestManagedFetchDomainsRemainIndependentAndNoChargeForFilteredResults(t *testing.T) {
+	p, err := NewPlan([]byte(`{"tools":[{"type":"web_search_20250305","allowed_domains":["search.example"]},{"type":"web_fetch_20250910","allowed_domains":["fetch.example"],"max_uses":3}]}`), "claude")
+	require.NoError(t, err)
+	b := &fakeBackend{}
+	s := &Session{Backend: b, Store: memoryStore{}}
+	_, err = p.Execute(context.Background(), s, Call{ID: "s", Name: SearchFunction, Arguments: Raw(map[string]string{"query": "test"})})
+	require.NoError(t, err)
+	require.Zero(t, s.Meter.Search)
+	for _, tc := range []struct {
+		target string
+		failed bool
+	}{{"https://sub.fetch.example/page", false}, {"https://search.example/page", true}, {"https://fetch.example.attacker.test", true}} {
+		e, err := p.Execute(context.Background(), s, Call{ID: "f", Name: FetchFunction, Arguments: Raw(map[string]string{"url": tc.target})})
+		require.NoError(t, err)
+		require.Equal(t, tc.failed, e.Failed)
+		if tc.failed {
+			require.Equal(t, "url_not_allowed", gjson.GetBytes(e.Public("claude")[1], "content.error_code").String())
+		}
+	}
+	require.Equal(t, 1, b.fetches)
+	require.Equal(t, 1, s.Meter.Fetch)
+	require.False(t, allowedToolURL("https://private.example.com", nil, []string{"example.com"}))
+}
+
+func TestAlphaHonorsDomainFiltersBeforeFetchAndBilling(t *testing.T) {
+	b := &fakeBackend{}
+	s := &Session{Backend: b, Store: memoryStore{}}
+	_, err := Alpha(context.Background(), s, []byte(`{"commands":{"search_query":[{"q":"test","domains":["allowed.example"]}]}}`))
+	require.NoError(t, err)
+	require.Zero(t, s.Meter.Search)
+	_, err = Alpha(context.Background(), s, []byte(`{"settings":{"allowed_domains":["allowed.example"]},"commands":{"open":[{"ref_id":"https://example.com"}]}}`))
+	require.Error(t, err)
+	require.Zero(t, b.fetches)
+	require.Zero(t, s.Meter.Fetch)
+}

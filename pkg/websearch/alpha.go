@@ -102,6 +102,18 @@ func Alpha(ctx context.Context, s *Session, body []byte) (Object, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(hits) > 0 {
+			filtered := make([]Hit, 0, len(hits))
+			for _, hit := range hits {
+				if allowedToolURL(hit.URL, allowed, p.Blocked) {
+					filtered = append(filtered, hit)
+				}
+			}
+			if len(filtered) == 0 {
+				s.Meter.Search--
+			}
+			hits = filtered
+		}
 		for _, hit := range hits {
 			id := NewID("turn_na_search_")
 			snippet := hit.Summary
@@ -129,6 +141,9 @@ func Alpha(ctx context.Context, s *Session, body []byte) (Object, error) {
 					return nil, err
 				}
 			}
+			if !allowedToolURL(record.URL, p.Allowed, p.Blocked) {
+				return nil, errors.New("fetch URL is not allowed")
+			}
 			if record.Content == "" {
 				page, err := s.Fetch(ctx, record.URL)
 				if err != nil {
@@ -143,6 +158,9 @@ func Alpha(ctx context.Context, s *Session, body []byte) (Object, error) {
 					return nil, errors.New("click link ID is unavailable")
 				}
 				record.URL = links[id.Int()][1]
+				if !allowedToolURL(record.URL, p.Allowed, p.Blocked) {
+					return nil, errors.New("fetch URL is not allowed")
+				}
 				page, err := s.Fetch(ctx, record.URL)
 				if err != nil {
 					return nil, err
