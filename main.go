@@ -54,6 +54,7 @@ func main() {
 	}
 
 	common.SysLog("New API " + common.Version + " started")
+	defer service.CloseImageResultCache()
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -285,6 +286,9 @@ func InitResources() error {
 	ratio_setting.InitRatioSettings()
 
 	service.InitHttpClient()
+	if err := service.InitImageResultCacheFromEnv(); err != nil {
+		return err
+	}
 
 	service.InitTokenEncoders()
 

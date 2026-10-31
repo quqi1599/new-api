@@ -298,5 +298,6 @@ func sendResponsesStreamData(c *gin.Context, streamResponse dto.ResponsesStreamR
 	if data == "" {
 		return nil
 	}
+	data = string(service.RewriteImageResultURLs(c, []byte(data)))
 	return helper.ResponseChunkData(c, streamResponse, data)
 }

@@ -5,6 +5,7 @@ import (
 	"github.com/QuantumNous/new-api/controller"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relay"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +18,9 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
+	// 链接自身是有时效的加密凭证；下载不进入 TokenAuth、渠道分配和计费。
+	router.GET("/v1/image-results/:ticket", middleware.RouteTag("image_result"), service.ServeImageResult)
+	router.HEAD("/v1/image-results/:ticket", middleware.RouteTag("image_result"), service.ServeImageResult)
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))

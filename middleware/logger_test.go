@@ -19,6 +19,8 @@ func TestBatch1AccessLogCredentials(t *testing.T) {
 		"/v1/models%23test%25?key=SECRET&alt=sse",
 		"/%61pi/oauth/test?code=SECRET&state=SECOND",
 		"/oauth/test?code=SECRET&state=SECOND",
+		"/v1/image-results/SECRET?download=1",
+		"/v1/%69mage-results/SECRET?download=1",
 	} {
 		t.Run(target, func(t *testing.T) {
 			var output bytes.Buffer

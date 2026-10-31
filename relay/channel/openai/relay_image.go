@@ -439,6 +439,9 @@ func openaiImageSSEHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *ht
 }
 
 func writeOpenAIImageEvent(c *gin.Context, name, data string) error {
+	if name == "image_generation.completed" || name == "image_edit.completed" {
+		data = string(service.RewriteImageResultURLs(c, []byte(data)))
+	}
 	data = strings.ReplaceAll(data, "\n", "\ndata: ")
 	if name == "" {
 		return helper.StringData(c, data)
@@ -450,6 +453,7 @@ func writeOpenAIImageEvent(c *gin.Context, name, data string) error {
 // logs write failures but does not return them, which would mark this request as
 // successful even after the downstream connection has gone away.
 func writeOpenAIImageJSON(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response, body []byte) *types.NewAPIError {
+	body = service.RewriteImageResultURLs(c, body)
 	for key, values := range resp.Header {
 		if len(values) > 0 && service.ShouldCopyUpstreamHeader(c, key, values) {
 			c.Header(key, values[0])

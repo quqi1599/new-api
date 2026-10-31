@@ -283,6 +283,7 @@ func (a *Adaptor) DoResponse(c *gin.Context, resp *http.Response, info *relaycom
 		return nil, types.NewError(fmt.Errorf("replicate adaptor: encode response failed: %w", err), types.ErrorCodeBadResponseBody)
 	}
 
+	responseBytes = service.RewriteImageResultURLs(c, responseBytes)
 	c.Writer.Header().Set("Content-Type", "application/json")
 	c.Writer.WriteHeader(http.StatusOK)
 	_, _ = c.Writer.Write(responseBytes)
