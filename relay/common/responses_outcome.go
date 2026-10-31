@@ -30,6 +30,9 @@ func (info *RelayInfo) ShouldRecordChannelSuccess() bool {
 	if info == nil {
 		return true
 	}
+	if info.ManagedWeb != nil && info.ManagedWeb.ModelRounds == 0 {
+		return false
+	}
 	info.FinalizeGenerationOutcome()
 	return info.GenerationOutcome == nil || info.GenerationOutcome.State == "completed"
 }
@@ -40,6 +43,15 @@ func (info *RelayInfo) FinalizeGenerationOutcome() {
 	if info == nil {
 		return
 	}
+	defer func() {
+		if info.ManagedWeb != nil && (info.ManagedWeb.Outcome == "failed" || info.ManagedWeb.Outcome == "cancelled") {
+			if info.GenerationOutcome == nil {
+				info.GenerationOutcome = &ResponsesOutcome{InputTokensSource: "unreported", OutputTokensSource: "unreported"}
+			}
+			info.GenerationOutcome.State = info.ManagedWeb.Outcome
+			info.GenerationOutcome.Reason = "managed_web_request_" + info.ManagedWeb.Outcome
+		}
+	}()
 	if info.ResponsesOutcome != nil {
 		outcome := *info.ResponsesOutcome
 		info.GenerationOutcome = &outcome

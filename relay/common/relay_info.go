@@ -93,6 +93,9 @@ type TokenCountMeta struct {
 }
 
 type RelayInfo struct {
+	// Managed web rounds use the ordinary model pricing path, then settle once.
+	DeferTextBilling  func(*dto.Usage, int)
+	ManagedWeb        *ManagedWebBilling
 	TokenId           int
 	TokenKey          string
 	TokenName         string

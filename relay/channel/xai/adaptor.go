@@ -67,6 +67,9 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 	if strings.HasSuffix(info.UpstreamModelName, "-search") {
 		info.UpstreamModelName = strings.TrimSuffix(info.UpstreamModelName, "-search")
 		request.Model = info.UpstreamModelName
+		if info.ManagedWeb != nil {
+			return request, nil
+		}
 		toMap := request.ToMap()
 		toMap["search_parameters"] = map[string]any{
 			"mode": "on",

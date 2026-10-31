@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/websearch"
 	"github.com/QuantumNous/new-api/relay"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -194,7 +195,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}
 
-	tokens, err := service.EstimateRequestToken(c, meta, relayInfo)
+	managedAlpha := websearch.Enabled() && relayInfo.RelayMode == relayconstant.RelayModeAlphaSearch
+	tokens := 0
+	if !managedAlpha {
+		tokens, err = service.EstimateRequestToken(c, meta, relayInfo)
+	}
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeCountTokenFailed)
 		return
@@ -202,7 +207,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
-	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	var priceData types.PriceData
+	if managedAlpha {
+		var webPrice *relaycommon.ManagedWebBilling
+		webPrice, err = service.NewManagedWebBilling(operation_setting.USDExchangeRate)
+		if err == nil {
+			webPrice.SearchRequests = 1
+			priceData = types.PriceData{QuotaToPreConsume: common.QuotaFromDecimal(service.ManagedWebQuota(webPrice)), GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}
+			relayInfo.PriceData = priceData
+		}
+	} else {
+		priceData, err = helper.ModelPriceHelper(c, relayInfo, tokens, meta)
+	}
 	if err != nil {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
@@ -339,16 +355,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		common.SetContextKey(c, constant.ContextKeyRelayBodyComplete, true)
 		c.Request.Body = io.NopCloser(bodyStorage)
 
-		switch relayFormat {
-		case types.RelayFormatOpenAIRealtime:
-			newAPIError = relay.WssHelper(c, relayInfo)
-		case types.RelayFormatClaude:
-			newAPIError = relay.ClaudeHelper(c, relayInfo)
-		case types.RelayFormatGemini:
-			newAPIError = geminiRelayHandler(c, relayInfo)
-		default:
-			newAPIError = relayHandler(c, relayInfo)
-		}
+		newAPIError = relay.ManagedWebHelper(c, relayInfo, func() *types.NewAPIError {
+			switch relayFormat {
+			case types.RelayFormatOpenAIRealtime:
+				return relay.WssHelper(c, relayInfo)
+			case types.RelayFormatClaude:
+				return relay.ClaudeHelper(c, relayInfo)
+			case types.RelayFormatGemini:
+				return geminiRelayHandler(c, relayInfo)
+			default:
+				return relayHandler(c, relayInfo)
+			}
+		})
 
 		if newAPIError == nil {
 			if relayInfo.ShouldRecordChannelSuccess() {
@@ -380,7 +398,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
-		if service.RecordChannelCircuitFailure(c.Request.Context(), channel.Id, relayInfo.OriginModelName, newAPIError) {
+		if relayInfo.ManagedWeb != nil && !relayInfo.ManagedWeb.ModelFailure {
+			service.ReleaseChannelCircuitProbe(c.Request.Context(), channel.Id, relayInfo.OriginModelName)
+		} else if service.RecordChannelCircuitFailure(c.Request.Context(), channel.Id, relayInfo.OriginModelName, newAPIError) {
 			logger.LogWarn(c, fmt.Sprintf("channel circuit opened for channel #%d model %s", channel.Id, relayInfo.OriginModelName))
 		}
 

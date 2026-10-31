@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	common2 "github.com/QuantumNous/new-api/common"
 	constant2 "github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/pkg/websearch"
 	"github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/service"
@@ -314,6 +316,24 @@ func getRequestURL(a Adaptor, c *gin.Context, info *common.RelayInfo) (string, e
 }
 
 func DoApiRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody io.Reader) (*http.Response, error) {
+	if info.ManagedWeb != nil {
+		body, err := io.ReadAll(io.LimitReader(requestBody, (32<<20)+1))
+		if err != nil {
+			return nil, err
+		}
+		if len(body) > 32<<20 {
+			return nil, errors.New("managed web upstream request exceeds 32 MiB")
+		}
+		plan, err := websearch.NewPlan(body, "gemini")
+		if err != nil {
+			return nil, err
+		}
+		if plan != nil {
+			return nil, errors.New("model channel attempted to re-enable a vendor hosted web tool")
+		}
+		requestBody = bytes.NewReader(body)
+		info.UpstreamRequestBodySize = int64(len(body))
+	}
 	fullRequestURL, err := getRequestURL(a, c, info)
 	if err != nil {
 		if c != nil && c.Request != nil && c.Request.Context().Err() != nil {

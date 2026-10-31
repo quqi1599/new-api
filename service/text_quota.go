@@ -138,6 +138,15 @@ func calculateTextToolCallSurcharge(ctx *gin.Context, relayInfo *relaycommon.Rel
 		summary.ClaudeWebSearchCallCount = 0
 	}
 
+	if managed := relayInfo.ManagedWeb; managed != nil {
+		delete(counts, dto.BuildInToolWebSearch)
+		delete(counts, dto.BuildInToolWebSearchPreview)
+		summary.ClaudeWebSearchCallCount = 0
+		summary.WebSearchCallCount = managed.SearchRequests
+		summary.WebSearchPrice = managed.CNYPerThousand / managed.USDToCNY
+		summary.ToolSurchargeItems = append(summary.ToolSurchargeItems, managedWebSurcharges(managed)...)
+		surcharge = surcharge.Add(ManagedWebQuota(managed))
+	}
 	names := make([]string, 0, len(counts))
 	for name := range counts {
 		names = append(names, name)
@@ -454,6 +463,16 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		}
 	}
 
+	if relayInfo.DeferTextBilling != nil {
+		relayInfo.DeferTextBilling(usage, summary.Quota)
+		return
+	}
+	if managed := relayInfo.ManagedWeb; managed != nil {
+		// Model quota was evaluated separately for each actual model round,
+		// including its original tier, cache semantics and group multiplier.
+		summary.Quota = common.QuotaFromDecimal(decimal.NewFromInt(int64(managed.ModelQuota)).Add(ManagedWebQuota(managed)))
+		managed.Quota = summary.Quota
+	}
 	for _, item := range summary.ToolSurchargeItems {
 		extraContent = append(extraContent, fmt.Sprintf("%s 调用 %d 次，调用花费 %s", item.Name, item.Count, logger.LogQuota(item.Quota)))
 	}
@@ -482,6 +501,9 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 
 	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
+		if relayInfo.ManagedWeb != nil {
+			relayInfo.ManagedWeb.SettlementError = err
+		}
 	}
 
 	logModel := summary.ModelName
@@ -546,6 +568,11 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	}
 	if len(summary.ToolSurchargeItems) > 0 {
 		other["tool_surcharges"] = summary.ToolSurchargeItems
+	}
+	if relayInfo.ManagedWeb != nil {
+		other["managed_web"] = relayInfo.ManagedWeb
+		other["web_fetch_call_count"] = relayInfo.ManagedWeb.FetchRequests
+		other["tool_usage_source"] = "platform_deepseek"
 	}
 	injectReportedServerToolUsage(other, summary)
 	if summary.CacheCreationTokens > 0 {

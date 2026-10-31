@@ -169,3 +169,11 @@ func applyCPAAuditIdentity(req *http.Request, info *common.RelayInfo) error {
 		common2.CPAAuditIdentitySecret,
 	)
 }
+
+// ApplyManagedWebAudit signs verified caller identity for the dedicated CPA
+// search endpoint, independently of the selected model channel's vendor.
+func ApplyManagedWebAudit(req *http.Request, info *common.RelayInfo) error {
+	identity := &common.RelayInfo{UserId: info.UserId, TokenId: info.TokenId, TokenName: info.TokenName, RequestId: info.RequestId, IsChannelTest: info.IsChannelTest, ChannelMeta: &common.ChannelMeta{}}
+	identity.ChannelOtherSettings.CPAAuditIdentityEnabled = true
+	return applyCPAAuditIdentity(req, identity)
+}

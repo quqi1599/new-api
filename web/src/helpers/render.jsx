@@ -1542,7 +1542,26 @@ export function renderTaskBillingProcess(other, content) {
   ]);
 }
 
+function renderManagedWebPrice(opts) {
+  const web = opts.managed_web;
+  return renderBillingArticle([
+    buildBillingText('模型调用 {{rounds}} 轮，模型费用 {{amount}}', {
+      rounds: web.model_rounds,
+      amount: renderQuota(web.model_quota, 6),
+    }),
+    buildBillingText('DeepSeek 搜索 {{search}} 次，网页抓取 {{fetch}} 次', {
+      search: web.search_requests,
+      fetch: web.fetch_requests,
+    }),
+    buildBillingText('搜索与抓取：¥{{price}} / 千次，不叠加分组倍率', {
+      price: web.cny_per_1k_calls,
+    }),
+    buildBillingText('合计：{{total}}', { total: renderQuota(web.quota, 6) }),
+  ]);
+}
+
 export function renderModelPrice(opts) {
+  if (opts.managed_web?.provider === 'deepseek') return renderManagedWebPrice(opts);
   const {
     prompt_tokens: inputTokens = 0,
     completion_tokens: completionTokens = 0,
@@ -1996,6 +2015,13 @@ export function renderModelPrice(opts) {
 }
 
 export function renderLogContent(opts) {
+  if (opts.managed_web?.provider === 'deepseek') {
+    return i18next.t('DeepSeek 搜索 {{search}} 次，抓取 {{fetch}} 次；¥{{price}} / 千次，不叠加分组倍率', {
+      search: opts.managed_web.search_requests,
+      fetch: opts.managed_web.fetch_requests,
+      price: opts.managed_web.cny_per_1k_calls,
+    });
+  }
   const {
     model_ratio: modelRatio,
     completion_ratio: completionRatio,
@@ -2603,6 +2629,7 @@ export function renderQuotaWithPrompt(quota, digits) {
 }
 
 export function renderClaudeModelPrice(opts) {
+  if (opts.managed_web?.provider === 'deepseek') return renderManagedWebPrice(opts);
   const {
     prompt_tokens: inputTokens = 0,
     completion_tokens: completionTokens = 0,
