@@ -53,6 +53,9 @@ func accessLogPath(requestURI string) string {
 	}
 	loggedPath := u.EscapedPath()
 	decodedPath := path.Clean(u.Path)
+	if strings.HasPrefix(decodedPath, "/v1/image-results/") {
+		return "/v1/image-results/[redacted]"
+	}
 	if decodedPath == "/api/oauth" || strings.HasPrefix(decodedPath, "/api/oauth/") ||
 		decodedPath == "/oauth" || strings.HasPrefix(decodedPath, "/oauth/") {
 		return loggedPath
