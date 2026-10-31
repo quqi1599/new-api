@@ -122,6 +122,11 @@ func ManagedWebHelper(c *gin.Context, info *relaycommon.RelayInfo, run func() *t
 }
 
 func runManagedWeb(c *gin.Context, info *relaycommon.RelayInfo, run func() *types.NewAPIError, body []byte, plan *websearch.Plan, session *websearch.Session) (resultErr *types.NewAPIError) {
+	// Standalone search does not enter a model adapter, which normally initializes
+	// the selected channel metadata used by accounting and consume logs.
+	if plan == nil && info.ChannelMeta == nil {
+		info.InitChannelMeta(c)
+	}
 	managed, err := service.NewManagedWebBilling(operation_setting.USDExchangeRate)
 	if err != nil {
 		return webError(err, 503)

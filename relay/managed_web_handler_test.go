@@ -182,3 +182,56 @@ func TestManagedWebRelaySettlesModelRoundsAndSearchExactlyOnce(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedAlphaInitializesSelectedChannelAndLogsExactlyOnce(t *testing.T) {
+	oldLog, oldExport := common.LogConsumeEnabled, common.DataExportEnabled
+	common.LogConsumeEnabled = true
+	common.DataExportEnabled = false
+	t.Cleanup(func() { common.LogConsumeEnabled = oldLog; common.DataExportEnabled = oldExport })
+	for _, scenario := range []string{"search", "fetch", "cached_find"} {
+		t.Run(scenario, func(t *testing.T) {
+			user, token := setupMidjourneyBillingTest(t, 1000000, 1000000)
+			writer := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(writer)
+			body := `{"model":"gpt-6.1-sol","commands":{"search_query":[{"q":"fixture"}]}}`
+			store := webTestStore{}
+			if scenario == "fetch" {
+				body = `{"model":"gpt-6.1-sol","commands":{"open":[{"ref_id":"https://example.com"}]}}`
+			}
+			if scenario == "cached_find" {
+				body = `{"model":"gpt-6.1-sol","commands":{"find":[{"ref_id":"cached_ref","pattern":"fixture"}]}}`
+				store["cached_ref"] = websearch.Record{URL: "https://example.com", Content: "fixture page"}
+			}
+			c.Request = httptest.NewRequest("POST", "/v1/alpha/search", strings.NewReader(body))
+			c.Request.Header.Set("Content-Type", "application/json")
+			common.SetContextKey(c, constant.ContextKeyChannelId, 143)
+			common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-6.1-sol")
+			c.Set(common.RequestIdKey, "owned-alpha-fixture")
+			t.Cleanup(func() { common.CleanupBodyStorage(c) })
+			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "gpt-6.1-sol", UsingGroup: "default", TokenGroup: "default", UserGroup: "default", StartTime: time.Now(), RelayFormat: types.RelayFormatOpenAIAlphaSearch, RelayMode: relayconstant.RelayModeAlphaSearch, UserSetting: dto.UserSetting{BillingPreference: "wallet_only", QuotaWarningThreshold: 1}, PriceData: types.PriceData{GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 1}}}
+			require.Nil(t, info.ChannelMeta)
+			require.Nil(t, service.PreConsumeBilling(c, 1712, info))
+			session := &websearch.Session{Backend: &webTestBackend{}, Store: store}
+			require.NotPanics(t, func() {
+				require.Nil(t, runManagedWeb(c, info, func() *types.NewAPIError { t.Fatal("standalone search must not invoke model"); return nil }, []byte(body), nil, session))
+			})
+			require.Equal(t, 143, info.ChannelId)
+			require.True(t, gjson.Valid(writer.Body.String()), writer.Body.String())
+			expected := 1712
+			if scenario == "cached_find" {
+				expected = 0
+			}
+			wallet, remaining := persistedMidjourneyQuota(t, user.Id, token.Id)
+			require.Equal(t, 1000000-expected, wallet)
+			require.Equal(t, wallet, remaining)
+			var logs []model.Log
+			require.NoError(t, model.LOG_DB.Where("user_id=? AND type=?", user.Id, model.LogTypeConsume).Find(&logs).Error)
+			require.Len(t, logs, 1)
+			require.Equal(t, expected, logs[0].Quota)
+			require.Equal(t, 143, logs[0].ChannelId)
+			require.Zero(t, gjson.Get(logs[0].Other, "managed_web.model_quota").Int())
+			require.Equal(t, "completed", gjson.Get(logs[0].Other, "managed_web.outcome").String())
+		})
+	}
+}
